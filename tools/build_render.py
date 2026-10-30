@@ -62,13 +62,16 @@ fn iris_flat_draws(value: bool, adapter: &wgpu::Adapter, device: &wgpu::Device) 
 hook('device-features', 'horizon_client_render::gfx::cull::Cull::features', '''\
 fn iris_features(value: wgpu::Features, adapter: &wgpu::Adapter) -> wgpu::Features {
     // Images cleared each frame and written from vertex stages; compute programs' `barrier()`
-    // (naga lowers it with subgroup barriers).
+    // (naga lowers it with subgroup barriers); image atomics, for voxels written in an order of
+    // their own (`atomic_vertex_stores`).
+    horizon_shaders::iris::set_image_atomics(adapter.features().contains(wgpu::Features::TEXTURE_ATOMIC));
     value
         | (adapter.features()
             & (wgpu::Features::CLEAR_TEXTURE
                 | wgpu::Features::VERTEX_WRITABLE_STORAGE
                 | wgpu::Features::SUBGROUP
-                | wgpu::Features::SUBGROUP_BARRIER))
+                | wgpu::Features::SUBGROUP_BARRIER
+                | wgpu::Features::TEXTURE_ATOMIC))
 }
 ''', [binding('value', 'wgpu::Features', '$value'), binding('adapter', '&wgpu::Adapter', 'adapter')], kind='RETURN')
 
@@ -79,6 +82,17 @@ ir = strip_tests(ref(RE + 'gfx/pack_post/iris.rs'))
 ir, _ = cut(ir, r'^impl PackPost \{\n    /// The bind group entries')
 ir, _ = cut(ir, r'^#\[allow\(dead_code\)\]\nfn _uses_entry')
 ir, _ = cut(ir, r'^impl PackPost \{\n    /// Every pass')
+ir = sub1(ir, 'if f[h].contains(naga::valid::GlobalUse::WRITE) {',
+          'if f[h].intersects(naga::valid::GlobalUse::WRITE | naga::valid::GlobalUse::ATOMIC) {')
+ir = sub1(ir, '''            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC;
+        let made = checked(device, || {''', '''            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC;
+        // Vertex stages store into 32-bit integer images atomically (`atomic_vertex_stores`).
+        let atomic = matches!(self.format, wgpu::TextureFormat::R32Uint | wgpu::TextureFormat::R32Sint)
+            && horizon_shaders::iris::image_atomics();
+        let usage = if atomic { usage | wgpu::TextureUsages::STORAGE_ATOMIC } else { usage };
+        let made = checked(device, || {''')
 ir = sub1(ir, 'use horizon_shaders::{Group, Interface, WorkGroups};\n',
           'use horizon_shaders::iris::WorkGroups;\nuse horizon_shaders::{Group, Interface};\n')
 ir = sub1(ir, 'use super::{BUFFERS, Binding, PackPost, SamplerKind, Source, checked, entry, source};\n', 'use super::*;\n')

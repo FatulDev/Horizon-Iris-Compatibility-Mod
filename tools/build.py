@@ -14,7 +14,7 @@ PRISTINE = os.path.expanduser('~/hz-pristine')
 OUT = os.path.join(ROOT, 'out', 'iris-features')
 
 MOD_ID = 'iris-features'
-VERSION = '0.1.15'
+VERSION = '0.1.16'
 HORIZON = 'fca2169de9c014be8b6606ac1f3dba0bcda3731a'
 MIXINS = '5140cdf81915c25f10a7745eb532e1c09f275068'
 
@@ -238,6 +238,8 @@ def submod(name):
     s = strip_tests(outer_docs(ref(SH + f'translate/{name}.rs'))).rstrip()
     return f'mod {name} {{\n{rsx.indent(s)}\n}}\n'
 tr += '\n' + submod('scan') + '\n' + submod('rewrite')
+tr += own('shaders_atomic_stores.rs')
+tr = sub1(tr, '    let mut module = module;\n', '    let mut module = module;\n    if stage.kind == ShaderStage::Vertex {\n        atomic_vertex_stores(&mut module);\n    }\n')
 module('shaders-translate', SH + 'translate/mod.rs', 'iris_translate',
        '// The translator with Iris\'s storage buffers, images and compute programs, and the GLSL\n'
        '// packs written for Iris rely on.\n' + tr)

@@ -29,3 +29,15 @@ pub fn parse_properties(text: &str, macros: &Macros) -> Properties {
 pub fn forget_smoothing(custom: &mut crate::Custom) {
     crate::custom::iris_custom::forget_smoothing(custom);
 }
+
+/// Whether the device has image atomics (`TEXTURE_ATOMIC`): set by the renderer when it asks
+/// for its features, read when programs are translated.
+static IMAGE_ATOMICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_image_atomics(on: bool) {
+    IMAGE_ATOMICS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn image_atomics() -> bool {
+    IMAGE_ATOMICS.load(std::sync::atomic::Ordering::Relaxed)
+}

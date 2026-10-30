@@ -107,6 +107,8 @@ a = t.index('            // Storage buffer 4\'s members')
 b = t.index('            let (_, lightmap) = view(')
 t = t[:a] + t[b:]
 t = sub1(t, 'PackPost::new(&device, &queue, post,', 'PackPost::iris_new(&device, &queue, post,')
+t = sub1(t, '            | wgpu::Features::SUBGROUP_BARRIER;\n', '            | wgpu::Features::SUBGROUP_BARRIER\n            | wgpu::Features::TEXTURE_ATOMIC;\n')
+t = sub1(t, '        println!("features: {features:?}");\n', '        println!("features: {features:?}");\n        horizon_shaders::iris::set_image_atomics(features.contains(wgpu::Features::TEXTURE_ATOMIC) && std::env::var_os("IRIS_TEST_NO_ATOMICS").is_none());\n')
 t = sub1(t, '&& let Some(b) = pp.iris.as_ref().and_then(|i| i.buffer(4))',
          '&& let Some(b) = super::super::iris::state(&pp).and_then(|s| s.borrow().iris.buffer(4).cloned())')
 t = sub1(t, 'let data = read_buffer(&device, &queue, b, 128);', 'let data = read_buffer(&device, &queue, &b, 128);')

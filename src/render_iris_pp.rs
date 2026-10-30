@@ -111,12 +111,16 @@ pub(super) fn storage_uses(modules: &[(wgpu::ShaderStages, &naga::Module)]) -> (
                 ) => {
                     let load = access.contains(naga::StorageAccess::LOAD);
                     let store = access.contains(naga::StorageAccess::STORE);
+                    let atomic = wgpu::StorageTextureAccess::Atomic;
                     let access = match (load, store) {
+                        _ if access.contains(naga::StorageAccess::ATOMIC) => atomic,
                         (true, false) => wgpu::StorageTextureAccess::ReadOnly,
                         (false, true) => wgpu::StorageTextureAccess::WriteOnly,
                         _ => wgpu::StorageTextureAccess::ReadWrite,
                     };
                     match images.iter_mut().find(|i| i.binding == b.binding) {
+                        // A stage's atomic stores decide (`atomic_vertex_stores`).
+                        Some(i) if i.access == atomic || access == atomic => i.access = atomic,
                         Some(i) if i.access != access => i.access = wgpu::StorageTextureAccess::ReadWrite,
                         Some(_) => {}
                         None => images.push(ImageUse {
