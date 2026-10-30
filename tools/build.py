@@ -14,7 +14,7 @@ PRISTINE = os.path.expanduser('~/hz-pristine')
 OUT = os.path.join(ROOT, 'out', 'iris-features')
 
 MOD_ID = 'iris-features'
-VERSION = '0.1.16'
+VERSION = '0.1.17'
 HORIZON = 'fca2169de9c014be8b6606ac1f3dba0bcda3731a'
 MIXINS = '5140cdf81915c25f10a7745eb532e1c09f275068'
 
@@ -87,7 +87,10 @@ iris = strip_tests(ref(SH + 'iris.rs')).rstrip() + '\n\n' + own('shaders_iris_ex
 # The GL extension Iris names for images (every GPU Iris runs on has it): Eclipse's floodfill
 # lighting voxelises and reads its light volume only with it.
 iris = sub1(iris, '    m.define("IRIS_FEATURE_CUSTOM_TEXTURE_NAME", "");\n',
-            '    m.define("IRIS_FEATURE_CUSTOM_TEXTURE_NAME", "");\n    m.define("MC_GL_ARB_shader_image_load_store", "");\n')
+            '    m.define("IRIS_FEATURE_CUSTOM_TEXTURE_NAME", "");\n    m.define("MC_GL_ARB_shader_image_load_store", "");\n'
+    '    // Iris defines these whatever the resource pack (defaults when it has no maps).\n'
+    '    m.define("MC_NORMAL_MAP", "");\n    m.define("MC_SPECULAR_MAP", "");\n'
+    '    m.define("MC_GL_ARB_texture_gather", "");\n    m.define("MC_GL_EXT_gpu_shader4", "");\n')
 # Value options as the shader options menu finds them (`iris_options`): a list anywhere in the
 # comment, `const` options too, at the player's values.
 iris, _ = cut(iris, r'^fn source_texts\(')
@@ -142,6 +145,39 @@ props = props.replace('pub fn parse(', 'pub(crate) fn parse(').replace('-> Self 
 props = sub1(props, 'Self::default()', 'Properties::default()')
 module('shaders-properties', SH + 'properties.rs', 'iris_properties',
        '// `Properties::parse`, with custom uniform expressions reading the pack\'s options.\nuse super::*;\n\n' + props)
+
+# The preprocessor: a function-like macro's call that spans lines (Noble's
+# `PARSE_CLOUD_LAYER_SETTINGS(\n a,\n b\n)`) is joined into one line before it is expanded, as
+# the GLSL preprocessor reads tokens across lines; the lines it took stay as empty lines.
+pfile = deindent(take(pristine(SH + 'preprocess.rs'), r'^    fn file\('))
+pfile = sub1(pfile, 'fn file(&mut self, path: &str, depth: usize, from: Origin) {',
+             "pub(super) fn iris_file(this: &mut Run<'_>, path: &str, depth: usize, from: Origin) {")
+pfile = re.sub(r'\bself\b', 'this', pfile)
+pfile = sub1(pfile, """        n += 1;
+        let origin = Origin {""", """        n += 1;
+        // A macro call left open at the end of the line takes the lines that close it.
+        if this.conditionals.active() && !line.trim_start().starts_with('#') {
+            while n < lines.len() && open_macro_call(&line, &this.macros) {
+                let next = lines[n];
+                if next.trim_start().starts_with('#') {
+                    break;
+                }
+                line.push(' ');
+                line.push_str(next);
+                n += 1;
+            }
+        }
+        let origin = Origin {""")
+pfile += open(os.path.join(ROOT, 'src', 'shaders_preprocess_extra.rs')).read()
+module('shaders-preprocess', SH + 'preprocess.rs', 'iris_preprocess',
+       '// `Run::file` with macro calls that span lines joined first.\nuse super::*;\n\n' + pfile)
+hook('preprocess-file', "horizon_shaders::preprocess::Run<'_>::file", """\
+fn iris_preprocess_file(run: &mut Run<'_>, path: &str, depth: usize, from: Origin) -> ::core::ops::ControlFlow<()> {
+    iris_preprocess::iris_file(run, path, depth, from);
+    ::core::ops::ControlFlow::Break(())
+}
+""", [binding('run', "&mut Run<'_>", '&mut *self'), binding('path', '&str', 'path'),
+      binding('depth', 'usize', 'depth'), binding('from', 'Origin', 'from')])
 
 # Post: compute programs, the declared resources, pass-through geometry stages.
 post_ref = ref(SH + 'post.rs')
@@ -234,12 +270,97 @@ for h in [r'^#\[derive\(Clone, Debug, PartialEq\)\]\npub struct ImageUse', r'^fn
 tr = '\n'.join(tparts)
 tr = tr.replace('fn translate(', 'pub(crate) fn translate(', 1)
 tr = re.sub(r'\n(\s*)images,\n\s*buffers,\n', '\n', tr)
-def submod(name):
-    s = strip_tests(outer_docs(ref(SH + f'translate/{name}.rs'))).rstrip()
+def submod(name, edit=lambda s: s):
+    s = edit(strip_tests(outer_docs(ref(SH + f'translate/{name}.rs')))).rstrip()
     return f'mod {name} {{\n{rsx.indent(s)}\n}}\n'
-tr += '\n' + submod('scan') + '\n' + submod('rewrite')
+
+# GLSL names Iris's compatibility layer accepts: `gpu_shader4`'s `texelFetch2D` and
+# `textureSize2D`, and `textureGather` (naga's GLSL frontend has neither), as texel fetches.
+GATHER = r'''
+        if self.tokens.iter().any(|t| t.starts_with("textureGather")) {
+            for (p, v) in [("", "vec4"), ("i", "ivec4"), ("u", "uvec4")] {
+                for (name, off, arg) in [("hz_textureGather", "ivec2(0)", ""), ("hz_textureGatherOffset", "o", ", ivec2 o")] {
+                    writeln!(p_out(&mut p_text), "{v} {name}({p}texture2D t, sampler s, vec2 uv{arg}, int c) {{\n    \
+                        ivec2 n = textureSize({p}sampler2D(t, s), 0); ivec2 m = n - 1;\n    \
+                        ivec2 i = ivec2(floor(uv * vec2(n) - 0.5)) + {off};\n    \
+                        {v} a = texelFetch({p}sampler2D(t, s), clamp(i + ivec2(0, 1), ivec2(0), m), 0);\n    \
+                        {v} b = texelFetch({p}sampler2D(t, s), clamp(i + ivec2(1, 1), ivec2(0), m), 0);\n    \
+                        {v} d = texelFetch({p}sampler2D(t, s), clamp(i + ivec2(1, 0), ivec2(0), m), 0);\n    \
+                        {v} e = texelFetch({p}sampler2D(t, s), clamp(i, ivec2(0), m), 0);\n    \
+                        return {v}(a[c], b[c], d[c], e[c]);\n}}\n\
+                        {v} {name}({p}texture2D t, sampler s, vec2 uv{arg}) {{ return {name}(t, s, uv{call}, 0); }}",
+                        call = if arg.is_empty() { "" } else { ", o" }).unwrap();
+                }
+            }
+            // Shadow lookups need derivatives: fragment stages only.
+            if self.kind == ShaderStage::Fragment {
+            p_text.push_str("vec4 hz_textureGather(texture2D t, samplerShadow s, vec2 uv, float r) {\n    \
+                vec2 n = vec2(textureSize(sampler2DShadow(t, s), 0));\n    \
+                vec2 i = floor(uv * n - 0.5) + 0.5;\n    \
+                return vec4(texture(sampler2DShadow(t, s), vec3((i + vec2(0.0, 1.0)) / n, r)),\n        \
+                texture(sampler2DShadow(t, s), vec3((i + vec2(1.0, 1.0)) / n, r)),\n        \
+                texture(sampler2DShadow(t, s), vec3((i + vec2(1.0, 0.0)) / n, r)),\n        \
+                texture(sampler2DShadow(t, s), vec3(i / n, r)));\n}\n");
+            }
+        }
+'''
+def edit_rewrite(s):
+    s = sub1(s, '                "texture2DProj" if called => Some("textureProj".into()),',
+             '                "texture2DProj" if called => Some("textureProj".into()),\n'
+             '                "texelFetch1D" | "texelFetch2D" | "texelFetch3D" if called => Some("texelFetch".into()),\n'
+             '                "textureSize1D" | "textureSize2D" | "textureSize3D" if called => Some("textureSize".into()),\n'
+             '                "textureGather" if called => Some("hz_textureGather".into()),\n'
+             '                "textureGatherOffset" if called => Some("hz_textureGatherOffset".into()),\n'
+             '                // Memory barriers: naga has the one `barrier()` (all memory, the workgroup in step).\n'
+             '                "memoryBarrierShared" | "memoryBarrier" | "groupMemoryBarrier" | "memoryBarrierImage"\n'
+             '                | "memoryBarrierBuffer" if called => Some("barrier".into()),')
+    gather = GATHER.replace('writeln!(p_out(&mut p_text), ', 'writeln!(p, ').replace('p_text.push_str(', 'p.push_str(')
+    # the loop variable `p` would shadow the prelude string: rename it
+    gather = gather.replace('for (p, v) in [("", "vec4"), ("i", "ivec4"), ("u", "uvec4")]', 'for (k, v) in [("", "vec4"), ("i", "ivec4"), ("u", "uvec4")]').replace('{p}texture2D', '{k}texture2D').replace('{p}sampler2D', '{k}sampler2D')
+    s = sub1(s, '        if self.kind == ShaderStage::Vertex {\n            p.push_str(\n                "const vec2 hz_quad',
+             gather.lstrip('\n') + '        if self.kind == ShaderStage::Vertex {\n            p.push_str(\n                "const vec2 hz_quad')
+    return s
+def edit_scan(s):
+    # A fragment output narrower than four components (`out vec3 color`): GL fills the target's
+    # other channels, wgpu refuses the pipeline. It writes a private variable, and a vec4 output
+    # of ours gets it after the pack's `main`.
+    s = sub1(s, '    pub(super) frag_outs: Vec<(u32, String)>,\n',
+             '    pub(super) frag_outs: Vec<(u32, String)>,\n    /// Iris Features: our wider outputs\' assignments, after the pack\'s `main`.\n    pub(super) widened: Vec<String>,\n')
+    s = sub1(s, '            frag_outs: Vec::new(),\n', '            frag_outs: Vec::new(),\n            widened: Vec::new(),\n')
+    s = sub1(s, '''                    self.frag_outs
+                        .push((n, format!("layout(location = {n}) out {ty} {name}{array};")));''', '''                    let widen = match ty.as_str() {
+                        "float" => Some(("vec4", format!("vec4({name}, 0.0, 0.0, 1.0)"))),
+                        "vec2" => Some(("vec4", format!("vec4({name}, 0.0, 1.0)"))),
+                        "vec3" => Some(("vec4", format!("vec4({name}, 1.0)"))),
+                        "int" => Some(("ivec4", format!("ivec4({name}, 0, 0, 0)"))),
+                        "ivec2" => Some(("ivec4", format!("ivec4({name}, 0, 0)"))),
+                        "ivec3" => Some(("ivec4", format!("ivec4({name}, 0)"))),
+                        "uint" => Some(("uvec4", format!("uvec4({name}, 0u, 0u, 0u)"))),
+                        "uvec2" => Some(("uvec4", format!("uvec4({name}, 0u, 0u)"))),
+                        "uvec3" => Some(("uvec4", format!("uvec4({name}, 0u)"))),
+                        _ => None,
+                    };
+                    match widen.filter(|_| array.is_empty()) {
+                        Some((wide, value)) => {
+                            self.frag_outs.push((
+                                n,
+                                format!("{ty} {name}; layout(location = {n}) out {wide} hz_fo{n};"),
+                            ));
+                            self.widened.push(format!("hz_fo{n} = {value};"));
+                        }
+                        None => self
+                            .frag_outs
+                            .push((n, format!("layout(location = {n}) out {ty} {name}{array};"))),
+                    }''')
+    return sub1(s, '            sampler_functions: HashMap::new(),',
+                '            // Iris Features: `textureGather` takes its sampler apart, as our helpers do.\n'
+                '            sampler_functions: [("textureGather", vec![true, false, false, false]), ("textureGatherOffset", vec![true, false, false, false])]\n'
+                '                .into_iter()\n                .map(|(n, p)| (n.to_owned(), p))\n                .collect(),')
+tr = sub1(tr, '    fragment_main.push_str("    hz_main();\\n");\n',
+          '    fragment_main.push_str("    hz_main();\\n");\n    for w in &f.widened {\n        writeln!(fragment_main, "    {w}").unwrap();\n    }\n')
+tr += '\n' + submod('scan', edit_scan) + '\n' + submod('rewrite', edit_rewrite)
 tr += own('shaders_atomic_stores.rs')
-tr = sub1(tr, '    let mut module = module;\n', '    let mut module = module;\n    if stage.kind == ShaderStage::Vertex {\n        atomic_vertex_stores(&mut module);\n    }\n')
+tr = sub1(tr, '    let mut module = module;\n', '    let mut module = module;\n    workgroup_barriers(&mut module);\n    if stage.kind == ShaderStage::Vertex {\n        atomic_vertex_stores(&mut module);\n    }\n')
 module('shaders-translate', SH + 'translate/mod.rs', 'iris_translate',
        '// The translator with Iris\'s storage buffers, images and compute programs, and the GLSL\n'
        '// packs written for Iris rely on.\n' + tr)

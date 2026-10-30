@@ -131,3 +131,45 @@ fn atomic_stores_in(
         }
     }
 }
+
+/// Iris Features: GLSL's `barrier()` waits for the whole workgroup. naga's GLSL frontend reads
+/// it as every kind of barrier, subgroups included, and its SPIR-V writer then gives the
+/// barrier a subgroup execution scope: only 32 invocations waited for each other, the rest of
+/// the workgroup raced on its shared memory (Eclipse's floodfill propagation came out a little
+/// different each frame on NVIDIA, and its light flickered). The workgroup barrier it means.
+fn workgroup_barriers(module: &mut naga::Module) {
+    fn fix(block: &mut naga::Block) {
+        use naga::Statement;
+        for stmt in block.iter_mut() {
+            match stmt {
+                Statement::ControlBarrier(flags) | Statement::MemoryBarrier(flags)
+                    if flags.contains(naga::Barrier::SUB_GROUP) =>
+                {
+                    flags.remove(naga::Barrier::SUB_GROUP);
+                    flags.insert(naga::Barrier::WORK_GROUP);
+                }
+                Statement::Block(b) => fix(b),
+                Statement::If { accept, reject, .. } => {
+                    fix(accept);
+                    fix(reject);
+                }
+                Statement::Switch { cases, .. } => {
+                    for c in cases.iter_mut() {
+                        fix(&mut c.body);
+                    }
+                }
+                Statement::Loop { body, continuing, .. } => {
+                    fix(body);
+                    fix(continuing);
+                }
+                _ => {}
+            }
+        }
+    }
+    for (_, f) in module.functions.iter_mut() {
+        fix(&mut f.body);
+    }
+    for ep in module.entry_points.iter_mut() {
+        fix(&mut ep.function.body);
+    }
+}

@@ -107,6 +107,13 @@ a = t.index('            // Storage buffer 4\'s members')
 b = t.index('            let (_, lightmap) = view(')
 t = t[:a] + t[b:]
 t = sub1(t, 'PackPost::new(&device, &queue, post,', 'PackPost::iris_new(&device, &queue, post,')
+# `IRIS_TEST_NOTES`: every note of loading the pack.
+t = sub1(t, '            for n in pp.notes.iter().filter_map(|n| n.split_once(": zero for now: ")) {', '''            if std::env::var_os("IRIS_TEST_NOTES").is_some() {
+                for n in &pp.notes {
+                    println!("  note: {}", n.chars().take(400).collect::<String>());
+                }
+            }
+            for n in pp.notes.iter().filter_map(|n| n.split_once(": zero for now: ")) {''')
 t = sub1(t, '            | wgpu::Features::SUBGROUP_BARRIER;\n', '            | wgpu::Features::SUBGROUP_BARRIER\n            | wgpu::Features::TEXTURE_ATOMIC;\n')
 t = sub1(t, '        println!("features: {features:?}");\n', '        println!("features: {features:?}");\n        horizon_shaders::iris::set_image_atomics(features.contains(wgpu::Features::TEXTURE_ATOMIC) && std::env::var_os("IRIS_TEST_NO_ATOMICS").is_none());\n')
 t = sub1(t, '&& let Some(b) = pp.iris.as_ref().and_then(|i| i.buffer(4))',

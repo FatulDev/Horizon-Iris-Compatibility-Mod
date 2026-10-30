@@ -93,6 +93,37 @@ ir = sub1(ir, '''            | wgpu::TextureUsages::COPY_DST
             && horizon_shaders::iris::image_atomics();
         let usage = if atomic { usage | wgpu::TextureUsages::STORAGE_ATOMIC } else { usage };
         let made = checked(device, || {''')
+# Raw custom textures of other formats than RGBA8: one to four channels of bytes, 16-bit
+# unsigned or half floats, or floats (Noble's cloud noise is RGB8); three channels gain an
+# opaque alpha.
+ir = sub1(ir, """            let per = match (raw.internal.as_str(), raw.pixel_type.as_str()) {
+                ("RGBA8" | "RGBA", "UNSIGNED_BYTE") => 4,
+                (i, t) => return Err(format!("raw {i} {t} is not supported")),
+            };
+            let n = (raw.size[0] * raw.size[1] * raw.size[2]) as usize * per;
+            if bytes.len() < n {
+                return Err(format!("{} bytes, {n} expected", bytes.len()));
+            }""", """            let Some((fmt, channels, size_of)) = raw_layout(&raw.internal, &raw.pixel_type) else {
+                return Err(format!("raw {} {} is not supported", raw.internal, raw.pixel_type));
+            };
+            format = fmt;
+            let texels = (raw.size[0] * raw.size[1] * raw.size[2]) as usize;
+            let n = texels * channels * size_of;
+            if bytes.len() < n {
+                return Err(format!("{} bytes, {n} expected", bytes.len()));
+            }
+            let data = widen_rgb(&bytes[..n], channels, size_of, &raw.pixel_type);
+            let per = data.len() / texels.max(1);""")
+ir = sub1(ir, "            (d, v, raw.size, bytes[..n].to_vec(), per as u32)", "            (d, v, raw.size, data, per as u32)")
+ir = sub1(ir, """    let (dimension, view_dimension, size, texels, bytes_per_texel) = match &decl.raw {""",
+          """    let mut format = wgpu::TextureFormat::Rgba8Unorm;
+    let (dimension, view_dimension, size, texels, bytes_per_texel) = match &decl.raw {""")
+ir = sub1(ir, """            dimension,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,""", """            dimension,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,""")
+ir += open(os.path.join(ROOT, 'src', 'render_raw_textures.rs')).read()
 ir = sub1(ir, 'use horizon_shaders::{Group, Interface, WorkGroups};\n',
           'use horizon_shaders::iris::WorkGroups;\nuse horizon_shaders::{Group, Interface};\n')
 ir = sub1(ir, 'use super::{BUFFERS, Binding, PackPost, SamplerKind, Source, checked, entry, source};\n', 'use super::*;\n')
