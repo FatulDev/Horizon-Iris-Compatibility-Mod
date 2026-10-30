@@ -1,0 +1,7 @@
+# Generated: tools/build.py writes out/, tools/package.py writes dist/ (attach the zip to a release).
+out/
+dist/
+mods/
+ref-*/
+__pycache__/
+*.pyc
