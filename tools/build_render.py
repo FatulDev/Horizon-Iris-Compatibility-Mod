@@ -134,6 +134,41 @@ ir = sub1(ir, '''    name: &str,
     storage: &(Vec<ImageUse>, Vec<u32>),
     modules: &[(wgpu::ShaderStages, &naga::Module)],''')
 ir = sub1(ir, '    for u in &interface.images {', '    for u in &storage.0 {')
+# Iris's `colorimgN`: colour buffer N as an image (Photon, Noble). It binds the side programs
+# read; the pass's bind group follows that side (`reads`).
+ir = sub1(ir, """        let Some((k, format, dimension)) = with_build(|b| {
+            b.images
+                .iter()
+                .position(|i| i.0 == u.name)
+                .map(|k| (k, b.images[k].2, b.images[k].3))
+        })
+        .flatten() else {""", """        if let Some(n) = u.name.strip_prefix("colorimg").and_then(|n| n.parse::<usize>().ok()).filter(|n| *n < BUFFERS) {
+            let Some(format) = color_format(n) else {
+                notes.push(format!("{name}: image `{}`: colour buffer {n} can't be an image here; skipped", u.name));
+                return None;
+            };
+            let (stages, _) = uses(modules, u.binding);
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: u.binding,
+                visibility: if stages.is_empty() { wgpu::ShaderStages::all() } else { stages },
+                ty: wgpu::BindingType::StorageTexture {
+                    access: u.access,
+                    format,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            });
+            pass.images.push((u.binding, COLOR_IMAGE + n));
+            continue;
+        }
+        let Some((k, format, dimension)) = with_build(|b| {
+            b.images
+                .iter()
+                .position(|i| i.0 == u.name)
+                .map(|k| (k, b.images[k].2, b.images[k].3))
+        })
+        .flatten() else {""")
+
 ir = sub1(ir, '    for &index in &interface.buffers {', '    for &index in &storage.1 {')
 s0 = ir.index('        if let Some(q) = qualifier_format(&u.format)')
 s1 = ir.index('        let (stages, writes) = uses(modules, u.binding);')
@@ -143,6 +178,8 @@ a1 = ir.index('};', a0) + 3
 ir = ir[:a0] + '        let access = u.access;\n' + ir[a1:]
 ir = sub1(ir, '    let mut iris = storage_entries(&c.name, interface, &modules, &mut entries, notes)?;',
           '    let uses = storage_uses(&modules);\n    let mut iris = storage_entries(&c.name, &uses, &modules, &mut entries, notes)?;')
+ir = sub1(ir, '    let mut module = c.program.module;\n    let modules = [(compute, &module)];\n',
+          '    let mut module = c.program.module;\n    declared_image_formats(&mut module);\n    let modules = [(compute, &module)];\n')
 ir, _ = cut(ir, r'^pub\(super\) fn qualifier_format\(')
 # Replaced by `unify_storage_access` (both stages of a pass at once).
 ir, _ = cut(ir, r'^pub\(super\) fn read_only_where_unwritten\(')
@@ -185,6 +222,8 @@ ir = sub1(ir, """        let horizon_has = s.name != "noisetex"
         let horizon_has = s.name != "noisetex" && horizon_source != Source::Dummy && !overridable;""")
 ir = sub1(ir, '    let stage = stage_of(group);\n', '    let stage = stage_of(group);\n    let flipped = flipped_before(stage, program_order(group, name));\n')
 ir = sub1(ir, 'c: horizon_shaders::ComputePass,', 'c: horizon_shaders::iris::ComputePass,')
+ir = sub1(ir, '        reads: s.reads,\n', '        reads: s.reads | color_reads,\n')
+ir = sub1(ir, '    super::share_samplers(&mut module, &s.slots);\n', '    super::share_samplers(&mut module, &s.slots);\n    let color_reads = color_images(&iris);\n')
 ir = sub1(ir, 'post: &mut horizon_shaders::IrisPost,', 'post: &mut horizon_shaders::iris::IrisPost,')
 ir = ir.replace('super::pack_uniforms::iris_index(', 'super::pack_uniforms::iris_uniforms::iris_index(')
 
@@ -194,6 +233,7 @@ new = take(pp_ref, r'^    pub fn new\(')
 new = sub1(new, 'pub fn new(', 'pub(crate) fn iris_new(')
 new = sub1(new, 'iris::set_build(Some(iris.context(features)));', 'iris::set_build(Some(iris.context(features)));\n        iris::record_writes(&post.programs);')
 new = sub1(new, 'let mut iris_post = post.iris;', 'let mut iris_post = horizon_shaders::iris::take_pending();')
+new = sub1(new, '        iris::set_build(Some(iris.context(features)));\n', '        iris::set_build(Some(iris.context(features)));\n        set_color_formats(formats, features);\n')
 new = sub1(new, 'custom.forget_smoothing();', 'horizon_shaders::iris::forget_smoothing(&mut custom);')
 new = sub1(new, '.flat_map(|p| p.iris.textures.iter().copied())', '.flat_map(|p| built_pass(&p.ubo).textures)')
 new = sub1(new, '        Self {\n            notes,\n', '        let pp = Self {\n            notes,\n')
@@ -247,6 +287,7 @@ new = sub1(new, '''        let weather_geometry = world.weather.then(|| Geometry
             depth_write: iris_post.rain_depth,''')
 new = sub1(new, '        let pp = Self {\n', '        let mut pp = Self {\n')
 new = sub1(new, '        register(&pp, iris);\n', '''        register(&pp, iris);
+        log_gpu_errors(device);
         if let Some(p) = &particles_translucent {
             pp.notes.push(format!("translucent particles draw with {}", p.name));
         }
@@ -278,11 +319,23 @@ bind = sub1(bind, '''            self.sampler_entries(
                 pass.group,
                 &pass.samplers,
                 &pi.textures,''')
-bind = sub1(bind, 'self.iris_entries(&pass.iris, &mut entries);', 'iris_entries(iris, &pi, &mut entries);')
+bind = sub1(bind, 'self.iris_entries(&pass.iris, &mut entries);', 'iris_entries(iris, &pi, &|n| self.color_view(n), &mut entries);')
 copies.append(bind)
 rs = take(pp_ref, r'^    fn run_shadow\(')
 rs = sub1(rs, '    fn run_shadow(', '    pub(super) fn iris_run_shadow(')
 copies.append(rs)
+# The colour buffers can be bound as images (`colorimgN`) where their format allows.
+rz = take(pp_ref, r'^    fn resize\(')
+rz = sub1(rz, '    fn resize(', '    pub(super) fn iris_resize_targets(')
+rz = sub1(rz, '''                let sides =
+                    [0, 1].map(|_| texture_levels(&label, self.formats[i], attachment, levels));''', '''                let attachment = if storage_capable(self.formats[i], device.features()) {
+                    attachment | wgpu::TextureUsages::STORAGE_BINDING
+                } else {
+                    attachment
+                };
+                let sides =
+                    [0, 1].map(|_| texture_levels(&label, self.formats[i], attachment, levels));''')
+copies.append(rz)
 run = take(pp_ref, r'^    pub fn run\(')
 run = sub1(run, '    pub fn run(', '    pub(super) fn iris_run(')
 run = sub1(run, '''        let notes = &mut self.notes;
@@ -301,13 +354,15 @@ run = sub1(run, '        self.resize(device, size);\n',
 run = sub1(run, '        self.iris_begin_frame(encoder);\n', '        self.iris_begin_frame(device, encoder);\n')
 assert run.count('self.draw_translucent(device, queue, encoder, size, terrain);') == 2
 run = re.sub(r'( *)self\.draw_translucent\(device, queue, encoder, size, terrain\);\n',
-             lambda m: m.group(0) + m.group(1) + 'self.iris_draw_hand_translucent(device, queue, encoder, size, frame);\n', run)
+             lambda m: m.group(0) + m.group(1) + 'self.iris_draw_hand_translucent(device, queue, encoder, size, frame);\n' + m.group(1) + 'self.iris_draw_outline(device, queue, encoder, frame);\n', run)
 copies.append(run)
 impl = 'impl PackPost {\n' + re.sub(r'(?<![\w:])super::', 'super::super::', '\n'.join(copies)) + '}\n'
 # build_pass.
 bp = take(pp_ref, r'^fn build_pass\(')
 bp = sub1(bp, '''    iris::read_only_where_unwritten(&mut p.program.vertex);
-    iris::read_only_where_unwritten(&mut p.program.fragment);''', '''    unify_storage_access([&mut p.program.vertex, &mut p.program.fragment]);
+    iris::read_only_where_unwritten(&mut p.program.fragment);''', '''    declared_image_formats(&mut p.program.vertex);
+    declared_image_formats(&mut p.program.fragment);
+    unify_storage_access([&mut p.program.vertex, &mut p.program.fragment]);
     let uses = storage_uses(&[
         (wgpu::ShaderStages::VERTEX, &p.program.vertex),
         (wgpu::ShaderStages::FRAGMENT, &p.program.fragment),
@@ -318,6 +373,8 @@ bp = sub1(bp, '''        &p.name,
         &uses,
         &modules,''')
 bp = sub1(bp, '        iris: pass_iris,\n', '')
+bp = sub1(bp, '        reads,\n', '        reads: reads | color_reads,\n')
+bp = sub1(bp, '    pass_iris.textures = resolved.extras;\n', '    pass_iris.textures = resolved.extras;\n    let color_reads = color_images(&pass_iris);\n')
 # An output past the program's last buffer (Luster writes two, `RENDERTARGETS: 1` names one):
 # Iris drops it; a trailing empty target would not match the pass's attachments.
 bp = sub1(bp, '''    if !final_pass && writes.is_empty() {''', '''    while targets.last().is_some_and(|t| t.is_none()) {
@@ -656,3 +713,22 @@ fn iris_draw_hand(
 ''', [binding('pp', '&mut PackPost', '&mut *self'), binding('device', '&wgpu::Device', 'device'),
       binding('queue', '&wgpu::Queue', 'queue'), binding('encoder', '&mut wgpu::CommandEncoder', '&mut *encoder'),
       binding('size', '[u32; 2]', 'size'), binding('frame', '&super::Frame', 'frame')])
+
+# The hit block's outline: the mod draws it after deferred (`iris_draw_outline`), not Horizon
+# into the pack's colour before it.
+hook('outline', 'horizon_client_render::gfx::Renderer::draw_outline', '''\
+fn iris_skip_outline(r: &Renderer) -> ::core::ops::ControlFlow<()> {
+    if matches!(r.pack_post, Some((_, Some(_)))) {
+        ::core::ops::ControlFlow::Break(())
+    } else {
+        ::core::ops::ControlFlow::Continue(())
+    }
+}
+''', [binding('r', '&Renderer', 'self')])
+
+hook('resize-targets', 'horizon_client_render::gfx::pack_post::PackPost::resize', '''\
+fn iris_resize_targets(pp: &mut PackPost, device: &wgpu::Device, size: [u32; 2]) -> ::core::ops::ControlFlow<()> {
+    pp.iris_resize_targets(device, size);
+    ::core::ops::ControlFlow::Break(())
+}
+''', [binding('pp', '&mut PackPost', '&mut *self'), binding('device', '&wgpu::Device', 'device'), binding('size', '[u32; 2]', 'size')])

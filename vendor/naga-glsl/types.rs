@@ -157,10 +157,16 @@ pub fn parse_type(type_name: &str) -> Option<Type> {
                 let kind = iter.next()?;
                 let size = iter.next()?;
                 // TODO: Check that the texture format and the kind match
-                let _ = texture_kind(kind)?;
+                let scalar_kind = texture_kind(kind)?;
 
+                // Iris Features: a placeholder of the image's kind, for images declared without
+                // a format (the renderer gives the real one).
                 let class = ImageClass::Storage {
-                    format: naga::StorageFormat::R8Uint,
+                    format: match scalar_kind {
+                        ScalarKind::Sint => naga::StorageFormat::R32Sint,
+                        ScalarKind::Uint => naga::StorageFormat::R32Uint,
+                        _ => naga::StorageFormat::Rgba32Float,
+                    },
                     access: naga::StorageAccess::LOAD | naga::StorageAccess::STORE,
                 };
 

@@ -268,6 +268,29 @@ impl<'a> Context<'a> {
     }
 
     pub fn add_expression(&mut self, expr: Expression, meta: Span) -> Result<Handle<Expression>> {
+        // Iris Features: a shift of integer literals wraps, as GLSL's does (`1 << 31` is
+        // `0x80000000`); naga's constant evaluator calls it an overflow.
+        let expr = match expr {
+            Expression::Binary { op: BinaryOperator::ShiftLeft, left, right } => {
+                let arena = if self.is_const { &self.module.global_expressions } else { &self.expressions };
+                match (&arena[left], &arena[right]) {
+                    (Expression::Literal(naga::Literal::I32(a)), Expression::Literal(naga::Literal::I32(b))) => {
+                        Expression::Literal(naga::Literal::I32(a.wrapping_shl(*b as u32)))
+                    }
+                    (Expression::Literal(naga::Literal::U32(a)), Expression::Literal(naga::Literal::U32(b))) => {
+                        Expression::Literal(naga::Literal::U32(a.wrapping_shl(*b)))
+                    }
+                    (Expression::Literal(naga::Literal::U32(a)), Expression::Literal(naga::Literal::I32(b))) => {
+                        Expression::Literal(naga::Literal::U32(a.wrapping_shl(*b as u32)))
+                    }
+                    (Expression::Literal(naga::Literal::I32(a)), Expression::Literal(naga::Literal::U32(b))) => {
+                        Expression::Literal(naga::Literal::I32(a.wrapping_shl(*b)))
+                    }
+                    _ => Expression::Binary { op: BinaryOperator::ShiftLeft, left, right },
+                }
+            }
+            other => other,
+        };
         let mut eval = if self.is_const {
             naga::proc::ConstantEvaluator::for_glsl_module(
                 self.module,

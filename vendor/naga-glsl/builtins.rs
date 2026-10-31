@@ -2074,6 +2074,32 @@ fn texture_call(
             ctx.conversion(array_index_expr, meta, Scalar::I32)?;
         }
 
+        // Iris Features: `texture()` of an integer texture (`usampler2D`), which GL drivers
+        // answer with the nearest texel and naga refuses: a fetch of the texel the coordinate
+        // falls in.
+        if let TypeInner::Image { class: naga::ImageClass::Sampled { kind: naga::ScalarKind::Sint | naga::ScalarKind::Uint, .. }, .. } =
+            *ctx.resolve_type(image, meta)?
+            && comps.depth_ref.is_none()
+        {
+            let lod = match level {
+                SampleLevel::Exact(e) => {
+                    let mut e = e;
+                    ctx.conversion(&mut e, meta, Scalar::I32)?;
+                    e
+                }
+                _ => ctx.add_expression(Expression::Literal(naga::Literal::I32(0)), meta)?,
+            };
+            let size = ctx.add_expression(Expression::ImageQuery { image, query: ImageQuery::Size { level: Some(lod) } }, meta)?;
+            let size_f = ctx.add_expression(Expression::As { expr: size, kind: Sk::Float, convert: Some(4) }, meta)?;
+            let scaled = ctx.add_expression(Expression::Binary { op: BinaryOperator::Multiply, left: comps.coordinate, right: size_f }, meta)?;
+            let floored = ctx.add_expression(Expression::Math { fun: MathFunction::Floor, arg: scaled, arg1: None, arg2: None, arg3: None }, meta)?;
+            let texel = ctx.add_expression(Expression::As { expr: floored, kind: Sk::Sint, convert: Some(4) }, meta)?;
+            return ctx.add_expression(
+                Expression::ImageLoad { image, coordinate: texel, array_index, sample: None, level: Some(lod) },
+                meta,
+            );
+        }
+
         Ok(ctx.add_expression(
             Expression::ImageSample {
                 image,

@@ -14,7 +14,7 @@ PRISTINE = os.path.expanduser('~/hz-pristine')
 OUT = os.path.join(ROOT, 'out', 'iris-features')
 
 MOD_ID = 'iris-features'
-VERSION = '0.1.20'
+VERSION = '0.1.21'
 HORIZON = 'fca2169de9c014be8b6606ac1f3dba0bcda3731a'
 MIXINS = '5140cdf81915c25f10a7745eb532e1c09f275068'
 
@@ -311,6 +311,25 @@ GATHER = r'''
                     ivec4 hz_atomic_{f}(int v) {{ return ivec4(v); }}").unwrap();
             }
         }
+        // `textureQueryLod` (the mip level a fragment's lookup would take), from the coordinate's
+        // derivatives, and `textureGatherOffsets` (four offsets), from four fetches.
+        if self.kind == ShaderStage::Fragment && self.tokens.iter().any(|t| *t == "textureQueryLod") {
+            p_text.push_str("vec2 hz_textureQueryLod(texture2D t, sampler s, vec2 uv) {\n    \
+                vec2 p = uv * vec2(textureSize(sampler2D(t, s), 0));\n    \
+                float l = 0.5 * log2(max(dot(dFdx(p), dFdx(p)), dot(dFdy(p), dFdy(p))));\n    \
+                float n = float(textureQueryLevels(sampler2D(t, s)) - 1);\n    \
+                return vec2(clamp(l, 0.0, n), l);\n}\n");
+        }
+        if self.tokens.iter().any(|t| *t == "textureGatherOffsets") {
+            for (k, v) in [("", "vec4"), ("i", "ivec4"), ("u", "uvec4")] {
+                writeln!(p_out(&mut p_text), "{v} hz_textureGatherOffsets({k}texture2D t, sampler s, vec2 uv, ivec2 o[4], int c) {{\n    \
+                    ivec2 n = textureSize({k}sampler2D(t, s), 0); ivec2 m = n - 1;\n    \
+                    ivec2 i = ivec2(floor(uv * vec2(n) - 0.5));\n    \
+                    return {v}(texelFetch({k}sampler2D(t, s), clamp(i + o[0], ivec2(0), m), 0)[c], texelFetch({k}sampler2D(t, s), clamp(i + o[1], ivec2(0), m), 0)[c],\n        \
+                        texelFetch({k}sampler2D(t, s), clamp(i + o[2], ivec2(0), m), 0)[c], texelFetch({k}sampler2D(t, s), clamp(i + o[3], ivec2(0), m), 0)[c]);\n}}\n\
+                    {v} hz_textureGatherOffsets({k}texture2D t, sampler s, vec2 uv, ivec2 o[4]) {{ return hz_textureGatherOffsets(t, s, uv, o, 0); }}").unwrap();
+            }
+        }
         if self.tokens.iter().any(|t| *t == "dot") {
             p_text.push_str("float hz_dot(float a, float b) { return a * b; }\n\
                 float hz_dot(vec2 a, vec2 b) { return dot(a, b); }\n\
@@ -367,13 +386,15 @@ def edit_rewrite(s):
     # `gl_VertexID` before the vertex inputs (`gl_Vertex...`): it is not `hz_VertexID`.
     s = sub1(s, '                "gl_VertexID" => Some("gl_VertexIndex".into()),\n', '')
     s = sub1(s, '                "gl_FragColor" => Some("hz_out0".into()),\n',
-             '                "gl_VertexID" => Some("gl_VertexIndex".into()),\n                "gl_FragColor" => Some("hz_out0".into()),\n')
+             '                "gl_VertexID" => Some("gl_VertexIndex".into()),\n                "gl_FogFragCoord" => Some("hz_FogFragCoord".into()),\n                "gl_FragColor" => Some("hz_out0".into()),\n')
     s = sub1(s, '                "texture2DProj" if called => Some("textureProj".into()),',
              '                "texture2DProj" if called => Some("textureProj".into()),\n'
              '                "texelFetch1D" | "texelFetch2D" | "texelFetch3D" if called => Some("texelFetch".into()),\n'
              '                "textureSize1D" | "textureSize2D" | "textureSize3D" if called => Some("textureSize".into()),\n'
              '                "textureGather" if called => Some("hz_textureGather".into()),\n'
              '                "textureGatherOffset" if called => Some("hz_textureGatherOffset".into()),\n'
+             '                "textureGatherOffsets" if called => Some("hz_textureGatherOffsets".into()),\n'
+             '                "textureQueryLod" if called => Some("hz_textureQueryLod".into()),\n'
              '                // naga takes `dot` of vectors only; GLSL also of two floats (Pegasus).\n'
              '                "dot" if called => Some("hz_dot".into()),\n'
              '                // Memory barriers: naga has the one `barrier()` (all memory, the workgroup in step).\n'
@@ -554,9 +575,38 @@ def edit_scan(s):
     # A global `float[5] w = ...` initialized in our `main`: its type keeps its size.
     s = sub1(s, """                t if ty.is_empty() || t == "[" => ty.push_str(t),""",
              """                t if ty.is_empty() || t == "[" || t == "]" || ty.ends_with('[') => ty.push_str(t),""")
+    # An integer varying is flat, as GL drivers take it without the qualifier (wgpu wants it).
+    s = sub1(s, """            let decl = format!("{interpolation}{ty} @{array};");""", """            let integer = ty.starts_with("int") || ty.starts_with("uint") || ty.starts_with("ivec")
+                || ty.starts_with("uvec") || ty == "bool" || ty.starts_with("bvec");
+            let decl = if integer && !interpolation.contains("flat") {
+                format!("flat {ty} @{array};")
+            } else {
+                format!("{interpolation}{ty} @{array};")
+            };""")
+    # `gl_FogFragCoord` (RedHat): a float varying of ours, as `gl_FrontColor` is a vec4 one.
+    s = sub1(s, """                "gl_FrontColor" => s.builtin_varying("hz_FrontColor".into()),
+""", """                "gl_FrontColor" => s.builtin_varying("hz_FrontColor".into()),
+                "gl_FogFragCoord" => {
+                    let list = if kind == ShaderStage::Vertex { &mut s.outs } else { &mut s.ins };
+                    if !list.iter().any(|v| v.name == "hz_FogFragCoord") {
+                        list.push(Var { name: "hz_FogFragCoord".into(), decl: "float @;".into() });
+                    }
+                }
+""")
+    # Integer varyings are flat (GL requires it of fragment inputs; drivers let vertex outputs
+    # without it through, wgpu doesn't).
+    s = sub1(s, """        let input = matches!(storage, "in" | "attribute") || (storage == "varying" && fragment);
+""", """        let input = matches!(storage, "in" | "attribute") || (storage == "varying" && fragment);
+        if storage != "uniform"
+            && matches!(ty.trim_end_matches(char::is_numeric), "int" | "uint" | "ivec" | "uvec")
+            && !interpolation.contains("flat")
+        {
+            interpolation.insert_str(0, "flat ");
+        }
+""")
     return sub1(s, '            sampler_functions: HashMap::new(),',
                 '            // Iris Features: `textureGather` takes its sampler apart, as our helpers do.\n'
-                '            sampler_functions: [("textureGather", vec![true, false, false, false]), ("textureGatherOffset", vec![true, false, false, false])]\n'
+                '            sampler_functions: [("textureGather", vec![true, false, false, false]), ("textureGatherOffset", vec![true, false, false, false]), ("textureGatherOffsets", vec![true, false, false, false]), ("textureQueryLod", vec![true, false])]\n'
                 '                .into_iter()\n                .map(|(n, p)| (n.to_owned(), p))\n                .collect(),')
 tr = sub1(tr, '    vertex_main.push_str("    hz_main();\\n");\n',
           '    vertex_main.push_str("    hz_main();\\n");\n    for w in &v.struct_copies {\n        writeln!(vertex_main, "    {w}").unwrap();\n    }\n')
@@ -634,7 +684,7 @@ tr = sub1(tr, '    let mut module = module;\n', '''    let mut module = module;
         REWRITES.with(|r| r.set(r.get() - 1));
         return again;
     }
-''' + '    workgroup_barriers(&mut module);\n    vector_modulo(&mut module);\n    private_struct_strides(&mut module);\n    callees_first(&mut module);\n    image_atomics(&mut module);\n    if stage.kind == ShaderStage::Vertex {\n        atomic_vertex_stores(&mut module);\n    }\n')
+''' + '    workgroup_barriers(&mut module);\n    vector_modulo(&mut module);\n    private_struct_strides(&mut module);\n    callees_first(&mut module);\n    atomic_types(&mut module);\n    base_level_lookups(&mut module);\n    image_atomics(&mut module);\n    if stage.kind == ShaderStage::Vertex {\n        atomic_vertex_stores(&mut module);\n    }\n')
 module('shaders-translate', SH + 'translate/mod.rs', 'iris_translate',
        '// The translator with Iris\'s storage buffers, images and compute programs, and the GLSL\n'
        '// packs written for Iris rely on.\n' + tr)

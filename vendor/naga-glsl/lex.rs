@@ -88,6 +88,9 @@ impl Iterator for Lexer<'_> {
                     "mediump" => TokenValue::PrecisionQualifier(Precision::Medium),
                     "lowp" => TokenValue::PrecisionQualifier(Precision::Low),
                     "restrict" => TokenValue::Restrict,
+                    // Iris Features: memory qualifiers naga has no use for (it orders memory by
+                    // barriers): read as `restrict`, which it also ignores.
+                    "coherent" | "volatile" => TokenValue::Restrict,
                     "readonly" => TokenValue::MemoryQualifier(StorageAccess::LOAD),
                     "writeonly" => TokenValue::MemoryQualifier(StorageAccess::STORE),
                     // values

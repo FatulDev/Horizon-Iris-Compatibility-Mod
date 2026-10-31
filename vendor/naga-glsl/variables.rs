@@ -249,8 +249,15 @@ impl Frontend {
         name: &str,
         meta: Span,
     ) -> Result<Handle<Expression>> {
+        // Iris Features: a pointer to a matrix's column (`m[1].x`) is a value pointer to a
+        // vector, swizzled as a vector behind a pointer.
+        let column;
         let (ty, is_pointer) = match *ctx.resolve_type(expression, meta)? {
             TypeInner::Pointer { base, .. } => (&ctx.module.types[base].inner, true),
+            TypeInner::ValuePointer { size: Some(size), scalar, .. } => {
+                column = TypeInner::Vector { size, scalar };
+                (&column, true)
+            }
             ref ty => (ty, false),
         };
         match *ty {
@@ -602,12 +609,11 @@ impl Frontend {
                                     Some((QualifierValue::Format(f), _)) => format = f,
                                     // TODO: glsl supports images without format qualifier
                                     // if they are `writeonly`
-                                    None => self.errors.push(Error {
-                                        kind: ErrorKind::SemanticError(
-                                            "image types require a format layout qualifier".into(),
-                                        ),
-                                        meta,
-                                    }),
+                                    // Iris Features: an image without a format (`writeonly uniform
+                                    // image3D img;`) keeps the type's placeholder; the renderer
+                                    // gives it its declared image's format before it builds the
+                                    // pipeline.
+                                    None => {}
                                     _ => unreachable!(),
                                 }
 

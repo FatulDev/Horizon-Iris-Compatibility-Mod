@@ -38,6 +38,13 @@ impl Frontend {
         raw_args: &[Handle<HirExpr>],
         meta: Span,
     ) -> Result<Option<Handle<Expression>>> {
+        // Iris Features: atomics on buffer and shared memory (`atomicAdd(counts[i], 1u)`).
+        if let FunctionCallKind::Function(ref name) = fc
+            && let Some(fun) = atomic_function(name)
+            && raw_args.len() == if name == "atomicCompSwap" { 3 } else { 2 }
+        {
+            return self.atomic_call(ctx, stmt, name, fun, raw_args, meta).map(Some);
+        }
         let args: Vec<_> = raw_args
             .iter()
             .map(|e| ctx.lower_expect_inner(stmt, self, *e, ExprPos::Rhs))
@@ -55,6 +62,61 @@ impl Frontend {
                 self.function_call(ctx, stmt, name, args, raw_args, meta)
             }
         }
+    }
+
+    /// `atomicAdd(mem, v)` and its kin: an atomic statement on `mem`'s pointer, its old value
+    /// the call's. The memory's type becomes atomic afterwards (`atomic_types`).
+    fn atomic_call(
+        &mut self,
+        ctx: &mut Context,
+        stmt: &StmtContext,
+        name: &str,
+        fun: naga::AtomicFunction,
+        raw_args: &[Handle<HirExpr>],
+        meta: Span,
+    ) -> Result<Handle<Expression>> {
+        let (pointer, _) = ctx.lower_expect_inner(stmt, self, raw_args[0], ExprPos::Lhs)?;
+        let scalar = match *ctx.resolve_type(pointer, meta)? {
+            TypeInner::Pointer { base, .. } => match ctx.module.types[base].inner {
+                TypeInner::Scalar(s) => s,
+                TypeInner::Atomic(s) => s,
+                _ => {
+                    return Err(Error {
+                        kind: ErrorKind::SemanticError(format!("`{name}` on memory that is not an integer").into()),
+                        meta,
+                    })
+                }
+            },
+            TypeInner::ValuePointer { size: None, scalar, .. } => scalar,
+            _ => {
+                return Err(Error {
+                    kind: ErrorKind::SemanticError(format!("`{name}` needs a variable to work on").into()),
+                    meta,
+                })
+            }
+        };
+        let mut lower_value = |ctx: &mut Context, this: &mut Self, e: Handle<HirExpr>| -> Result<Handle<Expression>> {
+            let (mut v, vmeta) = ctx.lower_expect_inner(stmt, this, e, ExprPos::Rhs)?;
+            ctx.implicit_conversion(&mut v, vmeta, scalar)?;
+            Ok(v)
+        };
+        let fun = if name == "atomicCompSwap" {
+            let compare = lower_value(ctx, self, raw_args[1])?;
+            naga::AtomicFunction::Exchange { compare: Some(compare) }
+        } else {
+            fun
+        };
+        let value = lower_value(ctx, self, raw_args[raw_args.len() - 1])?;
+        let ty = ctx.module.types.insert(Type { name: None, inner: TypeInner::Scalar(scalar) }, Span::default());
+        ctx.emit_end();
+        let result = ctx.expressions.append(Expression::AtomicResult { ty, comparison: false }, meta);
+        ctx.local_expression_kind_tracker.insert(result, naga::proc::ExpressionKind::Runtime);
+        ctx.emit_start();
+        ctx.body.push(
+            naga::Statement::Atomic { pointer, fun, value, result: Some(result) },
+            meta,
+        );
+        Ok(result)
     }
 
     fn constructor_single(
@@ -746,13 +808,9 @@ impl Frontend {
                 // No overload was better than the other this can be caused
                 // when all conversions are ambiguous in which the overloads themselves are
                 // ambiguous.
-                None => {
-                    ambiguous = true;
-                    // Assign the new overload, this helps ensures that in this case of
-                    // ambiguity the parsing won't end immediately and allow for further
-                    // collection of errors.
-                    maybe_overload = Some(overload);
-                }
+                // Iris Features: the drivers Iris packs are written for take the call with one of
+                // them (`max(uintValue, 1)`); the first found stays.
+                None => {}
             }
         }
 
@@ -1619,4 +1677,20 @@ fn builtin_required_variations<'a>(args: impl Iterator<Item = &'a TypeInner>) ->
     }
 
     variations
+}
+
+/// The atomic function of a GLSL atomic built-in's name (`atomicCompSwap`'s comparison comes later).
+fn atomic_function(name: &str) -> Option<naga::AtomicFunction> {
+    use naga::AtomicFunction as A;
+    Some(match name {
+        "atomicAdd" => A::Add,
+        "atomicMin" => A::Min,
+        "atomicMax" => A::Max,
+        "atomicAnd" => A::And,
+        "atomicOr" => A::InclusiveOr,
+        "atomicXor" => A::ExclusiveOr,
+        "atomicExchange" => A::Exchange { compare: None },
+        "atomicCompSwap" => A::Exchange { compare: None },
+        _ => return None,
+    })
 }

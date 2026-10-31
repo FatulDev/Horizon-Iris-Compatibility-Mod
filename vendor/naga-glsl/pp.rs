@@ -292,7 +292,11 @@ impl<'a> Preprocessor<'a> {
             if digits.ends_with('h') {
                 return Err((PreprocessorError::NotSupported16BitLiteral, location));
             }
-            let value: f32 = digits.parse::<f64>().map_err(|_| (PreprocessorError::FloatParsingError, location))? as f32;
+            // A literal past f32's range (`1e39`) is the largest float, as drivers read it.
+            let value: f32 = digits
+                .parse::<f64>()
+                .map_err(|_| (PreprocessorError::FloatParsingError, location))?
+                .clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32;
             return Ok(Token { value: TokenValue::Float(Float { value, width }), location });
         }
         let (digits, signed) = match lower.strip_suffix('u') {

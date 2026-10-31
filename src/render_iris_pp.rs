@@ -16,6 +16,8 @@ pub(super) struct IrisState {
     /// as in Iris, and the rest with `gbuffers_hand`. This frame's translucent quads wait here.
     pub hand_translucent: Option<(Pass, super::super::pack_hand::PackHand)>,
     pub hand_translucent_quads: Vec<super::super::Vertex>,
+    /// The hit block's outline (`iris_draw_outline`), made at its first draw.
+    pub outline: Option<Outline>,
     /// Floodfill diagnostics (`probe_floodfill`): frames since the pack started, and the
     /// read-backs in flight.
     pub frames: u64,
@@ -35,6 +37,9 @@ pub(super) struct Snapshot {
     pub image: usize,
     pub custom: usize,
     pub texture: Option<wgpu::Texture>,
+    /// A colour buffer instead of an image: a compute program samples `colortexN` while it
+    /// writes `colorimgN` (Photon, Noble).
+    pub color: Option<usize>,
 }
 
 pub(super) type Shared = std::rc::Rc<RefCell<IrisState>>;
@@ -65,6 +70,7 @@ pub(super) fn register(pp: &PackPost, iris: Iris) {
         particles_translucent_late: false,
         hand_translucent: None,
         hand_translucent_quads: Vec::new(),
+        outline: None,
         frames: 0,
         probes: Vec::new(),
         probed: Vec::new(),
@@ -95,7 +101,7 @@ fn plan_snapshots(s: &mut IrisState, dummy: &wgpu::TextureView) {
                         view_dimension,
                     });
                     let custom = iris.textures.len() - 1;
-                    snaps.push(Snapshot { image: k, custom, texture: None });
+                    snaps.push(Snapshot { image: k, custom, texture: None, color: None });
                     custom
                 }
             };
@@ -109,10 +115,32 @@ fn plan_snapshots(s: &mut IrisState, dummy: &wgpu::TextureView) {
     let mut computes = std::mem::take(&mut iris.computes);
     for c in computes.iter_mut() {
         fix(&mut c.iris, iris, snapshots, dummy);
+        let colors = color_images(&c.iris);
+        for b in &c.samplers {
+            let Source::Color(n) = b.source else { continue };
+            if colors & 1 << n == 0 {
+                continue;
+            }
+            let custom = match snapshots.iter().find(|s| s.color == Some(n)) {
+                Some(s) => s.custom,
+                None => {
+                    iris.textures.push(CustomTexture {
+                        decl: TextureDecl { sampler: format!("colortex{n} (sampled copy)"), stage: None, path: String::new(), raw: None },
+                        view: dummy.clone(),
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    });
+                    let custom = iris.textures.len() - 1;
+                    snapshots.push(Snapshot { image: usize::MAX, custom, texture: None, color: Some(n) });
+                    custom
+                }
+            };
+            c.iris.textures.retain(|t| t.0 != b.binding);
+            c.iris.textures.push((b.binding, Extra::Custom(custom)));
+        }
     }
     iris.computes = computes;
     if !snapshots.is_empty() {
-        let names: Vec<&str> = snapshots.iter().filter_map(|s| iris.images.get(s.image)).map(|i| i.decl.name.as_str()).collect();
+        let names: Vec<&str> = snapshots.iter().map(|s| iris.textures[s.custom].decl.sampler.as_str()).collect();
         log::info!("images sampled where they are also written, read from a copy taken first: {names:?}");
     }
 }
@@ -124,6 +152,7 @@ fn take_snapshots(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
     only: Option<&[(u32, Extra)]>,
+    color: &dyn Fn(usize) -> Option<wgpu::Texture>,
 ) -> bool {
     let IrisState { iris, snapshots, .. } = s;
     let mut remade = false;
@@ -133,8 +162,18 @@ fn take_snapshots(
         {
             continue;
         }
-        let Some(image) = iris.images.get(snap.image) else { continue };
-        let Some((texture, _)) = &image.texture else { continue };
+        let (texture, view_dimension) = match snap.color {
+            Some(n) => match color(n) {
+                Some(t) => (t, wgpu::TextureViewDimension::D2),
+                None => continue,
+            },
+            None => {
+                let Some(image) = iris.images.get(snap.image) else { continue };
+                let Some((texture, _)) = &image.texture else { continue };
+                (texture.clone(), image.view_dimension)
+            }
+        };
+        let texture = &texture;
         let fits = snap.texture.as_ref().is_some_and(|t| t.size() == texture.size() && t.format() == texture.format());
         if !fits {
             let copy = device.create_texture(&wgpu::TextureDescriptor {
@@ -148,7 +187,7 @@ fn take_snapshots(
                 view_formats: &[],
             });
             iris.textures[snap.custom].view = copy.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(image.view_dimension),
+                dimension: Some(view_dimension),
                 ..Default::default()
             });
             snap.texture = Some(copy);
@@ -284,11 +323,16 @@ pub(super) fn storage_uses(modules: &[(wgpu::ShaderStages, &naga::Module)]) -> (
 pub(super) fn iris_entries<'a>(
     iris: Option<&'a Iris>,
     pass: &PassIris,
+    color: &dyn Fn(usize) -> Option<&'a wgpu::TextureView>,
     entries: &mut Vec<wgpu::BindGroupEntry<'a>>,
 ) {
     let Some(iris) = iris else { return };
     for &(binding, k) in &pass.images {
-        if let Some(view) = iris.image_view(k) {
+        let view = match k.checked_sub(COLOR_IMAGE) {
+            Some(n) => color(n),
+            None => iris.image_view(k),
+        };
+        if let Some(view) = view {
             entries.push(wgpu::BindGroupEntry {
                 binding,
                 resource: wgpu::BindingResource::TextureView(view),
@@ -367,7 +411,7 @@ impl PackPost {
                 let mut s = st.borrow_mut();
                 s.iris.clear_images(encoder);
                 s.iris.ran.iter_mut().for_each(|r| *r = false);
-                take_snapshots(&mut s, device, encoder, None)
+                take_snapshots(&mut s, device, encoder, None, &|n| self.color_view(n).map(|v| v.texture().clone()))
             };
             if remade {
                 self.clear_all_groups();
@@ -397,7 +441,7 @@ impl PackPost {
         if let Some(st) = state(self) {
             let mut s = st.borrow_mut();
             if !s.snapshots.is_empty() {
-                take_snapshots(&mut s, device, encoder, Some(&c.iris.textures));
+                take_snapshots(&mut s, device, encoder, Some(&c.iris.textures), &|n| self.color_view(n).map(|v| v.texture().clone()));
             }
         }
         let group = self.bind_compute(device, queue, c, size);
@@ -462,7 +506,7 @@ impl PackPost {
                 resource: c.ubo.as_entire_binding(),
             }];
             self.sampler_entries(iris, Group::Composite, &c.samplers, &c.iris.textures, key, 0, None, &mut entries);
-            iris_entries(iris, &c.iris, &mut entries);
+            iris_entries(iris, &c.iris, &|n| self.color_view(n), &mut entries);
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(&c.name),
                 layout: &c.layout,
@@ -1100,4 +1144,390 @@ impl PackPost {
         }
         self.mips_valid &= !pass.written;
     }
+}
+
+/// The hit block's outline, drawn by the mod after the pack's deferred programs: Horizon drew
+/// it into the pack's colour before them, under the material the pack had for the block behind
+/// it, so the pack lit and reflected it as that block (a torch in hand shone off it). Iris
+/// draws it with the pack's line program, which packs leave unlit.
+pub(super) struct Outline {
+    pipeline: wgpu::RenderPipeline,
+    group: wgpu::BindGroup,
+    uniform: wgpu::Buffer,
+    edges: wgpu::Buffer,
+    capacity: u64,
+    layout: wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+}
+
+const OUTLINE_WGSL: &str = "
+struct U { view_proj: mat4x4<f32>, screen: vec4<f32> };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> edges: array<vec4<f32>>;
+@vertex fn vs(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> @builtin(position) vec4<f32> {
+    // Pulled a little toward the camera, as the game draws outlines, so the block's own faces
+    // don't hide them.
+    let shrink = 1.0 - 1.0 / 256.0;
+    let a = u.view_proj * vec4(edges[2u * i].xyz * shrink, 1.0);
+    let b = u.view_proj * vec4(edges[2u * i + 1u].xyz * shrink, 1.0);
+    let p = select(a, b, v >= 2u);
+    let d = normalize((b.xy / b.w - a.xy / a.w) * u.screen.xy + vec2(1e-6, 0.0));
+    var o = vec2(-d.y, d.x) * u.screen.z / u.screen.xy;
+    if (v % 2u) != 0u { o = -o; }
+    // GL's clip depth to wgpu's, as the pack's programs write it.
+    return vec4(p.xy + o * p.w, (p.z + p.w) * 0.5, p.w);
+}
+@fragment fn fs() -> @location(0) vec4<f32> { return vec4(0.0, 0.0, 0.0, 0.4); }
+";
+
+impl Outline {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, depth: wgpu::TextureFormat) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Iris Features outline"),
+            source: wgpu::ShaderSource::Wgsl(OUTLINE_WGSL.into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Iris Features outline"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Iris Features outline"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Iris Features outline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // The alpha too: packs keep translucent colour in a buffer of its own and
+                    // blend it by its alpha later.
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Iris Features outline"),
+            size: 80,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (edges, group) = Self::edges(device, &layout, &uniform, 64);
+        Self { pipeline, group, uniform, edges, capacity: 64, layout, format }
+    }
+
+    fn edges(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        uniform: &wgpu::Buffer,
+        count: u64,
+    ) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let edges = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Iris Features outline edges"),
+            size: count * 32,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Iris Features outline"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: edges.as_entire_binding() },
+            ],
+        });
+        (edges, group)
+    }
+}
+
+impl PackPost {
+    /// The hit block's outline into the buffer translucent terrain draws its colour to.
+    pub(super) fn iris_draw_outline(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &super::super::Frame,
+    ) {
+        if frame.outline.is_empty() {
+            return;
+        }
+        let Some(st) = state(self) else { return };
+        let Some(targets) = self.targets.as_ref() else { return };
+        let buffer = self
+            .water
+            .as_ref()
+            .and_then(|w| w.writes.iter().find(|(l, _)| *l == 0).map(|w| w.1))
+            .unwrap_or(0);
+        let Some(color) = targets.color[buffer].as_ref() else { return };
+        let view = &color[usize::from(self.main & 1 << buffer != 0)];
+        let format = self.formats[buffer];
+        let depth_format = targets.depth_texture.format();
+        let matrix = |name: &str| match super::pack_uniforms::index(name).and_then(|i| self.uniforms.values.get(i)) {
+            Some(super::pack_uniforms::Value::F(f)) => glam::Mat4::from_cols_array(f),
+            _ => glam::Mat4::IDENTITY,
+        };
+        let view_proj = matrix("gbufferProjection") * matrix("gbufferModelView");
+        let size = targets.size;
+        let mut s = st.borrow_mut();
+        if s.outline.as_ref().is_none_or(|o| o.format != format) {
+            s.outline = Some(Outline::new(device, format, depth_format));
+        }
+        let o = s.outline.as_mut().expect("made");
+        let camera = frame.camera;
+        let points: Vec<[f32; 4]> = frame
+            .outline
+            .iter()
+            .flat_map(|e| {
+                [
+                    [(e[0] - camera.x) as f32, (e[1] - camera.y) as f32, (e[2] - camera.z) as f32, 1.0],
+                    [(e[3] - camera.x) as f32, (e[4] - camera.y) as f32, (e[5] - camera.z) as f32, 1.0],
+                ]
+            })
+            .collect();
+        let count = frame.outline.len() as u64;
+        if count > o.capacity {
+            o.capacity = count.next_power_of_two();
+            (o.edges, o.group) = Outline::edges(device, &o.layout, &o.uniform, o.capacity);
+        }
+        queue.write_buffer(&o.edges, 0, bytemuck::cast_slice(&points));
+        // Line width in pixels: the game's 2.5 at 1080 lines, scaled with the render size.
+        let width = (size[1] as f32 / 1080.0 * 2.5).max(1.0) * 0.5;
+        let mut u: Vec<f32> = view_proj.to_cols_array().to_vec();
+        u.extend([size[0] as f32 * 0.5, size[1] as f32 * 0.5, width, 0.0]);
+        queue.write_buffer(&o.uniform, 0, bytemuck::cast_slice(&u));
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Iris Features outline"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &targets.depth,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        rp.set_pipeline(&o.pipeline);
+        rp.set_bind_group(0, &o.group, &[]);
+        rp.draw(0..4, 0..count as u32);
+    }
+}
+
+/// naga's storage format for a texture format images use.
+fn storage_format(f: wgpu::TextureFormat) -> Option<naga::StorageFormat> {
+    use naga::StorageFormat as S;
+    use wgpu::TextureFormat as T;
+    Some(match f {
+        T::R8Unorm => S::R8Unorm,
+        T::R8Snorm => S::R8Snorm,
+        T::R8Uint => S::R8Uint,
+        T::R8Sint => S::R8Sint,
+        T::R16Uint => S::R16Uint,
+        T::R16Sint => S::R16Sint,
+        T::R16Float => S::R16Float,
+        T::R16Unorm => S::R16Unorm,
+        T::Rg8Unorm => S::Rg8Unorm,
+        T::Rg8Uint => S::Rg8Uint,
+        T::R32Uint => S::R32Uint,
+        T::R32Sint => S::R32Sint,
+        T::R32Float => S::R32Float,
+        T::Rg16Uint => S::Rg16Uint,
+        T::Rg16Sint => S::Rg16Sint,
+        T::Rg16Float => S::Rg16Float,
+        T::Rg16Unorm => S::Rg16Unorm,
+        T::Rgba8Unorm => S::Rgba8Unorm,
+        T::Rgba8Snorm => S::Rgba8Snorm,
+        T::Rgba8Uint => S::Rgba8Uint,
+        T::Rgba8Sint => S::Rgba8Sint,
+        T::Rgb10a2Unorm => S::Rgb10a2Unorm,
+        T::Rg11b10Ufloat => S::Rg11b10Ufloat,
+        T::Rg32Uint => S::Rg32Uint,
+        T::Rg32Sint => S::Rg32Sint,
+        T::Rg32Float => S::Rg32Float,
+        T::Rgba16Uint => S::Rgba16Uint,
+        T::Rgba16Sint => S::Rgba16Sint,
+        T::Rgba16Float => S::Rgba16Float,
+        T::Rgba16Unorm => S::Rgba16Unorm,
+        T::Rgba32Uint => S::Rgba32Uint,
+        T::Rgba32Sint => S::Rgba32Sint,
+        T::Rgba32Float => S::Rgba32Float,
+        _ => return None,
+    })
+}
+
+/// Each storage image the modules declare takes the format of the pack's image of its name: a
+/// pack may declare an image without one (`writeonly uniform image3D img;`), and the frontend
+/// gives those a placeholder.
+pub(super) fn declared_image_formats(module: &mut naga::Module) {
+    use naga::{ImageClass, TypeInner};
+    let images: Vec<(String, wgpu::TextureFormat)> =
+        with_build(|b| b.images.iter().map(|i| (i.0.clone(), i.2)).collect()).unwrap_or_default();
+    let mut retype = Vec::new();
+    for (h, g) in module.global_variables.iter() {
+        let Some(name) = &g.name else { continue };
+        let TypeInner::Image { class: ImageClass::Storage { format, .. }, .. } = module.types[g.ty].inner else { continue };
+        let Some(want) = images.iter().find(|i| &i.0 == name).and_then(|i| storage_format(i.1)) else { continue };
+        if want != format {
+            retype.push((h, want));
+        }
+    }
+    for (h, want) in retype {
+        let ty = module.global_variables[h].ty;
+        let TypeInner::Image { dim, arrayed, class: ImageClass::Storage { mut access, .. } } = module.types[ty].inner else { continue };
+        // Atomic stores (`atomic_vertex_stores`) need a 32-bit integer format: on another, plain
+        // stores again.
+        if access.contains(naga::StorageAccess::ATOMIC)
+            && !matches!(want, naga::StorageFormat::R32Uint | naga::StorageFormat::R32Sint)
+        {
+            access.remove(naga::StorageAccess::ATOMIC);
+            unatomic_stores(module, h);
+        }
+        let name = module.types[ty].name.clone();
+        module.global_variables[h].ty = module.types.insert(
+            naga::Type { name, inner: TypeInner::Image { dim, arrayed, class: ImageClass::Storage { format: want, access } } },
+            naga::Span::UNDEFINED,
+        );
+    }
+}
+
+/// `atomic_vertex_stores` undone for `image`: its atomics become the stores they were.
+fn unatomic_stores(module: &mut naga::Module, image: naga::Handle<naga::GlobalVariable>) {
+    use naga::{Expression, Statement};
+    fn fix(block: &mut naga::Block, exprs: &naga::Arena<Expression>, image: naga::Handle<naga::GlobalVariable>) {
+        for s in block.iter_mut() {
+            match s {
+                Statement::ImageAtomic { image: i, coordinate, array_index, value, .. }
+                    if matches!(exprs[*i], Expression::GlobalVariable(g) if g == image) =>
+                {
+                    if let Expression::AccessIndex { base, index: 0 } = exprs[*value] {
+                        *s = Statement::ImageStore { image: *i, coordinate: *coordinate, array_index: *array_index, value: base };
+                    }
+                }
+                Statement::Block(b) => fix(b, exprs, image),
+                Statement::If { accept, reject, .. } => {
+                    fix(accept, exprs, image);
+                    fix(reject, exprs, image);
+                }
+                Statement::Switch { cases, .. } => cases.iter_mut().for_each(|c| fix(&mut c.body, exprs, image)),
+                Statement::Loop { body, continuing, .. } => {
+                    fix(body, exprs, image);
+                    fix(continuing, exprs, image);
+                }
+                _ => {}
+            }
+        }
+    }
+    for (_, f) in module.functions.iter_mut() {
+        fix(&mut f.body, &f.expressions, image);
+    }
+    for ep in module.entry_points.iter_mut() {
+        fix(&mut ep.function.body, &ep.function.expressions, image);
+    }
+}
+
+/// `PassIris::images` from here up: colour buffer `k - COLOR_IMAGE` as an image (`colorimgN`).
+pub(super) const COLOR_IMAGE: usize = 1 << 20;
+
+thread_local! {
+    // The colour buffers' formats while a pack's passes are built, those that can be images.
+    static COLOR_FORMATS: std::cell::Cell<[Option<wgpu::TextureFormat>; BUFFERS]> = const { std::cell::Cell::new([None; BUFFERS]) };
+}
+
+/// Whether buffers of `format` can be bound as storage images on this device.
+pub(super) fn storage_capable(format: wgpu::TextureFormat, features: wgpu::Features) -> bool {
+    format.guaranteed_format_features(features).allowed_usages.contains(wgpu::TextureUsages::STORAGE_BINDING)
+}
+
+/// The colour buffers' formats, for the passes about to be built.
+pub(super) fn set_color_formats(formats: [wgpu::TextureFormat; BUFFERS], features: wgpu::Features) {
+    COLOR_FORMATS.with(|c| c.set(formats.map(|f| storage_capable(f, features).then_some(f))));
+}
+
+/// Colour buffer `n`'s format, when it can be an image.
+pub(super) fn color_format(n: usize) -> Option<wgpu::TextureFormat> {
+    COLOR_FORMATS.with(|c| c.get()[n])
+}
+
+/// The colour buffers a pass binds as images.
+pub(super) fn color_images(pass: &PassIris) -> u16 {
+    pass.images.iter().filter_map(|(_, k)| k.checked_sub(COLOR_IMAGE)).fold(0, |m, n| m | 1 << n)
+}
+
+impl PackPost {
+    /// Colour buffer `n`'s side programs read now.
+    pub(super) fn color_view(&self, n: usize) -> Option<&wgpu::TextureView> {
+        let t = self.targets.as_ref()?;
+        t.color.get(n)?.as_ref().map(|c| &c[usize::from(self.main & 1 << n != 0)])
+    }
+}
+
+/// While a pack runs, a GPU validation error goes to the log instead of ending the game (wgpu's
+/// default): a pack's program the mod can't yet give everything it needs then draws wrongly or
+/// not at all, and the player can switch packs. Each message is logged once.
+pub(super) fn log_gpu_errors(device: &wgpu::Device) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+        // The reasons wgpu nests under "Validation Error", each.
+        let text = match &e {
+            wgpu::Error::Validation { description, .. } | wgpu::Error::Internal { description, .. } => {
+                description.split_whitespace().collect::<Vec<_>>().join(" ")
+            }
+            other => other.to_string(),
+        };
+        let Ok(mut seen) = SEEN.lock() else { return };
+        if seen.len() < 64 && !seen.contains(&text) {
+            log::error!("GPU error under the shader pack (the game goes on): {text}");
+            seen.push(text);
+        }
+    }));
 }

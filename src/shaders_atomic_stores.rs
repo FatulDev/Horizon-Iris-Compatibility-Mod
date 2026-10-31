@@ -660,3 +660,201 @@ fn apply_text_fixes(text: &str, fixes: &[(usize, usize, String)]) -> String {
     }
     out
 }
+
+/// Iris Features: memory the shader runs `atomicAdd` and its kin on (`Statement::Atomic`, from
+/// the frontend) takes an atomic type, as naga wants: the member or element of a buffer, a
+/// shared or private variable. Its other reads and writes stay plain loads and stores, which
+/// naga takes on atomics.
+fn atomic_types(module: &mut naga::Module) {
+    use naga::{Expression, Handle, Statement, Type, TypeInner};
+    #[derive(Clone, Copy, PartialEq)]
+    enum Step {
+        Member(u32),
+        Element,
+    }
+    // The global variable and the path to the atomic memory of each atomic's pointer.
+    fn path(exprs: &naga::Arena<Expression>, mut e: Handle<Expression>) -> Option<(Handle<naga::GlobalVariable>, Vec<Step>)> {
+        let mut steps = Vec::new();
+        loop {
+            match exprs[e] {
+                Expression::GlobalVariable(g) => {
+                    steps.reverse();
+                    return Some((g, steps));
+                }
+                Expression::AccessIndex { base, index } => {
+                    steps.push(Step::Member(index));
+                    e = base;
+                }
+                Expression::Access { base, .. } => {
+                    steps.push(Step::Element);
+                    e = base;
+                }
+                _ => return None,
+            }
+        }
+    }
+    fn atomics(block: &naga::Block, exprs: &naga::Arena<Expression>, out: &mut Vec<(Handle<naga::GlobalVariable>, Vec<Step>)>) {
+        for s in block.iter() {
+            match s {
+                Statement::Atomic { pointer, .. } => match path(exprs, *pointer) {
+                    Some(p) => {
+                        if !out.contains(&p) {
+                            out.push(p);
+                        }
+                    }
+                    None if std::env::var_os("IRIS_DEBUG_ATOMICS").is_some() => {
+                        let mut e = *pointer;
+                        let mut chain = Vec::new();
+                        for _ in 0..6 {
+                            chain.push(format!("{:?}", exprs[e]));
+                            match exprs[e] {
+                                Expression::AccessIndex { base, .. } | Expression::Access { base, .. } => e = base,
+                                _ => break,
+                            }
+                        }
+                        eprintln!("atomic pointer with no variable: {chain:?}");
+                    }
+                    None => {}
+                },
+                Statement::Block(b) => atomics(b, exprs, out),
+                Statement::If { accept, reject, .. } => {
+                    atomics(accept, exprs, out);
+                    atomics(reject, exprs, out);
+                }
+                Statement::Switch { cases, .. } => cases.iter().for_each(|c| atomics(&c.body, exprs, out)),
+                Statement::Loop { body, continuing, .. } => {
+                    atomics(body, exprs, out);
+                    atomics(continuing, exprs, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for (_, f) in module.functions.iter() {
+        atomics(&f.body, &f.expressions, &mut found);
+    }
+    for ep in module.entry_points.iter() {
+        atomics(&ep.function.body, &ep.function.expressions, &mut found);
+    }
+    if found.is_empty() {
+        return;
+    }
+    // `ty` with the memory at `steps` atomic; None when it already is or can't be.
+    fn atomic(types: &mut naga::UniqueArena<Type>, ty: Handle<Type>, steps: &[Step]) -> Option<Handle<Type>> {
+        let t = types[ty].clone();
+        let inner = match (t.inner, steps.first()) {
+            (TypeInner::Scalar(s), None) if matches!(s.kind, naga::ScalarKind::Sint | naga::ScalarKind::Uint) => {
+                TypeInner::Atomic(s)
+            }
+            (TypeInner::Array { base, size, stride }, Some(Step::Element)) => {
+                TypeInner::Array { base: atomic(types, base, &steps[1..])?, size, stride }
+            }
+            (TypeInner::Struct { mut members, span }, Some(Step::Member(i))) => {
+                let m = members.get_mut(*i as usize)?;
+                m.ty = atomic(types, m.ty, &steps[1..])?;
+                TypeInner::Struct { members, span }
+            }
+            _ => return None,
+        };
+        Some(types.insert(Type { name: t.name, inner }, naga::Span::UNDEFINED))
+    }
+    let mut retyped = Vec::new();
+    for (g, steps) in found {
+        let ty = module.global_variables[g].ty;
+        match atomic(&mut module.types, ty, &steps) {
+            Some(new) => {
+                module.global_variables[g].ty = new;
+                // The scalar the memory holds, for the results of stores made exchanges.
+                let mut t = new;
+                for step in &steps {
+                    t = match (&module.types[t].inner, step) {
+                        (TypeInner::Array { base, .. }, Step::Element) => *base,
+                        (TypeInner::Struct { members, .. }, Step::Member(i)) => members[*i as usize].ty,
+                        _ => t,
+                    };
+                }
+                let scalar = match module.types[t].inner {
+                    TypeInner::Atomic(s) => s,
+                    _ => naga::Scalar::U32,
+                };
+                let ty = module.types.insert(Type { name: None, inner: TypeInner::Scalar(scalar) }, naga::Span::UNDEFINED);
+                retyped.push((g, steps, ty));
+            }
+            None if std::env::var_os("IRIS_DEBUG_ATOMICS").is_some() => {
+                eprintln!("atomic memory not retyped: {:?} {:?} at {} steps", module.global_variables[g].name, module.types[ty].inner, steps.len());
+            }
+            None => {}
+        }
+    }
+    // Plain stores to the memory now atomic: atomic exchanges (naga stores only the type
+    // itself into a pointer).
+    fn stores(
+        block: &mut naga::Block,
+        exprs: &mut naga::Arena<Expression>,
+        retyped: &[(Handle<naga::GlobalVariable>, Vec<Step>, Handle<Type>)],
+    ) {
+        for s in block.iter_mut() {
+            match s {
+                Statement::Store { pointer, value } => {
+                    if let Some(p) = path(exprs, *pointer)
+                        && let Some(r) = retyped.iter().find(|r| r.0 == p.0 && r.1 == p.1)
+                    {
+                        // An exchange returns the old value: a result nothing reads.
+                        let result = exprs.append(Expression::AtomicResult { ty: r.2, comparison: false }, naga::Span::UNDEFINED);
+                        *s = Statement::Atomic {
+                            pointer: *pointer,
+                            fun: naga::AtomicFunction::Exchange { compare: None },
+                            value: *value,
+                            result: Some(result),
+                        };
+                    }
+                }
+                Statement::Block(b) => stores(b, exprs, retyped),
+                Statement::If { accept, reject, .. } => {
+                    stores(accept, exprs, retyped);
+                    stores(reject, exprs, retyped);
+                }
+                Statement::Switch { cases, .. } => cases.iter_mut().for_each(|c| stores(&mut c.body, exprs, retyped)),
+                Statement::Loop { body, continuing, .. } => {
+                    stores(body, exprs, retyped);
+                    stores(continuing, exprs, retyped);
+                }
+                _ => {}
+            }
+        }
+    }
+    if retyped.is_empty() {
+        return;
+    }
+    for (_, f) in module.functions.iter_mut() {
+        stores(&mut f.body, &mut f.expressions, &retyped);
+    }
+    for ep in module.entry_points.iter_mut() {
+        stores(&mut ep.function.body, &mut ep.function.expressions, &retyped);
+    }
+}
+
+/// Iris Features: a compute program's `texture()` (an implicit level of detail, which needs a
+/// fragment's derivatives; GL drivers take the base level there): the base level, as naga
+/// wants outside fragment stages. Also vertex stages.
+fn base_level_lookups(module: &mut naga::Module) {
+    if module.entry_points.iter().all(|e| e.stage == naga::ShaderStage::Fragment) {
+        return;
+    }
+    let fix = |f: &mut naga::Function| {
+        for (_, e) in f.expressions.iter_mut() {
+            if let naga::Expression::ImageSample { level, .. } = e
+                && matches!(level, naga::SampleLevel::Auto | naga::SampleLevel::Bias(_))
+            {
+                *level = naga::SampleLevel::Zero;
+            }
+        }
+    };
+    for (_, f) in module.functions.iter_mut() {
+        fix(f);
+    }
+    for ep in module.entry_points.iter_mut() {
+        fix(&mut ep.function);
+    }
+}

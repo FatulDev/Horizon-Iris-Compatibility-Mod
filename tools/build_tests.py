@@ -150,6 +150,21 @@ t = sub1(t, '                yaw: 30.0,\n                pitch: -10.0,', '      
 
 t = sub1(t, '            let mut frame = crate::gfx::Frame {\n', '            // `IRIS_TEST_HAND`: a held block (a cube 0.3 across, 0.7 in front of the camera).\n            let hand_yaw: f32 = std::env::var("IRIS_TEST_YAW").ok().and_then(|v| v.parse().ok()).unwrap_or(30.0);\n            let hand_pitch: f32 = std::env::var("IRIS_TEST_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(-10.0);\n            let test_hand: Vec<crate::mesher::Vertex> = if std::env::var_os("IRIS_TEST_HAND").is_some() {\n                let inv = crate::camera::view_matrix(hand_yaw, hand_pitch).inverse();\n                let mut v = Vec::new();\n                let c = glam::Vec3::new(0.25, -0.2, -0.7);\n                let h = 0.15f32;\n                let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [\n                    ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),\n                    ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),\n                    ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),\n                    ([-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),\n                    ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),\n                    ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),\n                ];\n                for (n, u, w) in faces {\n                    let (n, u, w) = (glam::Vec3::from(n), glam::Vec3::from(u), glam::Vec3::from(w));\n                    for (a, b) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {\n                        let p = c + (n + u * a + w * b) * h;\n                        let world = inv.transform_point3(p);\n                        let nw = inv.transform_vector3(n);\n                        v.push(crate::mesher::Vertex {\n                            pos: world.to_array(),\n                            uv: [0.5 + a * 0.01, 0.5 + b * 0.01],\n                            layer: if std::env::var("IRIS_TEST_HAND").as_deref() == Ok("translucent") { 32 } else { 0 },\n                            color: 0xffff_ffff,\n                            light: 0xf0f0,\n                            normal: [(nw.x * 127.0) as i8, (nw.y * 127.0) as i8, (nw.z * 127.0) as i8, 127],\n                            glint_uv: [0.0, 0.0],\n                        });\n                    }\n                }\n                v\n            } else {\n                Vec::new()\n            };\n            let mut frame = crate::gfx::Frame {\n')
 t = sub1(t, '                hand: &[],\n', '                hand: &test_hand,\n')
+# `IRIS_TEST_OUTLINE`: the outline of a block 4 ahead of the camera's start, a little below.
+t = sub1(t, '                outline: Vec::new(),\n', '''                outline: if std::env::var_os("IRIS_TEST_OUTLINE").is_some() {
+                    let (x, y, z) = (-2.0f64, 78.5f64, 3.5f64);
+                    let mut e = Vec::new();
+                    for (a, b) in [((0, 0, 0), (1, 0, 0)), ((0, 0, 0), (0, 1, 0)), ((0, 0, 0), (0, 0, 1)),
+                        ((1, 1, 1), (0, 1, 1)), ((1, 1, 1), (1, 0, 1)), ((1, 1, 1), (1, 1, 0)),
+                        ((1, 0, 0), (1, 1, 0)), ((1, 0, 0), (1, 0, 1)), ((0, 1, 0), (1, 1, 0)),
+                        ((0, 1, 0), (0, 1, 1)), ((0, 0, 1), (1, 0, 1)), ((0, 0, 1), (0, 1, 1))] {
+                        e.push([x + f64::from(a.0), y + f64::from(a.1), z + f64::from(a.2), x + f64::from(b.0), y + f64::from(b.1), z + f64::from(b.2)]);
+                    }
+                    e
+                } else {
+                    Vec::new()
+                },
+''')
 t = sub1(t, '            for f in 0..frames {\n', '''            // `IRIS_TEST_PROBE`: the floodfill diagnostics on (every 256 frames, to stdout too).
             if std::env::var_os("IRIS_TEST_PROBE").is_some() {
                 super::super::super::iris_bridge::set_floodfill_probe(true);
@@ -405,7 +420,7 @@ t = t[:-1] + '''
         impl log::Log for Out {
             fn enabled(&self, _: &log::Metadata<'_>) -> bool { true }
             fn log(&self, r: &log::Record<'_>) {
-                if r.args().to_string().starts_with("floodfill") {
+                if r.args().to_string().starts_with("floodfill") || r.args().to_string().starts_with("GPU error") {
                     println!("  {}", r.args());
                 }
             }
