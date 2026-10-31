@@ -223,6 +223,7 @@ pub(super) fn set_particles_translucent(pp: &PackPost, pass: Option<Pass>, late:
 
 /// Drops the resources of the pack that ran (the renderer dropped it).
 pub(crate) fn forget() {
+    horizon_shaders::iris::set_pack_terrain(false);
     STATE.with(|s| *s.borrow_mut() = None);
     BUILT.with(|b| b.borrow_mut().clear());
 }

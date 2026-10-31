@@ -14,7 +14,7 @@ PRISTINE = os.path.expanduser('~/hz-pristine')
 OUT = os.path.join(ROOT, 'out', 'iris-features')
 
 MOD_ID = 'iris-features'
-VERSION = '0.1.22'
+VERSION = '0.1.23'
 HORIZON = 'fca2169de9c014be8b6606ac1f3dba0bcda3731a'
 MIXINS = '5140cdf81915c25f10a7745eb532e1c09f275068'
 
@@ -637,6 +637,54 @@ tr = sub1(tr, '    fragment_main.push_str("    hz_main();\\n");\n',
 n = tr.count('s.binding, s.name, s.binding + 1, s.name')
 assert n >= 1, n
 tr = tr.replace('s.binding, s.name, s.binding + 1, s.name', 's.binding, rewrite::keyword_name(&s.name), s.binding + 1, rewrite::keyword_name(&s.name)')
+# The alpha test also with `out` variables (Iris tests location 0's alpha whatever the pack
+# declares; Sildur's and BSL leave the test to it).
+tr = sub1(tr, """    if let Some(t) = gbuffers.and_then(|g| g.alpha_test)
+        && f.outputs.contains(&0)
+        && !f.frag_outs.iter().any(|(n, _)| *n == 0)
+    {
+        match t.op {
+            "false" => fragment_main.push_str("    discard;\\n"),
+            op => writeln!(
+                fragment_main,
+                "    if (!(hz_out0.a {op} {:?})) {{ discard; }}",
+                t.reference
+            )
+            .unwrap(),
+        }
+    }""", """    let out0 = match f.frag_outs.iter().find(|(n, _)| *n == 0) {
+        None if f.outputs.contains(&0) => Some("hz_out0".to_owned()),
+        None => None,
+        Some((_, d)) if d.contains("hz_fo0") => Some("hz_fo0".to_owned()),
+        Some((_, d)) => d
+            .split_once(" out vec4 ")
+            .map(|(_, r)| r.trim_end_matches(';').split('[').next().unwrap_or("").trim().to_owned())
+            .filter(|n| !n.is_empty() && !d.contains('[')),
+    };
+    if let Some(t) = gbuffers.and_then(|g| g.alpha_test)
+        && let Some(out0) = out0
+    {
+        match t.op {
+            "false" => fragment_main.push_str("    discard;\\n"),
+            op => writeln!(
+                fragment_main,
+                "    if (!({out0}.a {op} {:?})) {{ discard; }}",
+                t.reference
+            )
+            .unwrap(),
+        }
+    }""")
+# Terrain's cutout faces: a flat varying of ours (`hz_cutout`, set by the terrain inputs from
+# the layer's opaque bit) limits the alpha test to them, as Iris tests only its cutout layers
+# (Bliss writes data into solid terrain's alpha).
+tr = sub1(tr, "    let header = |stage: &Stage| {\n", """    let cutout = gbuffers.is_some_and(|g| g.body.contains("hz_cutout ="));
+    if cutout {
+        let next = locations.len() as u32;
+        locations.insert("hz_cutout".to_owned(), (next, "flat float @;".to_owned()));
+    }
+    let header = |stage: &Stage| {
+""")
+tr = tr.replace('"    if (!({out0}.a {op} {:?})) {{ discard; }}",', '"    if ({}!({out0}.a {op} {:?})) {{ discard; }}", if cutout { "hz_cutout > 0.5 && " } else { "" },')
 tr += '\n' + submod('scan', edit_scan) + '\n' + submod('rewrite', edit_rewrite)
 # Any pointer into a variable passed to a function (`f(material.normal)` for an `inout`
 # parameter), not only a vector's component: naga's SPIR-V writer takes whole variables only.

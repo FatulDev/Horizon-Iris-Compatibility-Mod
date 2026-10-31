@@ -97,3 +97,15 @@ pub fn sprite_layer(sprite: &str) -> Option<u8> {
         .find(|(n, _)| candidates.iter().any(|c| n.strip_prefix("minecraft:") == Some(c.as_str())))
         .map(|l| l.1)
 }
+
+/// Whether a pack draws the terrain (set while one runs): distant terrain then meshes each
+/// block's face on its own instead of merging runs of them.
+static PACK_TERRAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_pack_terrain(on: bool) {
+    PACK_TERRAIN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn pack_terrain() -> bool {
+    PACK_TERRAIN.load(std::sync::atomic::Ordering::Relaxed)
+}

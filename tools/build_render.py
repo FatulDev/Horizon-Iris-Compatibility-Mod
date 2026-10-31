@@ -288,6 +288,7 @@ new = sub1(new, '''        let weather_geometry = world.weather.then(|| Geometry
 new = sub1(new, '        let pp = Self {\n', '        let mut pp = Self {\n')
 new = sub1(new, '        register(&pp, iris);\n', '''        register(&pp, iris);
         log_gpu_errors(device);
+        horizon_shaders::iris::set_pack_terrain(true);
         if let Some(p) = &particles_translucent {
             pp.notes.push(format!("translucent particles draw with {}", p.name));
         }
@@ -491,6 +492,7 @@ ti = sub1(ti, '    pub fn terrain_inputs(', '    pub(crate) fn iris_terrain_inpu
 # panes): packs that leave the test to Iris (Sildur's, BSL, Pegasus) drew their clear texels
 # as solid colour. Solid blocks' texels are opaque, so the one terrain program can test all.
 ti = sub1(ti, '            alpha_test: None,', '            alpha_test: Some(horizon_shaders::AlphaTest { op: ">", reference: 0.1 }),')
+ti = sub1(ti, '             hz_Color = vec4(hz_v_color.rgb, 1.0);\\n    \\\n', '             hz_Color = vec4(hz_v_color.rgb, 1.0);\\n    \\\n             hz_cutout = (hz_v_layer & 32768u) != 0u ? 0.0 : 1.0;\\n    \\\n')
 ti = sub1(ti, '            ("at_tangent", "hz_tangent"),', '            ("at_tangent", "hz_tangent"),\n            ("at_midBlock", mid_block),')
 ti = sub1(ti, '        if flat {\n            body.push_str(FACE);\n        }',
           '        if flat {\n            body.push_str(FACE);\n            body.push_str(IRIS_IDS);\n        }')
@@ -736,3 +738,27 @@ fn iris_resize_targets(pp: &mut PackPost, device: &wgpu::Device, size: [u32; 2])
     ::core::ops::ControlFlow::Break(())
 }
 ''', [binding('pp', '&mut PackPost', '&mut *self'), binding('device', '&wgpu::Device', 'device'), binding('size', '[u32; 2]', 'size')])
+
+# Distant terrain merges runs of a block's faces into one quad whose texture repeats per block
+# (Horizon's sampler repeats it); a pack's programs read the texture through the atlas, where a
+# repeat can't happen, and the quad's texture stretched across the run (grass sides on far
+# hills). While a pack draws, each face is a block's own.
+hook('lod-faces', 'horizon_client_render::lod::mesh::emit', '''\
+fn iris_lod_faces(mesh: &mut SectionMesh, key: FaceKey, rect: Rect) -> ::core::ops::ControlFlow<()> {
+    if !horizon_shaders::iris::pack_terrain() {
+        return ::core::ops::ControlFlow::Continue(());
+    }
+    let mut u0 = rect.u0;
+    while u0 < rect.u1 {
+        let u1 = rect.u1.min(u0.floor() + 1.0);
+        let mut v0 = rect.v0;
+        while v0 < rect.v1 {
+            let v1 = rect.v1.min(v0.floor() + 1.0);
+            emit_quad(mesh, key, Rect { u0, v0, u1, v1 });
+            v0 = v1;
+        }
+        u0 = u1;
+    }
+    ::core::ops::ControlFlow::Break(())
+}
+''', [binding('mesh', '&mut SectionMesh', '&mut *mesh'), binding('key', 'FaceKey', 'key'), binding('rect', 'Rect', 'rect')])
