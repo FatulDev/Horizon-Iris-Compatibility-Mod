@@ -596,3 +596,67 @@ fn image_atomics(module: &mut naga::Module) {
         );
     }
 }
+
+thread_local! {
+    // How many times `compile` has gone round with the text rewritten (`text_fixes`).
+    static REWRITES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Iris Features: what to write differently in the GLSL text itself for naga to take it, found
+/// from the parsed module's spans: the scalar of `ivec2 % int` becomes `ivec2(int)` (naga's
+/// frontend widens it for every other operator). As (start, end, replacement) byte ranges.
+fn text_fixes(module: &naga::Module, text: &str) -> Vec<(usize, usize, String)> {
+    use naga::{BinaryOperator, Expression, ScalarKind, TypeInner};
+    let mut fixes = Vec::new();
+    let mut scan = |f: &naga::Function| {
+        let ctx = naga::proc::ResolveContext::with_locals(module, &f.local_variables, &f.arguments);
+        let mut typifier = naga::front::Typifier::new();
+        let Some((last, _)) = f.expressions.iter().last() else { return };
+        if typifier.grow(last, &f.expressions, &ctx).is_err() {
+            return;
+        }
+        for (_, e) in f.expressions.iter() {
+            let Expression::Binary { op: BinaryOperator::Modulo, left, right } = *e else { continue };
+            let (scalar, size, kind) = match (typifier.get(left, &module.types), typifier.get(right, &module.types)) {
+                (TypeInner::Vector { size, scalar }, TypeInner::Scalar(_)) => (right, *size, scalar.kind),
+                (TypeInner::Scalar(_), TypeInner::Vector { size, scalar }) => (left, *size, scalar.kind),
+                _ => continue,
+            };
+            let Some(range) = f.expressions.get_span(scalar).to_range() else { continue };
+            if range.end > text.len() || range.start >= range.end || !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end) {
+                continue;
+            }
+            let prefix = match kind {
+                ScalarKind::Sint => "i",
+                ScalarKind::Uint => "u",
+                _ => "",
+            };
+            let n = size as u8;
+            fixes.push((range.start, range.end, format!("{prefix}vec{n}({})", &text[range.clone()])));
+        }
+    };
+    for (_, f) in module.functions.iter() {
+        scan(f);
+    }
+    for ep in module.entry_points.iter() {
+        scan(&ep.function);
+    }
+    // Innermost last, none overlapping, applied from the end.
+    fixes.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut kept: Vec<(usize, usize, String)> = Vec::new();
+    for f in fixes {
+        if kept.last().is_none_or(|k| f.1 <= k.0) {
+            kept.push(f);
+        }
+    }
+    kept
+}
+
+/// `text` with `fixes` (from the end, as `text_fixes` orders them) applied.
+fn apply_text_fixes(text: &str, fixes: &[(usize, usize, String)]) -> String {
+    let mut out = text.to_owned();
+    for (start, end, with) in fixes {
+        out.replace_range(*start..*end, with);
+    }
+    out
+}

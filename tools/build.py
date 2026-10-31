@@ -14,7 +14,7 @@ PRISTINE = os.path.expanduser('~/hz-pristine')
 OUT = os.path.join(ROOT, 'out', 'iris-features')
 
 MOD_ID = 'iris-features'
-VERSION = '0.1.18'
+VERSION = '0.1.19'
 HORIZON = 'fca2169de9c014be8b6606ac1f3dba0bcda3731a'
 MIXINS = '5140cdf81915c25f10a7745eb532e1c09f275068'
 
@@ -269,7 +269,7 @@ fn iris_load_post(
 # The translator.
 tr_ref = ref(SH + 'translate/mod.rs')
 tparts = ['use super::*;\nuse std::collections::BTreeMap;\nuse std::fmt::Write;\n\nuse naga::ShaderStage;\n'
-          'use naga::front::glsl::{Frontend, Options};\nuse naga::valid::{Capabilities, ValidationFlags, Validator};\n\n'
+          'use crate::translate::iris_glsl::frontend::{Frontend, Options};\nuse naga::valid::{Capabilities, ValidationFlags, Validator};\n\n'
           'use crate::Preprocessed;\n\nuse scan::Stage;\n']
 for h in [r'^#\[derive\(Clone, Debug, PartialEq\)\]\npub struct ImageUse', r'^fn image_uses\(', r'^fn image_declarations\(',
           r'^fn translate\(', r'^#\[derive\(Clone, Copy, Debug, PartialEq\)\]\npub enum WorkGroups',
@@ -277,6 +277,13 @@ for h in [r'^#\[derive\(Clone, Debug, PartialEq\)\]\npub struct ImageUse', r'^fn
           r'^pub fn translate_compute\(', r'^fn compile\(', r'^fn component_arguments\(']:
     tparts.append(take(tr_ref, h))
 tr = '\n'.join(tparts)
+# naga's GLSL frontend, vendored with fixes for what Iris packs write (vendor/naga-glsl).
+import naga_glsl
+module('shaders-glsl', SH + 'translate/mod.rs', 'iris_glsl',
+       '// naga 30.0.1\'s GLSL frontend (MIT or Apache-2.0), changed for Iris packs: see the mod\'s\n'
+       '// vendor/naga-glsl/README.md.\n#[allow(dead_code, unused_imports, unused_variables, unused_mut, unused_assignments, clippy::all)]\npub mod frontend {\n'
+       + naga_glsl.fold(os.path.join(ROOT, 'vendor', 'naga-glsl'), 'crate::translate::iris_glsl::frontend::') + '\n}\n', 'pub')
+
 tr = tr.replace('fn translate(', 'pub(crate) fn translate(', 1)
 tr = re.sub(r'\n(\s*)images,\n\s*buffers,\n', '\n', tr)
 def submod(name, edit=lambda s: s):
@@ -327,6 +334,25 @@ GATHER = r'''
         }
 '''
 def edit_rewrite(s):
+    # A sampler named after a GLSL function (`uniform sampler2D texture;`, OptiFine's old name
+    # for the atlas, which packs call as `texture(texture, uv)`): naga's frontend reads every
+    # later `texture(` as the variable. Its texture is written `hz_kw_texture`; calls stay calls.
+    s = sub1(s, '''fn keyword_name(name: &str) -> &str {
+    match name {''', '''pub(super) fn keyword_name(name: &str) -> &str {
+    match name {
+        "texture" => "hz_kw_texture",
+        "texture2D" => "hz_kw_texture2D",''')
+    s = sub1(s, '''            let sampler = params
+                .get(t)
+                .map(String::as_str)
+                .or_else(|| sampler_ty.get(t).copied());''', '''            if called && sampler_ty.contains_key(t) && keyword_name(t) != t && !params.contains_key(t) {
+                out.push_str(t);
+                continue;
+            }
+            let sampler = params
+                .get(t)
+                .map(String::as_str)
+                .or_else(|| sampler_ty.get(t).copied());''')
     # `gl_VertexID` before the vertex inputs (`gl_Vertex...`): it is not `hz_VertexID`.
     s = sub1(s, '                "gl_VertexID" => Some("gl_VertexIndex".into()),\n', '')
     s = sub1(s, '                "gl_FragColor" => Some("hz_out0".into()),\n',
@@ -446,44 +472,6 @@ def edit_scan(s):
     }
 
     pub(super) fn global(&mut self, from: usize, to: usize, body: bool) {""")
-    # A struct member declared `float[6] name;` (Luster's ACES tables): naga's GLSL frontend reads
-    # the member as a `float`. `float name[6];` is the same member.
-    s = sub1(s, """        let (mut start, mut depth, mut parens) = (0, 0usize, 0usize);
-""", """        {
-            let sig: Vec<usize> = (0..s.tokens.len()).filter(|&i| significant(s.tokens[i])).collect();
-            let at = |k: usize| sig.get(k).map_or("", |&i| s.tokens[i]);
-            let (mut in_struct, mut depth) = (false, 0i32);
-            let mut moves = Vec::new();
-            for k in 0..sig.len() {
-                match at(k) {
-                    "struct" => {
-                        in_struct = true;
-                        depth = 0;
-                    }
-                    "{" if in_struct => depth += 1,
-                    "}" if in_struct => {
-                        depth -= 1;
-                        in_struct = depth > 0;
-                    }
-                    "[" if in_struct && depth == 1 && k > 0 && is_ident(at(k - 1)) && at(k + 2) == "]"
-                        && is_ident(at(k + 3)) && matches!(at(k + 4), ";" | ",") =>
-                    {
-                        moves.push(k);
-                    }
-                    _ => {}
-                }
-            }
-            for k in moves {
-                let size = at(k + 1).to_owned();
-                let name = at(k + 3).to_owned();
-                for j in k..k + 3 {
-                    s.replaced.insert(sig[j], String::new());
-                }
-                s.replaced.insert(sig[k + 3], format!("{name}[{size}]"));
-            }
-        }
-        let (mut start, mut depth, mut parens) = (0, 0usize, 0usize);
-""")
     # `imageAtomicMax(image, p, v)` (Pegasus's voxels), which naga's GLSL frontend lacks: written
     # `imageStore(image, p, hz_atomic_max(v))`, a store of ours the compiler turns into the
     # atomic (`image_atomics`). Only as a statement; its old value is not returned.
@@ -533,6 +521,28 @@ def edit_scan(s):
         }
         let (mut start, mut depth, mut parens) = (0, 0usize, 0usize);
 """)
+    # `flat out vec3[9] coefficients;` (Noble): the array size on the type goes with each name.
+    s = sub1(s, """        let mut declarators: Vec<(String, String)> = Vec::new();
+        let mut j = k + 1;
+""", """        let mut declarators: Vec<(String, String)> = Vec::new();
+        let mut j = k + 1;
+        let mut type_array = String::new();
+        while words.get(j).is_some_and(|&t| self.tokens[t] == "[") {
+            while let Some(&t) = words.get(j) {
+                type_array.push_str(self.tokens[t]);
+                j += 1;
+                if self.tokens[t] == "]" {
+                    break;
+                }
+            }
+        }
+""")
+    s = sub1(s, """            j += 1;
+            declarators.push((name, array));""", """            j += 1;
+            declarators.push((name, format!("{type_array}{array}")));""")
+    # A global `float[5] w = ...` initialized in our `main`: its type keeps its size.
+    s = sub1(s, """                t if ty.is_empty() || t == "[" => ty.push_str(t),""",
+             """                t if ty.is_empty() || t == "[" || t == "]" || ty.ends_with('[') => ty.push_str(t),""")
     return sub1(s, '            sampler_functions: HashMap::new(),',
                 '            // Iris Features: `textureGather` takes its sampler apart, as our helpers do.\n'
                 '            sampler_functions: [("textureGather", vec![true, false, false, false]), ("textureGatherOffset", vec![true, false, false, false])]\n'
@@ -543,6 +553,12 @@ tr = sub1(tr, '    fragment_main.push_str("    hz_main();\\n");\n',
           '    for w in &f.struct_copies {\n        writeln!(fragment_main, "    {w}").unwrap();\n    }\n    fragment_main.push_str("    hz_main();\\n");\n')
 tr = sub1(tr, '    fragment_main.push_str("    hz_main();\\n");\n',
           '    fragment_main.push_str("    hz_main();\\n");\n    for w in &f.widened {\n        writeln!(fragment_main, "    {w}").unwrap();\n    }\n')
+# A sampler named after a GLSL function (`uniform sampler2D texture;`, OptiFine's old name for
+# the atlas, which packs then call as `texture(texture, uv)`): naga's frontend reads every later
+# `texture(` as the variable. Its texture is declared `hz_t_texture`; calls stay calls.
+n = tr.count('s.binding, s.name, s.binding + 1, s.name')
+assert n >= 1, n
+tr = tr.replace('s.binding, s.name, s.binding + 1, s.name', 's.binding, rewrite::keyword_name(&s.name), s.binding + 1, rewrite::keyword_name(&s.name)')
 tr += '\n' + submod('scan', edit_scan) + '\n' + submod('rewrite', edit_rewrite)
 # Any pointer into a variable passed to a function (`f(material.normal)` for an `inout`
 # parameter), not only a vector's component: naga's SPIR-V writer takes whole variables only.
@@ -588,7 +604,26 @@ tr = sub1(tr, """                        let Some(&scalar) = scalar_of.get(a) el
                             naga::Span::UNDEFINED,
                         );""", """                        let Some(&ty) = scalar_of.get(a) else { continue };""")
 tr += own('shaders_atomic_stores.rs')
-tr = sub1(tr, '    let mut module = module;\n', '    let mut module = module;\n    workgroup_barriers(&mut module);\n    vector_modulo(&mut module);\n    private_struct_strides(&mut module);\n    callees_first(&mut module);\n    image_atomics(&mut module);\n    if stage.kind == ShaderStage::Vertex {\n        atomic_vertex_stores(&mut module);\n    }\n')
+# `IRIS_DUMP_GLSL=<folder>`: every translated program's GLSL written there (debugging packs).
+tr = sub1(tr, """    let module = Frontend::default()
+        .parse(&Options::from(stage.kind), text)""", """    if let Some(dir) = std::env::var_os("IRIS_DUMP_GLSL") {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{:016x}.glsl", h.finish())), text);
+    }
+    let module = Frontend::default()
+        .parse(&Options::from(stage.kind), text)""")
+tr = sub1(tr, '    let mut module = module;\n', '''    let mut module = module;
+    // Iris Features: text naga takes only written differently (`text_fixes`): again with it.
+    let fixes = text_fixes(&module, text);
+    if !fixes.is_empty() && REWRITES.with(|r| r.get()) < 8 {
+        REWRITES.with(|r| r.set(r.get() + 1));
+        let again = compile(stage, &apply_text_fixes(text, &fixes), header_lines);
+        REWRITES.with(|r| r.set(r.get() - 1));
+        return again;
+    }
+''' + '    workgroup_barriers(&mut module);\n    vector_modulo(&mut module);\n    private_struct_strides(&mut module);\n    callees_first(&mut module);\n    image_atomics(&mut module);\n    if stage.kind == ShaderStage::Vertex {\n        atomic_vertex_stores(&mut module);\n    }\n')
 module('shaders-translate', SH + 'translate/mod.rs', 'iris_translate',
        '// The translator with Iris\'s storage buffers, images and compute programs, and the GLSL\n'
        '// packs written for Iris rely on.\n' + tr)

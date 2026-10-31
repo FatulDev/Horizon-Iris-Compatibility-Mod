@@ -144,6 +144,8 @@ ir = ir[:a0] + '        let access = u.access;\n' + ir[a1:]
 ir = sub1(ir, '    let mut iris = storage_entries(&c.name, interface, &modules, &mut entries, notes)?;',
           '    let uses = storage_uses(&modules);\n    let mut iris = storage_entries(&c.name, &uses, &modules, &mut entries, notes)?;')
 ir, _ = cut(ir, r'^pub\(super\) fn qualifier_format\(')
+# Replaced by `unify_storage_access` (both stages of a pass at once).
+ir, _ = cut(ir, r'^pub\(super\) fn read_only_where_unwritten\(')
 ir = sub1(ir, 'pub(super) struct Iris {\n    pub resources: Resources,', 'pub(super) struct Iris {\n    #[allow(dead_code)]\n    pub resources: Resources,')
 # Iris's precedence of `texture.<stage>.colortexN`: it replaces buffer N in that stage's programs
 # until one of them has written (flipped) the buffer; after that they read the buffer.
@@ -272,15 +274,17 @@ run = sub1(run, '''        let notes = &mut self.notes;
 ''')
 run = sub1(run, '        self.resize(device, size);\n',
            '        let resized = self.targets.as_ref().is_none_or(|t| t.size != size);\n        self.resize(device, size);\n')
+run = sub1(run, '        self.iris_begin_frame(encoder);\n', '        self.iris_begin_frame(device, encoder);\n')
 copies.append(run)
 impl = 'impl PackPost {\n' + re.sub(r'(?<![\w:])super::', 'super::super::', '\n'.join(copies)) + '}\n'
 # build_pass.
 bp = take(pp_ref, r'^fn build_pass\(')
-bp = sub1(bp, '''    iris::read_only_where_unwritten(&mut p.program.vertex);''', '''    let uses = storage_uses(&[
+bp = sub1(bp, '''    iris::read_only_where_unwritten(&mut p.program.vertex);
+    iris::read_only_where_unwritten(&mut p.program.fragment);''', '''    unify_storage_access([&mut p.program.vertex, &mut p.program.fragment]);
+    let uses = storage_uses(&[
         (wgpu::ShaderStages::VERTEX, &p.program.vertex),
         (wgpu::ShaderStages::FRAGMENT, &p.program.fragment),
-    ]);
-    iris::read_only_where_unwritten(&mut p.program.vertex);''')
+    ]);''')
 bp = sub1(bp, '''        &p.name,
         &p.program.interface,
         &modules,''', '''        &p.name,

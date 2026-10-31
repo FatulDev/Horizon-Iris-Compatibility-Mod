@@ -69,11 +69,12 @@ function.
   program skip with a note in the log.
 - Image atomics are translated only as statements (`imageAtomicMax(img, p, v);`); their return
   value isn't available. Buffer atomics (`atomicAdd` on buffers) are not translated.
-- Other Iris packs, in the software-Vulkan harness: Bliss renders. Luster and Noble build every
-  program but the picture is still wrong (black, white); Pegasus builds most programs, but one
-  pass both samples and writes its light volume, which wgpu refuses. Iris's `colorimgN` images
-  (writing colour buffers as images) aren't supported yet, and swizzles of a scalar (`f().x`)
-  fail in naga's GLSL frontend.
+- Other Iris packs, in the software-Vulkan harness: Bliss, Pegasus, Sildur's Vibrant and Just
+  Colored Lighting render; Luster and Reverie build but come out black, Noble white. Buffer
+  atomics (`atomicAdd`) aren't translated yet.
+- The mod carries its own copy of naga's GLSL frontend (`vendor/naga-glsl`, MIT or Apache-2.0,
+  changes listed in its README): naga's own refuses GLSL that Iris packs rely on (array
+  members of plain structs, `ivec2 % int`, `f().x`, `float a[4], b[4]`).
 - `lightningBoltPosition` always reads "no bolt", so lightning doesn't cast Eclipse's lightning
   shadows.
 - The options page is a list of buttons (what Horizon gives native mods): an option with many

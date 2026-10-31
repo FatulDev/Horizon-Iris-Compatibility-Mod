@@ -17,6 +17,19 @@ pub(super) struct IrisState {
     pub probes: Vec<Probe>,
     /// The texels of the last frames read back: frame, image, texels (tight), size, bytes each.
     pub probed: Vec<(u64, String, Vec<u8>, [u32; 3], u32)>,
+    /// Images a pass both samples and loads or stores: what it samples instead (`Snapshot`).
+    pub snapshots: Vec<Snapshot>,
+}
+
+/// A copy of an image for a pass that samples it while it also binds it as an image (Pegasus's
+/// light volume, written in one half and sampled in the other). GL lets one draw do both; wgpu
+/// refuses the pass. The copy is taken at the start of each frame and before each compute
+/// program that samples it: what the pack reads is the image as the frame or program began.
+pub(super) struct Snapshot {
+    /// The image (`Iris::images`), and the custom texture (`Iris::textures`) passes sample.
+    pub image: usize,
+    pub custom: usize,
+    pub texture: Option<wgpu::Texture>,
 }
 
 pub(super) type Shared = std::rc::Rc<RefCell<IrisState>>;
@@ -48,8 +61,97 @@ pub(super) fn register(pp: &PackPost, iris: Iris) {
         frames: 0,
         probes: Vec::new(),
         probed: Vec::new(),
+        snapshots: Vec::new(),
     }));
+    plan_snapshots(&mut shared.borrow_mut(), &pp.dummy);
     STATE.with(|s| *s.borrow_mut() = Some((pp.dummy.clone(), shared)));
+}
+
+/// Passes that sample an image they also bind as an image sample a copy of it instead.
+fn plan_snapshots(s: &mut IrisState, dummy: &wgpu::TextureView) {
+    fn fix(pi: &mut PassIris, iris: &mut Iris, snaps: &mut Vec<Snapshot>, dummy: &wgpu::TextureView) {
+        for t in pi.textures.iter_mut() {
+            let Extra::Image(k) = t.1 else { continue };
+            if !pi.images.iter().any(|(_, i)| *i == k) {
+                continue;
+            }
+            let custom = match snaps.iter().find(|s| s.image == k) {
+                Some(s) => s.custom,
+                None => {
+                    let Some(image) = iris.images.get(k) else { continue };
+                    let view_dimension = image.view_dimension;
+                    let sampler = format!("{} (sampled copy)", image.decl.name);
+                    iris.textures.push(CustomTexture {
+                        decl: TextureDecl { sampler, stage: None, path: String::new(), raw: None },
+                        // The copy's own view from the first frame on.
+                        view: dummy.clone(),
+                        view_dimension,
+                    });
+                    let custom = iris.textures.len() - 1;
+                    snaps.push(Snapshot { image: k, custom, texture: None });
+                    custom
+                }
+            };
+            t.1 = Extra::Custom(custom);
+        }
+    }
+    let IrisState { iris, passes, snapshots, .. } = s;
+    for pi in passes.values_mut() {
+        fix(pi, iris, snapshots, dummy);
+    }
+    let mut computes = std::mem::take(&mut iris.computes);
+    for c in computes.iter_mut() {
+        fix(&mut c.iris, iris, snapshots, dummy);
+    }
+    iris.computes = computes;
+    if !snapshots.is_empty() {
+        let names: Vec<&str> = snapshots.iter().filter_map(|s| iris.images.get(s.image)).map(|i| i.decl.name.as_str()).collect();
+        log::info!("images sampled where they are also written, read from a copy taken first: {names:?}");
+    }
+}
+
+/// Brings the copies of `snapshots` up to date (made again when their image was), for the
+/// passes sampling `only` (all when `None`). Whether a copy was made again (bind groups stale).
+fn take_snapshots(
+    s: &mut IrisState,
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    only: Option<&[(u32, Extra)]>,
+) -> bool {
+    let IrisState { iris, snapshots, .. } = s;
+    let mut remade = false;
+    for snap in snapshots.iter_mut() {
+        if let Some(only) = only
+            && !only.iter().any(|(_, e)| *e == Extra::Custom(snap.custom))
+        {
+            continue;
+        }
+        let Some(image) = iris.images.get(snap.image) else { continue };
+        let Some((texture, _)) = &image.texture else { continue };
+        let fits = snap.texture.as_ref().is_some_and(|t| t.size() == texture.size() && t.format() == texture.format());
+        if !fits {
+            let copy = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&iris.textures[snap.custom].decl.sampler),
+                size: texture.size(),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: texture.dimension(),
+                format: texture.format(),
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            iris.textures[snap.custom].view = copy.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(image.view_dimension),
+                ..Default::default()
+            });
+            snap.texture = Some(copy);
+            remade = true;
+        }
+        if let Some(copy) = &snap.texture {
+            encoder.copy_texture_to_texture(texture.as_image_copy(), copy.as_image_copy(), texture.size());
+        }
+    }
+    remade
 }
 
 /// `pp` draws the particles on the translucent layer with `pass`, after deferred when `late`.
@@ -240,11 +342,17 @@ impl PackPost {
     }
 
     /// The start of a frame: images cleared, nothing run yet.
-    pub(super) fn iris_begin_frame(&mut self, encoder: &mut wgpu::CommandEncoder) {
+    pub(super) fn iris_begin_frame(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
         if let Some(st) = state(self) {
-            let mut s = st.borrow_mut();
-            s.iris.clear_images(encoder);
-            s.iris.ran.iter_mut().for_each(|r| *r = false);
+            let remade = {
+                let mut s = st.borrow_mut();
+                s.iris.clear_images(encoder);
+                s.iris.ran.iter_mut().for_each(|r| *r = false);
+                take_snapshots(&mut s, device, encoder, None)
+            };
+            if remade {
+                self.clear_all_groups();
+            }
         }
     }
 
@@ -266,6 +374,13 @@ impl PackPost {
         c: &mut ComputeRun,
         size: [u32; 2],
     ) {
+        // Images it samples while it writes them: copied as the program begins.
+        if let Some(st) = state(self) {
+            let mut s = st.borrow_mut();
+            if !s.snapshots.is_empty() {
+                take_snapshots(&mut s, device, encoder, Some(&c.iris.textures));
+            }
+        }
         let group = self.bind_compute(device, queue, c, size);
         let groups = match c.work {
             WorkGroups::Fixed(g) => g,
@@ -820,4 +935,65 @@ fn log_changes(probed: &[(u64, String, Vec<u8>, [u32; 3], u32)]) {
         }
     }
     log::info!("{line}");
+}
+
+/// Images and storage buffers no stage of a pass writes become read-only in every stage, and
+/// those one writes take the same access in every stage (one bind group layout entry serves
+/// both; wgpu wants each stage to declare exactly its access). JCL's terrain writes the
+/// held-light image from its vertex stage and reads it from the fragment stage.
+pub(super) fn unify_storage_access(modules: [&mut naga::Module; 2]) {
+    use naga::{AddressSpace, ImageClass, StorageAccess, TypeInner};
+    use std::collections::HashMap;
+    let mut access: HashMap<(u32, u32), (bool, StorageAccess)> = HashMap::new();
+    for m in modules.iter() {
+        let Ok(info) = naga::valid::Validator::new(naga::valid::ValidationFlags::empty(), naga::valid::Capabilities::all())
+            .validate(m)
+        else {
+            return;
+        };
+        for (h, g) in m.global_variables.iter() {
+            let Some(b) = &g.binding else { continue };
+            let declared = match (&g.space, &m.types[g.ty].inner) {
+                (AddressSpace::Storage { access }, _) => *access,
+                (_, TypeInner::Image { class: ImageClass::Storage { access, .. }, .. }) => *access,
+                _ => continue,
+            };
+            let written = (0..m.entry_points.len()).any(|i| {
+                info.get_entry_point(i)[h].intersects(naga::valid::GlobalUse::WRITE | naga::valid::GlobalUse::ATOMIC)
+            });
+            let e = access.entry((b.group, b.binding)).or_insert((false, StorageAccess::empty()));
+            e.0 |= written;
+            e.1 |= declared;
+        }
+    }
+    for m in modules {
+        let mut retype = Vec::new();
+        for (h, g) in m.global_variables.iter_mut() {
+            let Some(b) = &g.binding else { continue };
+            let Some(&(written, union)) = access.get(&(b.group, b.binding)) else { continue };
+            let want = if written { union | StorageAccess::LOAD } else { StorageAccess::LOAD };
+            if let AddressSpace::Storage { access } = &mut g.space {
+                *access = want;
+            } else {
+                retype.push((h, want));
+            }
+        }
+        for (h, want) in retype {
+            let ty = m.global_variables[h].ty;
+            let TypeInner::Image { dim, arrayed, class: ImageClass::Storage { format, access } } = m.types[ty].inner else {
+                continue;
+            };
+            if access == want {
+                continue;
+            }
+            let name = m.types[ty].name.clone();
+            m.global_variables[h].ty = m.types.insert(
+                naga::Type {
+                    name,
+                    inner: TypeInner::Image { dim, arrayed, class: ImageClass::Storage { format, access: want } },
+                },
+                naga::Span::UNDEFINED,
+            );
+        }
+    }
 }

@@ -46,9 +46,12 @@ with zipfile.ZipFile(deliver, 'w', zipfile.ZIP_DEFLATED) as z:
     add_tree(z, unpacked, f'{MOD_ID}-{VERSION}/{MOD_ID}/')
     z.write(os.path.join(ROOT, 'README.md'), f'{MOD_ID}-{VERSION}/README.md')
     z.write(os.path.join(ROOT, 'reference.patch'), f'{MOD_ID}-{VERSION}/reference.patch')
-    for t in ['build.py', 'build_render.py', 'build_tests.py', 'rsx.py', 'stage.sh', 'package.py']:
+    for t in ['build.py', 'build_render.py', 'build_tests.py', 'rsx.py', 'stage.sh', 'package.py', 'naga_glsl.py']:
         z.write(os.path.join(HERE, t), f'{MOD_ID}-{VERSION}/tools/{t}')
     for n in sorted(os.listdir(os.path.join(ROOT, 'src'))):
         z.write(os.path.join(ROOT, 'src', n), f'{MOD_ID}-{VERSION}/src/{n}')
+    z.write(os.path.join(ROOT, 'LICENSE'), f'{MOD_ID}-{VERSION}/LICENSE')
+    # naga's GLSL frontend, with its licences.
+    add_tree(z, os.path.join(ROOT, 'vendor'), f'{MOD_ID}-{VERSION}/vendor/')
 print(hnmod)
 print(deliver)
