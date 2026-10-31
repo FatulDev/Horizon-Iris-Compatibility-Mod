@@ -11,6 +11,11 @@ pub(super) struct IrisState {
     /// `gbuffers_particles_translucent`'s pass, and whether it draws after deferred.
     pub particles_translucent: Option<Pass>,
     pub particles_translucent_late: bool,
+    /// `gbuffers_hand_water`'s pass and geometry, when the pack has it: held items with
+    /// translucent texels (stained glass, ice, slime) draw with it after translucent terrain,
+    /// as in Iris, and the rest with `gbuffers_hand`. This frame's translucent quads wait here.
+    pub hand_translucent: Option<(Pass, super::super::pack_hand::PackHand)>,
+    pub hand_translucent_quads: Vec<super::super::Vertex>,
     /// Floodfill diagnostics (`probe_floodfill`): frames since the pack started, and the
     /// read-backs in flight.
     pub frames: u64,
@@ -58,6 +63,8 @@ pub(super) fn register(pp: &PackPost, iris: Iris) {
         passes,
         particles_translucent: None,
         particles_translucent_late: false,
+        hand_translucent: None,
+        hand_translucent_quads: Vec::new(),
         frames: 0,
         probes: Vec::new(),
         probed: Vec::new(),
@@ -152,6 +159,18 @@ fn take_snapshots(
         }
     }
     remade
+}
+
+/// `pp` draws held items with translucent texels with `pass`.
+pub(super) fn set_hand_translucent(pp: &PackPost, pass: Option<(Pass, super::super::pack_hand::PackHand)>) {
+    if let Some(s) = state(pp) {
+        s.borrow_mut().hand_translucent = pass;
+    }
+}
+
+/// Whether a hand quad of 4 vertices is one of a translucent item's (`WorldSink`'s overlay).
+fn translucent_hand_quad(q: &[super::super::Vertex]) -> bool {
+    matches!(q[0].layer, super::super::entity_batch::TRANSLUCENT_ITEM_OVERLAY | super::super::entity_batch::TRANSLUCENT_GLINT_ITEM_OVERLAY)
 }
 
 /// `pp` draws the particles on the translucent layer with `pass`, after deferred when `late`.
@@ -995,5 +1014,90 @@ pub(super) fn unify_storage_access(modules: [&mut naga::Module; 2]) {
                 naga::Span::UNDEFINED,
             );
         }
+    }
+}
+
+impl PackPost {
+    /// `draw_hand` with the held items' translucent quads kept for `iris_draw_hand_translucent`
+    /// when the pack has `gbuffers_hand_water`. Whether it drew (else Horizon's own draws).
+    pub(super) fn iris_draw_hand(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        size: [u32; 2],
+        frame: &super::super::Frame,
+    ) -> bool {
+        let Some(st) = state(self) else { return false };
+        if st.borrow().hand_translucent.is_none() {
+            return false;
+        }
+        let (opaque, translucent): (Vec<&[super::super::Vertex]>, Vec<&[super::super::Vertex]>) =
+            frame.hand.chunks_exact(4).partition(|q| !translucent_hand_quad(q));
+        let opaque: Vec<super::super::Vertex> = opaque.concat();
+        st.borrow_mut().hand_translucent_quads = translucent.concat();
+        let Some((mut pass, mut geometry)) = self.hand.take() else { return true };
+        self.iris_hand_pass(device, queue, encoder, size, frame, &opaque, &mut pass, &mut geometry, "HAND_SOLID");
+        self.hand = Some((pass, geometry));
+        true
+    }
+
+    /// The held items' translucent quads, after translucent terrain.
+    pub(super) fn iris_draw_hand_translucent(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        size: [u32; 2],
+        frame: &super::super::Frame,
+    ) {
+        let Some(st) = state(self) else { return };
+        let (taken, quads) = {
+            let mut s = st.borrow_mut();
+            (s.hand_translucent.take(), std::mem::take(&mut s.hand_translucent_quads))
+        };
+        let Some((mut pass, mut geometry)) = taken else { return };
+        self.iris_hand_pass(device, queue, encoder, size, frame, &quads, &mut pass, &mut geometry, "HAND_TRANSLUCENT");
+        st.borrow_mut().hand_translucent = Some((pass, geometry));
+    }
+
+    /// One hand pass over `quads` (Horizon's `draw_hand`).
+    #[allow(clippy::too_many_arguments)]
+    fn iris_hand_pass(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        size: [u32; 2],
+        frame: &super::super::Frame,
+        quads: &[super::super::Vertex],
+        pass: &mut Pass,
+        geometry: &mut super::super::pack_hand::PackHand,
+        stage: &str,
+    ) {
+        let projection = super::super::pack_hand::projection(
+            frame.hand_fov_degrees,
+            size[0] as f32 / size[1].max(1) as f32,
+            frame.depth_far,
+            frame.bob,
+        );
+        geometry.prepare(device, queue, quads, projection);
+        if geometry.quads == 0 {
+            return;
+        }
+        let group = self.bind(device, queue, pass, size);
+        {
+            let mut rp = self.begin(encoder, pass);
+            rp.set_pipeline(&pass.pipeline);
+            rp.set_bind_group(0, &group, &[]);
+            rp.set_bind_group(1, &geometry.group, &[]);
+            if pass.draw {
+                self.draws.bind(&mut rp, stage);
+            }
+            rp.set_vertex_buffer(0, geometry.vertices());
+            rp.set_index_buffer(geometry.indices.slice(..), wgpu::IndexFormat::Uint32);
+            rp.draw_indexed(0..geometry.quads * 6, 0, 0..1);
+        }
+        self.mips_valid &= !pass.written;
     }
 }

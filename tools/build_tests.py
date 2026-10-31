@@ -148,6 +148,8 @@ t = sub1(t, '                bob: glam::Mat4::IDENTITY,', '''                bob
 t = sub1(t, 'camera: glam::DVec3::new(0.5, 80.0, 0.5),', 'camera: glam::DVec3::new(0.5, std::env::var("IRIS_TEST_Y").ok().and_then(|v| v.parse().ok()).unwrap_or(80.0), 0.5),')
 t = sub1(t, '                yaw: 30.0,\n                pitch: -10.0,', '                yaw: std::env::var("IRIS_TEST_YAW").ok().and_then(|v| v.parse().ok()).unwrap_or(30.0),\n                pitch: std::env::var("IRIS_TEST_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(-10.0),')
 
+t = sub1(t, '            let mut frame = crate::gfx::Frame {\n', '            // `IRIS_TEST_HAND`: a held block (a cube 0.3 across, 0.7 in front of the camera).\n            let hand_yaw: f32 = std::env::var("IRIS_TEST_YAW").ok().and_then(|v| v.parse().ok()).unwrap_or(30.0);\n            let hand_pitch: f32 = std::env::var("IRIS_TEST_PITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(-10.0);\n            let test_hand: Vec<crate::mesher::Vertex> = if std::env::var_os("IRIS_TEST_HAND").is_some() {\n                let inv = crate::camera::view_matrix(hand_yaw, hand_pitch).inverse();\n                let mut v = Vec::new();\n                let c = glam::Vec3::new(0.25, -0.2, -0.7);\n                let h = 0.15f32;\n                let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [\n                    ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),\n                    ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),\n                    ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),\n                    ([-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),\n                    ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),\n                    ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),\n                ];\n                for (n, u, w) in faces {\n                    let (n, u, w) = (glam::Vec3::from(n), glam::Vec3::from(u), glam::Vec3::from(w));\n                    for (a, b) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {\n                        let p = c + (n + u * a + w * b) * h;\n                        let world = inv.transform_point3(p);\n                        let nw = inv.transform_vector3(n);\n                        v.push(crate::mesher::Vertex {\n                            pos: world.to_array(),\n                            uv: [0.5 + a * 0.01, 0.5 + b * 0.01],\n                            layer: if std::env::var("IRIS_TEST_HAND").as_deref() == Ok("translucent") { 32 } else { 0 },\n                            color: 0xffff_ffff,\n                            light: 0xf0f0,\n                            normal: [(nw.x * 127.0) as i8, (nw.y * 127.0) as i8, (nw.z * 127.0) as i8, 127],\n                            glint_uv: [0.0, 0.0],\n                        });\n                    }\n                }\n                v\n            } else {\n                Vec::new()\n            };\n            let mut frame = crate::gfx::Frame {\n')
+t = sub1(t, '                hand: &[],\n', '                hand: &test_hand,\n')
 t = sub1(t, '            for f in 0..frames {\n', '''            // `IRIS_TEST_PROBE`: the floodfill diagnostics on (every 256 frames, to stdout too).
             if std::env::var_os("IRIS_TEST_PROBE").is_some() {
                 super::super::super::iris_bridge::set_floodfill_probe(true);
@@ -156,6 +158,14 @@ t = sub1(t, '            for f in 0..frames {\n', '''            // `IRIS_TEST_P
             let spin: f32 = std::env::var("IRIS_TEST_SPIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
             for f in 0..frames {
                 frame.yaw += spin;
+                // `IRIS_TEST_MATS`: the camera's uniforms going into each frame.
+                if std::env::var_os("IRIS_TEST_MATS").is_some() {
+                    for n in ["gbufferModelView", "gbufferPreviousModelView", "cameraPosition", "previousCameraPosition", "frameTime"] {
+                        if let Some(i) = crate::gfx::pack_uniforms::index(n) {
+                            println!("  frame {f} {n}: {:?}", pp.uniforms.values.get(i));
+                        }
+                    }
+                }
                 // `IRIS_TEST_WALK`: blocks per frame along +z, the terrain following the camera.
                 if let Ok(w) = std::env::var("IRIS_TEST_WALK") {
                     frame.camera.z += w.parse::<f64>().unwrap_or(0.0);

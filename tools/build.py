@@ -14,7 +14,7 @@ PRISTINE = os.path.expanduser('~/hz-pristine')
 OUT = os.path.join(ROOT, 'out', 'iris-features')
 
 MOD_ID = 'iris-features'
-VERSION = '0.1.19'
+VERSION = '0.1.20'
 HORIZON = 'fca2169de9c014be8b6606ac1f3dba0bcda3731a'
 MIXINS = '5140cdf81915c25f10a7745eb532e1c09f275068'
 
@@ -235,10 +235,20 @@ post = sub1(post, '''    pub texture_files: std::collections::BTreeMap<String, V
     pub particles_opaque_late: bool,
     /// `rainDepth`: rain and snow write depth (Iris: only when the pack asks).
     pub rain_depth: bool,
+    /// `gbuffers_hand_water`, when the pack has it: held items with translucent texels.
+    pub hand_translucent: Option<PostProgram>,
 }''')
 post = sub1(post, '    let particles = translucent(&PARTICLES, 0.1, &mut gbuffers_dyn);\n',
             '    let particles = translucent(&PARTICLES, 0.1, &mut gbuffers_dyn);\n'
-            '    let particles_translucent = translucent(&["gbuffers_particles_translucent"], 0.1, &mut gbuffers_dyn);\n')
+            '    let particles_translucent = translucent(&["gbuffers_particles_translucent"], 0.1, &mut gbuffers_dyn);\n'
+            '    let hand_translucent = inputs.hand.as_ref().and_then(|i| {\n'
+            '        let mut i = i.clone();\n'
+            '        i.alpha_test = Some(crate::AlphaTest { op: ">", reference: 0.0 });\n'
+            '        gbuffers_dyn(&["gbuffers_hand_water"], &i)\n'
+            '    }).map(|mut p| {\n'
+            '        p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));\n'
+            '        p\n'
+            '    });\n')
 post = sub1(post, '    crate::iris::set_pending(load_computes(&mut loader));\n', '''    let mut iris = load_computes(&mut loader);
     iris.particles_translucent = particles_translucent.filter(|_| loader.post.particles.is_some());
     iris.particles_opaque_late = match properties.get("particles.ordering").map(str::trim) {
@@ -247,6 +257,7 @@ post = sub1(post, '    crate::iris::set_pending(load_computes(&mut loader));\n',
         None => loader.post.particles_late,
     };
     iris.rain_depth = properties.get("rain.depth").is_some_and(|v| v.trim() == "true");
+    iris.hand_translucent = hand_translucent.filter(|_| loader.post.hand.is_some());
     crate::iris::set_pending(iris);
 ''')
 module('shaders-post', SH + 'post.rs', 'iris_post',

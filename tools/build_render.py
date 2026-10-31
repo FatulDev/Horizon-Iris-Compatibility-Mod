@@ -216,6 +216,26 @@ new = sub1(new, '''        let shadow_entities = shadow_programs.map(|p| {''', '
             .and_then(|(p, g)| build(p, Some(g)))
             .filter(|_| entity_passes[super::pack_entities::PARTICLE].is_some());
         let shadow_entities = shadow_programs.map(|p| {''')
+# Held items with translucent texels: `gbuffers_hand_water`'s pass, with a hand geometry of its own.
+new = sub1(new, '''        let weather = post
+            .weather''', '''        let hand_translucent = iris_post
+            .hand_translucent
+            .take()
+            .filter(|_| hand.is_some())
+            .and_then(|p| {
+                let geometry = super::pack_hand::PackHand::new(device);
+                let g = Geometry {
+                    buffers: &entity_buffers,
+                    table: Some(&geometry.layout),
+                    depth_write: false,
+                    atlas: world.celestial.clone(),
+                    ids: None,
+                    cull: false,
+                };
+                build(p, Some(&g)).map(|pass| (pass, geometry))
+            });
+        let weather = post
+            .weather''')
 # Rain and snow write depth only with `rainDepth=true`, as in Iris: the composite passes would
 # otherwise take each streak for a surface right in front of the camera.
 new = sub1(new, '''        let weather_geometry = world.weather.then(|| Geometry {
@@ -231,6 +251,10 @@ new = sub1(new, '        register(&pp, iris);\n', '''        register(&pp, iris)
             pp.notes.push(format!("translucent particles draw with {}", p.name));
         }
         set_particles_translucent(&pp, particles_translucent, particles_translucent_late);
+        if let Some((p, _)) = &hand_translucent {
+            pp.notes.push(format!("translucent held items draw with {}", p.name));
+        }
+        set_hand_translucent(&pp, hand_translucent);
 ''')
 copies.append(new)
 # bind, run_shadow, run.
@@ -275,6 +299,9 @@ run = sub1(run, '''        let notes = &mut self.notes;
 run = sub1(run, '        self.resize(device, size);\n',
            '        let resized = self.targets.as_ref().is_none_or(|t| t.size != size);\n        self.resize(device, size);\n')
 run = sub1(run, '        self.iris_begin_frame(encoder);\n', '        self.iris_begin_frame(device, encoder);\n')
+assert run.count('self.draw_translucent(device, queue, encoder, size, terrain);') == 2
+run = re.sub(r'( *)self\.draw_translucent\(device, queue, encoder, size, terrain\);\n',
+             lambda m: m.group(0) + m.group(1) + 'self.iris_draw_hand_translucent(device, queue, encoder, size, frame);\n', run)
 copies.append(run)
 impl = 'impl PackPost {\n' + re.sub(r'(?<![\w:])super::', 'super::super::', '\n'.join(copies)) + '}\n'
 # build_pass.
@@ -609,3 +636,23 @@ fn iris_native_settings_click(game: &mut crate::game::Game<'_>, mod_id: &str, bu
 }
 ''', [binding('game', "&mut crate::game::Game<'_>", '&mut *self'), binding('mod_id', '&str', 'mod_id'),
       binding('button', 'usize', 'button')], cancellable=False)
+
+# Held items: their translucent quads to `gbuffers_hand_water` when the pack has it.
+hook('draw-hand', 'horizon_client_render::gfx::pack_post::PackPost::draw_hand', '''\
+fn iris_draw_hand(
+    pp: &mut PackPost,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    size: [u32; 2],
+    frame: &super::Frame,
+) -> ::core::ops::ControlFlow<()> {
+    if pp.iris_draw_hand(device, queue, encoder, size, frame) {
+        ::core::ops::ControlFlow::Break(())
+    } else {
+        ::core::ops::ControlFlow::Continue(())
+    }
+}
+''', [binding('pp', '&mut PackPost', '&mut *self'), binding('device', '&wgpu::Device', 'device'),
+      binding('queue', '&wgpu::Queue', 'queue'), binding('encoder', '&mut wgpu::CommandEncoder', '&mut *encoder'),
+      binding('size', '[u32; 2]', 'size'), binding('frame', '&super::Frame', 'frame')])
