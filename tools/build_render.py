@@ -47,17 +47,6 @@ fn iris_hand_projection(hud_fov: f32, aspect: f32, far: f32) -> ::core::ops::Con
 }
 ''', [binding('hud_fov', 'f32', 'hud_fov'), binding('aspect', 'f32', 'aspect'), binding('far', 'f32', 'far')])
 
-hook('flat-draws', 'horizon_client_render::gfx::flat::wanted', '''\
-fn iris_flat_draws(value: bool, adapter: &wgpu::Adapter, device: &wgpu::Device) -> bool {
-    // A shader pack's terrain programs read `mc_Entity`, the face's normal and tangent from
-    // flat draws only (per-section draws give -1 and an up normal): Horizon turns them on
-    // only on Metal; the mod wherever the device can (`HORIZON_FLAT_DRAWS=0` still turns
-    // them off).
-    value || (std::env::var("HORIZON_FLAT_DRAWS").as_deref() != Ok("0") && supported(adapter, device))
-}
-''', [binding('value', 'bool', '$value'), binding('adapter', '&wgpu::Adapter', 'adapter'),
-      binding('device', '&wgpu::Device', 'device')], kind='RETURN')
-
 # --- Device features ----------------------------------------------------------------------------
 hook('device-features', 'horizon_client_render::gfx::cull::Cull::features', '''\
 fn iris_features(value: wgpu::Features, adapter: &wgpu::Adapter) -> wgpu::Features {
@@ -501,8 +490,9 @@ ti = sub1(ti, '            ("at_tangent", "hz_tangent"),', '            ("at_tan
 ti = sub1(ti, '"vec4((hz_cell + 0.5) * hz_scale, 0.0, 1.0)"', '"vec4((hz_cell + hz_mid_uv) * hz_scale, 0.0, 1.0)"')
 ti = sub1(ti, '             hz_cutout = (hz_v_layer & 32768u) != 0u ? 0.0 : 1.0;\\n    \\\n', '             hz_cutout = (hz_v_layer & 32768u) != 0u ? 0.0 : 1.0;\\n    \\\n             hz_mid_uv = vec2(0.5);\\n    \\\n')
 
+# The UV step is the instance's w with the fade-in masked off (terrain.wgsl's `instance_step`).
 ti = sub1(ti, '        if flat {\n            body.push_str(FACE);\n        }',
-          '        if flat {\n            body.push_str(FACE);\n            body.push_str(IRIS_IDS);\n            body.push_str("    hz_mid_uv = clamp((hz_t0 + 0.5 * hz_d2) * hz_origin.w, 0.0, 1.0);\\n");\n        }')
+          '        if flat {\n            body.push_str(FACE);\n            body.push_str(IRIS_IDS);\n            body.push_str("    hz_mid_uv = clamp((hz_t0 + 0.5 * hz_d2) * (hz_origin.w > 0.0 ? uintBitsToFloat(floatBitsToUint(hz_origin.w) & 0xff800000u) : fract(abs(hz_origin.w))), 0.0, 1.0);\\n");\n        }')
 ti = sub1(ti, 'declarations.push_str("vec2 hz_cell; vec2 hz_scale; vec4 hz_tangent;\\n");', 'declarations.push_str("vec2 hz_cell; vec2 hz_scale; vec4 hz_tangent; vec2 hz_mid_uv;\\n");')
 ti = sub1(ti, '"vec4(float(hz_block_ids[2u * hz_layer]), float(hz_block_ids[2u * hz_layer + 1u]), 0.0, 0.0)"',
           '"vec4(float(hz_id), float(hz_block_ids[hz_base + 1u]), 0.0, 0.0)"')
@@ -753,7 +743,9 @@ fn iris_resize_targets(pp: &mut PackPost, device: &wgpu::Device, size: [u32; 2])
 # hills). While a pack draws, each face is a block's own.
 hook('lod-faces', 'horizon_client_render::lod::mesh::emit', '''\
 fn iris_lod_faces(mesh: &mut SectionMesh, key: FaceKey, rect: Rect) -> ::core::ops::ControlFlow<()> {
-    if !horizon_shaders::iris::pack_terrain() {
+    // A face of a coarse tile (thousands of blocks wide) stays Horizon's: one quad a block
+    // would be millions of them.
+    if !horizon_shaders::iris::pack_terrain() || (rect.u1 - rect.u0) * (rect.v1 - rect.v0) > 4096.0 {
         return ::core::ops::ControlFlow::Continue(());
     }
     let mut u0 = rect.u0;
@@ -762,7 +754,7 @@ fn iris_lod_faces(mesh: &mut SectionMesh, key: FaceKey, rect: Rect) -> ::core::o
         let mut v0 = rect.v0;
         while v0 < rect.v1 {
             let v1 = rect.v1.min(v0.floor() + 1.0);
-            emit_quad(mesh, key, Rect { u0, v0, u1, v1 });
+            emit_quad(mesh, key, Rect { u0, v0, u1, v1 }, 1.0);
             v0 = v1;
         }
         u0 = u1;

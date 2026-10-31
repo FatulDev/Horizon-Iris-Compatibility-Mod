@@ -30,12 +30,21 @@ pub(super) struct PackIds {
     missing_item: i32,
     /// `oldHandLight` (3.2): the first held item and light are those of the brighter hand.
     old_hand_light: bool,
+    /// `oldLighting`: `true` keeps the game's face shading in the block colours.
+    old_lighting: bool,
 }
 
 impl Game<'_> {
     /// Loads the pack for the current dimension when it changed, and returns this frame's
     /// inputs to the pack's uniforms.
     pub(super) fn shader_pack_inputs(&mut self, camera: glam::DVec3, partial: f32) -> PackInputs {
+        // A `shaders/` pack lights the faces itself unless `oldLighting=true`: sections mesh
+        // without the game's face shading (the pack loaded or dropped below shows next frame).
+        let pack_lighting = self.pack_ids.as_ref().is_some_and(|ids| !ids.old_lighting);
+        if self.streaming.shader_pack_lighting != pack_lighting {
+            self.streaming.shader_pack_lighting = pack_lighting;
+            self.all_sections_changed();
+        }
         static DEV_PACK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let dev = DEV_PACK.get_or_init(|| std::env::var("HORIZON_SHADER_PACK").ok());
         let picked = dev.as_deref().unwrap_or(&self.settings.horizon.shader_pack);
@@ -112,6 +121,10 @@ impl Game<'_> {
                             old_hand_light: properties
                                 .get("oldHandLight")
                                 .is_none_or(|v| v.trim() != "false"),
+                            // Off unless the pack turns it on (Iris shades no faces by default).
+                            old_lighting: properties
+                                .get("oldLighting")
+                                .is_some_and(|v| v.trim() == "true"),
                             entities: entities.plain(),
                             missing_entity: if text.is_some() { 65535 } else { 0 },
                             missing_block: if ids.is_empty() { 0 } else { 65535 },

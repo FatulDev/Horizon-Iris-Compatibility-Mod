@@ -14,9 +14,9 @@ PRISTINE = os.path.expanduser('~/hz-pristine')
 OUT = os.path.join(ROOT, 'out', 'iris-features')
 
 MOD_ID = 'iris-features'
-VERSION = '0.1.24'
-HORIZON = 'fca2169de9c014be8b6606ac1f3dba0bcda3731a'
-MIXINS = '5140cdf81915c25f10a7745eb532e1c09f275068'
+VERSION = '0.1.25'
+HORIZON = 'a734600373ed0da15ba6128a62cddc768d0bbc61'
+MIXINS = '4342a0bfbe71d4d14185528d64e496d6022f16a1'
 
 def ref(path):
     return open(os.path.join(REF, path)).read()
@@ -132,21 +132,6 @@ fn iris_read_text(pack: &Pack, path: &str) -> ::core::ops::ControlFlow<Option<St
 }
 ''', [binding('pack', '&Pack', 'self'), binding('path', '&str', 'path')])
 
-# `#if` with decimals.
-cond = strip_tests(outer_docs(ref(SH + 'condition.rs')))
-for h in [r'^pub\(crate\) fn split_directive\(', r'^struct Branch \{', r'^#\[derive\(Default\)\]\npub\(crate\) struct Conditionals',
-          r'^impl Conditionals \{', r'^fn test\(']:
-    cond, _ = cut(cond, h)
-cond = re.sub(r'^(//.*\n)+\n', '', cond, count=1)  # the file's opening comment
-cond = cond.replace('pub fn eval_condition(', 'pub(crate) fn eval_condition(')
-module('shaders-condition', SH + 'condition.rs', 'iris_condition',
-       '// `#if` arithmetic that takes decimals, as Iris\'s preprocessor does.\n' + cond)
-hook('eval-condition', 'horizon_shaders::condition::eval_condition', '''\
-fn iris_eval_condition(expr: &str, macros: &crate::Macros) -> ::core::ops::ControlFlow<Result<i64, String>> {
-    ::core::ops::ControlFlow::Break(iris_condition::eval_condition(expr, macros))
-}
-''', [binding('expr', '&str', 'expr'), binding('macros', '&crate::Macros', 'macros')])
-
 # `smooth()` state forgotten after the renderer's trial evaluation.
 module('shaders-custom', SH + 'custom.rs', 'iris_custom', '''\
 // Forgets what `smooth` has seen, so the next evaluation starts each one at its value.
@@ -163,28 +148,11 @@ props = sub1(props, 'Self::default()', 'Properties::default()')
 module('shaders-properties', SH + 'properties.rs', 'iris_properties',
        '// `Properties::parse`, with custom uniform expressions reading the pack\'s options.\nuse super::*;\n\n' + props)
 
-# The preprocessor: a function-like macro's call that spans lines (Noble's
-# `PARSE_CLOUD_LAYER_SETTINGS(\n a,\n b\n)`) is joined into one line before it is expanded, as
-# the GLSL preprocessor reads tokens across lines; the lines it took stay as empty lines.
+# The preprocessor (Horizon joins macro calls that span lines itself).
 pfile = deindent(take(pristine(SH + 'preprocess.rs'), r'^    fn file\('))
 pfile = sub1(pfile, 'fn file(&mut self, path: &str, depth: usize, from: Origin) {',
              "pub(super) fn iris_file(this: &mut Run<'_>, path: &str, depth: usize, from: Origin) {")
 pfile = re.sub(r'\bself\b', 'this', pfile)
-pfile = sub1(pfile, """        n += 1;
-        let origin = Origin {""", """        n += 1;
-        // A macro call left open at the end of the line takes the lines that close it.
-        if this.conditionals.active() && !line.trim_start().starts_with('#') {
-            while n < lines.len() && open_macro_call(&line, &this.macros) {
-                let next = lines[n];
-                if next.trim_start().starts_with('#') {
-                    break;
-                }
-                line.push(' ');
-                line.push_str(next);
-                n += 1;
-            }
-        }
-        let origin = Origin {""")
 # An `#endif` with no `#if` open is passed over, as Iris's preprocessor (JCPP) does: it reports
 # it and goes on (Pegasus closes one `#if` twice across an include).
 pfile = sub1(pfile, "    this.line(&line, origin, path, depth);", """    let stray_endif = !this.conditionals.open()
@@ -194,9 +162,8 @@ pfile = sub1(pfile, "    this.line(&line, origin, path, depth);", """    let str
     } else {
         this.line(&line, origin, path, depth);
     }""")
-pfile += open(os.path.join(ROOT, 'src', 'shaders_preprocess_extra.rs')).read()
 module('shaders-preprocess', SH + 'preprocess.rs', 'iris_preprocess',
-       '// `Run::file` with macro calls that span lines joined first.\nuse super::*;\n\n' + pfile)
+       '// `Run::file` with a stray `#endif` passed over.\nuse super::*;\n\n' + pfile)
 hook('preprocess-file', "horizon_shaders::preprocess::Run<'_>::file", """\
 fn iris_preprocess_file(run: &mut Run<'_>, path: &str, depth: usize, from: Origin) -> ::core::ops::ControlFlow<()> {
     iris_preprocess::iris_file(run, path, depth, from);
@@ -479,10 +446,10 @@ def edit_scan(s):
                     let decl = format!("{interpolation}{mty} @{marray};");
                     if input {
                         self.struct_copies.push(format!("{name}.{member} = {part};"));
-                        self.ins.push(Var { name: part, decl });
+                        self.ins.push(Var { name: part, decl, structure: false });
                     } else {
                         self.struct_copies.push(format!("{part} = {name}.{member};"));
-                        self.outs.push(Var { name: part, decl });
+                        self.outs.push(Var { name: part, decl, structure: false });
                     }
                 }
             }
@@ -606,7 +573,7 @@ def edit_scan(s):
                 "gl_FogFragCoord" => {
                     let list = if kind == ShaderStage::Vertex { &mut s.outs } else { &mut s.ins };
                     if !list.iter().any(|v| v.name == "hz_FogFragCoord") {
-                        list.push(Var { name: "hz_FogFragCoord".into(), decl: "float @;".into() });
+                        list.push(Var { name: "hz_FogFragCoord".into(), decl: "float @;".into(), structure: false });
                     }
                 }
 """)

@@ -28,8 +28,8 @@ You need the Horizon launcher with native mods (Settings → Game → Native mod
 
 The mod is pinned to these exact commits. The launcher reads them from `horizon-native.json`.
 
-- Horizon `fca2169de9c014be8b6606ac1f3dba0bcda3731a` (main on 2026-10-30).
-- horizon-mixins `5140cdf81915c25f10a7745eb532e1c09f275068` (main on 2026-10-30). The hooks need
+- Horizon `a734600373ed0da15ba6128a62cddc768d0bbc61` (main on 2026-10-31).
+- horizon-mixins `4342a0bfbe71d4d14185528d64e496d6022f16a1` (main on 2026-10-31). The hooks need
   its support for `format!` and the other standard macros in hooked functions.
 
 A Horizon Nightly with other changes needs the mod rebuilt against it. Run `tools/build.py` with
@@ -45,7 +45,6 @@ function.
 | `smooth()` timing | Custom uniforms' `smooth(x, up, down)` take half-lives in tenths of a second, as in Iris; Horizon alone reads them as seconds, 10x slower |
 | View bobbing | In `gbufferModelView`, not `gbufferProjection`, as Iris has it (packs read the projection as a plain perspective; otherwise clouds and lighting sway with each step) |
 | Matrix components in custom uniforms | `m.i.j` is GLSL's `m[i][j]` (column, row), as in Iris; Horizon alone reads row, column (so the sun's world direction turned with the camera) |
-| Flat terrain draws | Turned on wherever the GPU supports them (Horizon uses them only on Metal): a pack's terrain programs get `mc_Entity` (waving plants, water, glass) and each face's normal and tangent only from them. `HORIZON_FLAT_DRAWS=0` turns them off |
 | Translucent particles | `gbuffers_particles_translucent` draws the particles on the translucent layer (campfire smoke, splashes...) with its own blend, the others draw with `gbuffers_particles`. `particles.ordering=mixed` draws the opaque ones before deferred and the translucent ones after, as Iris does (Horizon alone drew every particle with `gbuffers_particles` after deferred, so Eclipse's particles came out as raw G-buffer data) |
 | Rain and snow depth | Weather writes depth only with `rain.depth=true`, as in Iris (Horizon alone always wrote it, so Eclipse took each whole rain quad for a surface in front of the camera: dark boxes, discoloured streaks, and the wrong lighting behind them) |
 | `at_midBlock` | Flat terrain draws give each vertex its offset to the block's centre (in 64ths), as Iris does. Eclipse's floodfill voxelises blocks there; without it each block landed on whichever neighbouring voxel its corners rounded to, and that changed as the camera moved |
@@ -59,7 +58,6 @@ function.
 | Terrain alpha test | Terrain's cutout faces (leaves, plants, campfires) shed texels below alpha 0.1, as Iris tests its cutout layers, also for packs that declare their outputs; solid faces aren't tested |
 | Distant terrain | While a pack runs, distant terrain meshes each block's face on its own: merged runs repeat their texture through Horizon's sampler, which a pack's atlas lookups can't (grass sides stretched across far hills) |
 | `mc_midTexCoord` | The middle of the quad's own texture coordinates, as Iris gives it, not of its sprite (packs that rebuild the tile from it stretched grass sides) |
-| Decimal `#if` | `#if SPEED < 1.0`, as Iris's preprocessor allows |
 | `bufferObject.N` | Storage buffers (fixed or screen-relative), at set 0 binding 1000 + N |
 | `image.*` | Images, cleared per frame when asked, sized by the screen or fixed, readable through their sampler name |
 | `customTexture.*`, `texture.noise`, `texture.<stage>.<sampler>` | PNG and raw (`RGBA8`) textures, 1D/2D/3D. As in Iris, `texture.<stage>.colortexN` replaces buffer N in that stage's programs until one of them has written the buffer (Eclipse's blue noise in `colortex6`) |
@@ -92,8 +90,8 @@ function.
 - Writing images or buffers from a vertex stage needs the GPU's `VERTEX_WRITABLE_STORAGE`. Most
   Vulkan, DX12 and Metal GPUs have it; without it, those programs are skipped with a note.
 - Testing so far: the bundle was applied with `horizon-mixins apply` to pristine Horizon
-  `fca2169` and the whole game compiled with `--locked` (Cargo.lock unchanged, no warnings).
-  Horizon's 587 renderer tests pass; the two `crash::` tests fail without the mod too.
+  `a734600` and the whole game compiled with `--locked` (Cargo.lock unchanged, no warnings).
+  Horizon's 752 renderer tests pass; the two `crash::` tests fail without the mod too.
 - Unmodified Eclipse ran on that build under Mesa's software Vulkan driver (lavapipe) in all
   three dimensions. All 15 post passes and 8 compute programs ran with no GPU errors, and the
   sky, clouds and textured moon rendered. That was over an empty world: it has not been tested
@@ -109,16 +107,16 @@ function.
 
 `tools/build.py` assembles the bundle from the reference implementation (Horizon branch
 `iris-features`) and the pinned pristine source. Support modules carry the new code. Cancellable
-HEAD hooks replace a handful of entry points: `eval_condition`, `load_post`, the translator,
+HEAD hooks replace a handful of entry points: `load_post`, the translator,
 `Pack::read_text` (the player's option values), `FrameUniforms::eval_custom`,
 `PackPost::{bind, run, run_shadow, prepare_entities, draw_entities, draw_weather, draw_clouds}`,
 `PackAtlas::terrain_inputs` and the game's `shader_pack_inputs`; the options page uses Horizon's
 native-mod hook points (`native_mods`, `native_settings`, `native_settings_click`). RETURN hooks
-add the device features and turn flat draws on. horizon-mixins can't add struct
+add the device features. horizon-mixins can't add struct
 fields to functions that use closures, so a pack's GPU resources are kept beside its `PackPost`,
 keyed by one of its textures.
 
-To rebuild the bundle, apply `reference.patch` to Horizon `fca2169`, then copy the changed files into
+To rebuild the bundle, apply `reference.patch` to Horizon `a734600`, then copy the changed files into
 `ref/` (same paths) and run `tools/build.py` and `tools/package.py`. `tools/stage.sh` applies the bundle to a pristine
 export for checking.
 

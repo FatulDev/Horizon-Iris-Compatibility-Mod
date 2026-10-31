@@ -1,8 +1,8 @@
 diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
-index 662338023..50d3d90df 100644
+index 67b46c31b..69d4544d9 100644
 --- a/crates/horizon-client-render/src/gfx.rs
 +++ b/crates/horizon-client-render/src/gfx.rs
-@@ -1061,7 +1061,13 @@ async fn open_backend(
+@@ -1217,7 +1217,13 @@ async fn open_backend(
                  | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
                  | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
                  | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
@@ -2571,7 +2571,7 @@ index 000000000..3651a033a
 +    }
 +}
 diff --git a/crates/horizon-client-render/src/gfx/pack_uniforms.rs b/crates/horizon-client-render/src/gfx/pack_uniforms.rs
-index 4da492b00..8d63d53c0 100644
+index ba668deaf..c7518b20c 100644
 --- a/crates/horizon-client-render/src/gfx/pack_uniforms.rs
 +++ b/crates/horizon-client-render/src/gfx/pack_uniforms.rs
 @@ -33,6 +33,109 @@ pub struct PackInputs {
@@ -2699,7 +2699,7 @@ index 4da492b00..8d63d53c0 100644
              values: Vec::new(),
              atlas: [0; 2],
              start: std::time::Instant::now(),
-@@ -277,6 +383,7 @@ fn smooth(value: f32, target: f32, half_life: f32, dt: f32) -> f32 {
+@@ -278,6 +384,7 @@ fn smooth(value: f32, target: f32, half_life: f32, dt: f32) -> f32 {
  impl FrameUniforms {
      /// This frame's values for a render size of `size` pixels.
      pub fn update(&mut self, frame: &Frame, inputs: &PackInputs, size: [u32; 2]) {
@@ -2707,7 +2707,7 @@ index 4da492b00..8d63d53c0 100644
          let now = std::time::Instant::now();
          let dt = self.last.map_or(0.0, |l| (now - l).as_secs_f32());
          self.last = Some(now);
-@@ -425,9 +532,21 @@ impl FrameUniforms {
+@@ -427,9 +534,21 @@ impl FrameUniforms {
      pub fn eval_custom(&mut self, custom: &mut horizon_shaders::Custom) {
          self.values.truncate(NAMES.len());
          let values = &self.values;
@@ -2731,7 +2731,7 @@ index 4da492b00..8d63d53c0 100644
              Some(match *v {
                  Value::F(f) => horizon_shaders::Val::vector(&f.map(f64::from)[..n]),
                  Value::I(i) => horizon_shaders::Val::vector(&i.map(f64::from)[..n.min(3)]),
-@@ -440,6 +559,8 @@ impl FrameUniforms {
+@@ -442,6 +561,8 @@ impl FrameUniforms {
          let out = custom.eval(dt, &builtin);
          self.values
              .extend(out.iter().map(|v| Value::f(&v.v.map(|x| x as f32)[..v.n])));
@@ -2741,10 +2741,10 @@ index 4da492b00..8d63d53c0 100644
  }
  
 diff --git a/crates/horizon-client/src/game/shader_packs.rs b/crates/horizon-client/src/game/shader_packs.rs
-index 26b4d1b49..c1c984191 100644
+index dbf539141..94fcf91db 100644
 --- a/crates/horizon-client/src/game/shader_packs.rs
 +++ b/crates/horizon-client/src/game/shader_packs.rs
-@@ -71,8 +71,11 @@ impl Game<'_> {
+@@ -80,8 +80,11 @@ impl Game<'_> {
                  match Pack::open(&path) {
                      Ok(pack) => {
                          let macros = Macros::standard();
@@ -2757,7 +2757,7 @@ index 26b4d1b49..c1c984191 100644
                          for note in &properties.notes {
                              log::warn!(
                                  "shader pack {name}: shaders.properties:{}: {}",
-@@ -88,18 +91,18 @@ impl Game<'_> {
+@@ -97,18 +100,18 @@ impl Game<'_> {
                              biomes.list.iter().map(|b| b.name.as_str()).collect();
                          post.custom.set_biomes(&names);
                          let text = pack.read_text("block.properties").unwrap_or_default();
@@ -2779,7 +2779,7 @@ index 26b4d1b49..c1c984191 100644
                              "item",
                          );
                          self.pack_ids = Some(PackIds {
-@@ -158,6 +161,35 @@ impl Game<'_> {
+@@ -171,6 +174,35 @@ impl Game<'_> {
              .map(|c| c.biome(at.x, at.y, at.z));
          let (held_items, held_light) = self.held_for_pack();
          let info = biome.map(|b| self.res.biomes().get(b));
@@ -2815,7 +2815,7 @@ index 26b4d1b49..c1c984191 100644
          PackInputs {
              day_time: self.world.day_time,
              rain: lerp(self.world.weather.rain_level),
-@@ -181,6 +213,7 @@ impl Game<'_> {
+@@ -194,6 +226,7 @@ impl Game<'_> {
              rainfall: info.map_or(0.0, |b| b.downfall),
              held_items,
              held_light,
@@ -2823,212 +2823,6 @@ index 26b4d1b49..c1c984191 100644
          }
      }
  
-diff --git a/crates/horizon-shaders/src/condition.rs b/crates/horizon-shaders/src/condition.rs
-index c476bb663..3ee50d4a5 100644
---- a/crates/horizon-shaders/src/condition.rs
-+++ b/crates/horizon-shaders/src/condition.rs
-@@ -15,11 +15,41 @@ pub fn eval_condition(expr: &str, macros: &Macros) -> Result<i64, String> {
-     };
-     let value = parser.binary(0)?;
-     match parser.tokens.get(parser.at) {
--        None => Ok(value),
-+        None => Ok(value.int()),
-         Some(t) => Err(format!("unexpected `{}`", t.text())),
-     }
- }
- 
-+/// A number in a condition. GLSL's `#if` is integer-only; Iris's preprocessor also takes
-+/// decimals (`#if SPEED < 1.0`), which packs written for it rely on, so this one does too:
-+/// arithmetic and comparisons with a decimal operand are done in floating point, the bit and
-+/// shift operators and `%` stay integer-only.
-+#[derive(Clone, Copy, Debug, PartialEq)]
-+enum Num {
-+    I(i64),
-+    F(f64),
-+}
-+
-+impl Num {
-+    fn int(self) -> i64 {
-+        match self {
-+            Num::I(n) => n,
-+            Num::F(x) => (x != 0.0) as i64,
-+        }
-+    }
-+
-+    fn float(self) -> f64 {
-+        match self {
-+            Num::I(n) => n as f64,
-+            Num::F(x) => x,
-+        }
-+    }
-+
-+    fn truthy(self) -> bool {
-+        self.float() != 0.0
-+    }
-+}
-+
- /// The text after a line's `#`, split into the directive word and the rest without its `//`
- /// comment. `None` when the first word is followed by something other than white space, `//` or
- /// the end of the line (`#ifdefault=1` is a comment, not `#ifdef`).
-@@ -171,14 +201,15 @@ fn find_word(text: &str, word: &str) -> Option<usize> {
- 
- #[derive(Clone, Copy, Debug, PartialEq)]
- enum Token {
--    Num(i64),
-+    Num(Num),
-     Op(&'static str),
- }
- 
- impl Token {
-     fn text(&self) -> String {
-         match self {
--            Token::Num(n) => n.to_string(),
-+            Token::Num(Num::I(n)) => n.to_string(),
-+            Token::Num(Num::F(x)) => x.to_string(),
-             Token::Op(op) => (*op).to_owned(),
-         }
-     }
-@@ -198,15 +229,36 @@ fn tokens(expr: &str, macros: &Macros) -> Result<Vec<Token>, String> {
-             let len = rest
-                 .find(|c: char| !c.is_ascii_alphanumeric())
-                 .unwrap_or(rest.len());
--            if rest[len..].starts_with('.') {
--                return Err(format!("`{}`: `#if` takes integers only", &rest[..len + 1]));
-+            if rest[len..].starts_with('.') || rest[..len].contains(['e', 'E']) && !rest.starts_with("0x") {
-+                // A decimal: digits, `.`, digits, an exponent, an `f` suffix.
-+                let end = rest
-+                    .char_indices()
-+                    .find(|&(i, c)| {
-+                        !(c.is_ascii_digit()
-+                            || c == '.'
-+                            || c == 'e'
-+                            || c == 'E'
-+                            || ((c == '-' || c == '+') && rest[..i].ends_with(['e', 'E'])))
-+                    })
-+                    .map_or(rest.len(), |(i, _)| i);
-+                let value: f64 = rest[..end]
-+                    .parse()
-+                    .map_err(|_| format!("`{}` is not a number", &rest[..end]))?;
-+                let mut end = end;
-+                if rest[end..].starts_with(['f', 'F']) {
-+                    end += 1;
-+                }
-+                out.push(Token::Num(Num::F(value)));
-+                rest = &rest[end..];
-+                rest = rest.trim_start();
-+                continue;
-             }
--            out.push(Token::Num(int_literal(&rest[..len])?));
-+            out.push(Token::Num(Num::I(int_literal(&rest[..len])?)));
-             rest = &rest[len..];
-         } else if is_ident_start(c) {
-             // Not a macro: 0, as the C preprocessor counts it.
-             let len = rest.find(|c: char| !is_ident(c)).unwrap_or(rest.len());
--            out.push(Token::Num(0));
-+            out.push(Token::Num(Num::I(0)));
-             rest = &rest[len..];
-         } else {
-             let op = OPS
-@@ -260,7 +312,7 @@ impl Parser<'_> {
-         t
-     }
- 
--    fn binary(&mut self, level: usize) -> Result<i64, String> {
-+    fn binary(&mut self, level: usize) -> Result<Num, String> {
-         if level == LEVELS.len() {
-             return self.unary();
-         }
-@@ -276,7 +328,7 @@ impl Parser<'_> {
-         Ok(left)
-     }
- 
--    fn unary(&mut self) -> Result<i64, String> {
-+    fn unary(&mut self) -> Result<Num, String> {
-         match self.next() {
-             Some(Token::Num(n)) => Ok(n),
-             Some(Token::Op("(")) => {
-@@ -286,18 +338,43 @@ impl Parser<'_> {
-                     _ => Err("missing `)`".into()),
-                 }
-             }
--            Some(Token::Op("-")) => Ok(self.unary()?.wrapping_neg()),
-+            Some(Token::Op("-")) => Ok(match self.unary()? {
-+                Num::I(n) => Num::I(n.wrapping_neg()),
-+                Num::F(x) => Num::F(-x),
-+            }),
-             Some(Token::Op("+")) => self.unary(),
--            Some(Token::Op("!")) => Ok((self.unary()? == 0) as i64),
--            Some(Token::Op("~")) => Ok(!self.unary()?),
-+            Some(Token::Op("!")) => Ok(Num::I(!self.unary()?.truthy() as i64)),
-+            Some(Token::Op("~")) => match self.unary()? {
-+                Num::I(n) => Ok(Num::I(!n)),
-+                Num::F(_) => Err("`~` of a decimal".into()),
-+            },
-             Some(t) => Err(format!("unexpected `{}`", t.text())),
-             None => Err("the condition ends too early".into()),
-         }
-     }
- }
- 
--fn apply(op: &str, a: i64, b: i64) -> Result<i64, String> {
--    Ok(match op {
-+fn apply(op: &str, a: Num, b: Num) -> Result<Num, String> {
-+    let (Num::I(a), Num::I(b)) = (a, b) else {
-+        let (x, y) = (a.float(), b.float());
-+        let bool = |v: bool| Num::I(v as i64);
-+        return Ok(match op {
-+            "||" => bool(a.truthy() || b.truthy()),
-+            "&&" => bool(a.truthy() && b.truthy()),
-+            "==" => bool(x == y),
-+            "!=" => bool(x != y),
-+            "<" => bool(x < y),
-+            ">" => bool(x > y),
-+            "<=" => bool(x <= y),
-+            ">=" => bool(x >= y),
-+            "+" => Num::F(x + y),
-+            "-" => Num::F(x - y),
-+            "*" => Num::F(x * y),
-+            "/" => Num::F(x / y),
-+            _ => return Err(format!("`{op}` of a decimal")),
-+        });
-+    };
-+    Ok(Num::I(match op {
-         "||" => (a != 0 || b != 0) as i64,
-         "&&" => (a != 0 && b != 0) as i64,
-         "|" => a | b,
-@@ -317,7 +394,7 @@ fn apply(op: &str, a: i64, b: i64) -> Result<i64, String> {
-         "/" | "%" if b == 0 => return Err("division by zero".into()),
-         "/" => a.wrapping_div(b),
-         _ => a.wrapping_rem(b),
--    })
-+    }))
- }
- 
- #[cfg(test)]
-@@ -343,6 +420,11 @@ mod tests {
-         assert_eq!(eval("-7 % 2"), Ok(-1));
-         assert_eq!(eval("!0 + ~0"), Ok(0));
-         assert_eq!(eval("0x10 + 010 + 3u"), Ok(27));
-+        // Decimals, as Iris's preprocessor takes them.
-+        assert_eq!(eval("1.0 >= 1.0 && 0.5 < 1"), Ok(1));
-+        assert_eq!(eval("2.5 * 2 == 5"), Ok(1));
-+        assert_eq!(eval("1.5e1 > 14.9f"), Ok(1));
-+        assert_eq!(eval("0.0"), Ok(0));
-     }
- 
-     #[test]
-@@ -359,7 +441,10 @@ mod tests {
-     #[test]
-     fn bad_conditions_say_why() {
-         assert!(eval("1 / 0").is_err());
--        assert!(eval("SHADOW_RES == 0.5").is_err());
-+        // Decimals compare (Iris Features); bit operators and `%` of one are still errors.
-+        assert_eq!(eval("SHADOW_RES == 0.5"), Ok(0));
-+        assert!(eval("1.5 % 2").is_err());
-+        assert!(eval("~1.0").is_err());
-         assert!(eval("(1 + 2").is_err());
-         assert!(eval("1 2").is_err());
-         assert!(eval("").is_err());
 diff --git a/crates/horizon-shaders/src/custom.rs b/crates/horizon-shaders/src/custom.rs
 index e27472816..7840157ef 100644
 --- a/crates/horizon-shaders/src/custom.rs
@@ -3476,10 +3270,10 @@ index 000000000..87b799771
 +    }
 +}
 diff --git a/crates/horizon-shaders/src/lib.rs b/crates/horizon-shaders/src/lib.rs
-index 4aa481e81..b10ed6812 100644
+index 014fe567c..6162d85d6 100644
 --- a/crates/horizon-shaders/src/lib.rs
 +++ b/crates/horizon-shaders/src/lib.rs
-@@ -13,6 +13,7 @@
+@@ -14,6 +14,7 @@
  //! - [`Macros`] and [`eval_condition`]: the macros packs test, and the `#if` arithmetic (1.5).
  
  mod biomes;
@@ -3487,7 +3281,7 @@ index 4aa481e81..b10ed6812 100644
  mod block_ids;
  mod condition;
  mod config;
-@@ -38,12 +39,13 @@ pub use macros::{MC_VERSION, Macros, RENDER_STAGES, render_stage};
+@@ -41,12 +42,13 @@ pub use macros::{MC_VERSION, Macros, RENDER_STAGES, render_stage};
  pub use options::switches_on;
  pub use pack::{Pack, PackError};
  pub use post::{
@@ -3505,7 +3299,7 @@ index 4aa481e81..b10ed6812 100644
 +    translate_shadow,
  };
 diff --git a/crates/horizon-shaders/src/macros.rs b/crates/horizon-shaders/src/macros.rs
-index 6c7fb2678..0fd861db5 100644
+index 0ce48f4a6..b5752967b 100644
 --- a/crates/horizon-shaders/src/macros.rs
 +++ b/crates/horizon-shaders/src/macros.rs
 @@ -91,6 +91,7 @@ impl Macros {
@@ -3517,7 +3311,7 @@ index 6c7fb2678..0fd861db5 100644
      }
  
 diff --git a/crates/horizon-shaders/src/post.rs b/crates/horizon-shaders/src/post.rs
-index fe5b1c63f..fdd3cf414 100644
+index 746e2f69a..acfb8d6f1 100644
 --- a/crates/horizon-shaders/src/post.rs
 +++ b/crates/horizon-shaders/src/post.rs
 @@ -268,6 +268,116 @@ pub struct Post {
@@ -3678,7 +3472,7 @@ index fe5b1c63f..fdd3cf414 100644
          }
          let vertex = preprocess(self.pack, &vsh, self.macros);
          let fragment = preprocess(self.pack, &fsh, self.macros);
-@@ -683,6 +805,20 @@ impl Loader<'_> {
+@@ -684,6 +806,20 @@ impl Loader<'_> {
      }
  }
  
@@ -3697,13 +3491,13 @@ index fe5b1c63f..fdd3cf414 100644
 +}
 +
  fn diagnostics(pp: &Preprocessed) -> Vec<String> {
-     pp.diagnostics
-         .iter()
+     located(pp, &pp.diagnostics)
+ }
 diff --git a/crates/horizon-shaders/src/properties.rs b/crates/horizon-shaders/src/properties.rs
-index b9d27f3e3..ea4de4342 100644
+index 6768d083a..f700ede2e 100644
 --- a/crates/horizon-shaders/src/properties.rs
 +++ b/crates/horizon-shaders/src/properties.rs
-@@ -60,11 +60,21 @@ impl Properties {
+@@ -71,11 +71,21 @@ impl Properties {
                  continue;
              }
              match logical.split_once('=') {
@@ -3731,7 +3525,7 @@ index b9d27f3e3..ea4de4342 100644
              }
          }
 diff --git a/crates/horizon-shaders/src/translate/mod.rs b/crates/horizon-shaders/src/translate/mod.rs
-index 6d2ae46c6..6638d4430 100644
+index cb1b13a1b..2e3183840 100644
 --- a/crates/horizon-shaders/src/translate/mod.rs
 +++ b/crates/horizon-shaders/src/translate/mod.rs
 @@ -47,6 +47,84 @@ pub struct Interface {
@@ -3829,8 +3623,8 @@ index 6d2ae46c6..6638d4430 100644
 +    buffers.dedup();
  
      // Varyings by name: the vertex outputs, then fragment inputs the vertex stage lacks. A
-     // matrix or array travels as one varying per column or element (`varying_parts`).
-@@ -314,6 +396,7 @@ fn translate(
+     // matrix or array travels as one varying per column or element (`varying_parts`), a
+@@ -338,6 +420,7 @@ fn translate(
              )
              .unwrap();
          }
@@ -3838,7 +3632,7 @@ index 6d2ae46c6..6638d4430 100644
          let direction = if stage.kind == ShaderStage::Vertex {
              "out"
          } else {
-@@ -461,7 +544,155 @@ fn translate(
+@@ -495,7 +578,155 @@ fn translate(
              samplers,
              outputs,
              draw,
@@ -3994,7 +3788,7 @@ index 6d2ae46c6..6638d4430 100644
      })
  }
  
-@@ -554,6 +785,10 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
+@@ -708,6 +939,10 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
                  .map(|e| at(e.meta, e.kind.to_string()))
                  .collect::<Vec<_>>()
          })?;
@@ -4005,7 +3799,7 @@ index 6d2ae46c6..6638d4430 100644
      Validator::new(ValidationFlags::all(), Capabilities::all())
          .validate(&module)
          .map_err(|e| {
-@@ -571,6 +806,114 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
+@@ -725,6 +960,114 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
      Ok(module)
  }
  
@@ -4121,10 +3915,10 @@ index 6d2ae46c6..6638d4430 100644
  fn block_layout(module: &naga::Module) -> (u32, Vec<(String, u32)>) {
      for (_, var) in module.global_variables.iter() {
 diff --git a/crates/horizon-shaders/src/translate/rewrite.rs b/crates/horizon-shaders/src/translate/rewrite.rs
-index 4101b1642..7cc959582 100644
+index a50b10676..9d588ecb3 100644
 --- a/crates/horizon-shaders/src/translate/rewrite.rs
 +++ b/crates/horizon-shaders/src/translate/rewrite.rs
-@@ -79,12 +79,27 @@ impl Stage<'_> {
+@@ -82,12 +82,27 @@ impl Stage<'_> {
          let mut skip_until = 0;
          let next = |i: usize| (i + 1..self.tokens.len()).find(|&j| significant(self.tokens[j]));
          let prev = |i: usize| (0..i).rev().find(|&j| significant(self.tokens[j]));
@@ -4152,7 +3946,7 @@ index 4101b1642..7cc959582 100644
                  continue;
              }
              if removed(i) {
-@@ -106,8 +121,18 @@ impl Stage<'_> {
+@@ -131,8 +146,18 @@ impl Stage<'_> {
                  }
                  "(" => {
                      let callee = prev(i).map_or("", |j| self.tokens[j]);
@@ -4172,7 +3966,7 @@ index 4101b1642..7cc959582 100644
                      } else {
                          ""
                      };
-@@ -139,12 +164,17 @@ impl Stage<'_> {
+@@ -164,12 +189,17 @@ impl Stage<'_> {
                  out.push_str(t);
                  continue;
              }
@@ -4181,7 +3975,7 @@ index 4101b1642..7cc959582 100644
 +                continue;
 +            }
              // A function definition's sampler parameters: `sampler2D s` → `texture2D s, sampler hz_s_s`.
-             if depth == 0 && t.contains("sampler") && calls.len() == 1 {
+             if depth == 0 && is_sampler_type(t) && calls.len() == 1 {
                  if let Some(n) = next(i).filter(|&n| is_ident(self.tokens[n])) {
                      let name = self.tokens[n];
                      let (texture, sampler) = split_sampler(t);
@@ -4191,7 +3985,7 @@ index 4101b1642..7cc959582 100644
                      params.insert(name.to_owned(), t.to_owned());
                      skip_until = n + 1;
                      continue;
-@@ -177,10 +207,11 @@ impl Stage<'_> {
+@@ -202,10 +232,11 @@ impl Stage<'_> {
                          .is_some_and(|p| p.get(*arg) == Some(&true))
                  }) && prev(i)
                      .is_some_and(|j| matches!(self.tokens[j], "(" | ","));
@@ -4205,7 +3999,7 @@ index 4101b1642..7cc959582 100644
                  }
                  continue;
              }
-@@ -199,6 +230,7 @@ impl Stage<'_> {
+@@ -224,6 +255,7 @@ impl Stage<'_> {
                  }
                  // GLSL's `modf`, which naga's frontend lacks.
                  "modf" if called => Some("hz_modf".into()),
@@ -4213,7 +4007,7 @@ index 4101b1642..7cc959582 100644
                  "texture2D" | "texture1D" | "texture3D" | "textureCube" if called => {
                      Some("texture".into())
                  }
-@@ -240,6 +272,7 @@ impl Stage<'_> {
+@@ -269,6 +301,7 @@ impl Stage<'_> {
                  _ if !fragment && VERTEX_INPUTS.iter().any(|b| t.starts_with(b)) => {
                      Some(format!("hz_{}", &t[3..]))
                  }
@@ -4221,7 +4015,7 @@ index 4101b1642..7cc959582 100644
                  "gl_VertexID" => Some("gl_VertexIndex".into()),
                  "gl_InstanceID" => Some("gl_InstanceIndex".into()),
                  _ if old && LATER_KEYWORDS.contains(&t) => Some(format!("hz_kw_{t}")),
-@@ -247,10 +280,25 @@ impl Stage<'_> {
+@@ -276,10 +309,25 @@ impl Stage<'_> {
              };
              out.push_str(replaced.as_deref().unwrap_or(t));
          }
@@ -4248,10 +4042,10 @@ index 4101b1642..7cc959582 100644
      /// The element count of an unsized array whose `[]` ends at `close`: the arguments of the
      /// constructor that follows (`[] = T[](...)` or `[](...)`).
 diff --git a/crates/horizon-shaders/src/translate/scan.rs b/crates/horizon-shaders/src/translate/scan.rs
-index 392538f03..c2d1b7b04 100644
+index 465243022..4eddb34f5 100644
 --- a/crates/horizon-shaders/src/translate/scan.rs
 +++ b/crates/horizon-shaders/src/translate/scan.rs
-@@ -44,8 +44,45 @@ pub(super) struct Stage<'p> {
+@@ -49,8 +49,45 @@ pub(super) struct Stage<'p> {
      /// Globals whose initializer runs in our `main` (`g = hz_init_g();`), in order.
      pub(super) inits: Vec<String>,
      pub(super) errors: Vec<Error>,
@@ -4297,7 +4091,7 @@ index 392538f03..c2d1b7b04 100644
  pub(super) const STORAGE: [&str; 5] = ["uniform", "in", "out", "attribute", "varying"];
  pub(super) const QUALIFIERS: [&str; 11] = [
      "flat",
-@@ -126,6 +163,16 @@ impl<'p> Stage<'p> {
+@@ -150,6 +187,16 @@ impl<'p> Stage<'p> {
              replaced: HashMap::new(),
              inits: Vec::new(),
              errors: Vec::new(),
@@ -4312,9 +4106,9 @@ index 392538f03..c2d1b7b04 100644
 +            instances: Vec::new(),
 +            runtime_consts: Vec::new(),
          };
+         s.rename_vulkan_types();
          let (mut start, mut depth, mut parens) = (0, 0usize, 0usize);
-         for i in 0..s.tokens.len() {
-@@ -173,6 +220,14 @@ impl<'p> Stage<'p> {
+@@ -199,6 +246,14 @@ impl<'p> Stage<'p> {
                  _ => {}
              }
          }
@@ -4329,7 +4123,7 @@ index 392538f03..c2d1b7b04 100644
          s
      }
  
-@@ -230,6 +285,20 @@ impl<'p> Stage<'p> {
+@@ -275,6 +330,20 @@ impl<'p> Stage<'p> {
              .position(|&i| matches!(self.tokens[i], "(" | "="));
          let prototype = paren.is_some_and(|p| self.tokens[words[p]] == "(")
              && !words.iter().any(|&i| STORAGE.contains(&self.tokens[i]));
@@ -4350,7 +4144,7 @@ index 392538f03..c2d1b7b04 100644
          if body || prototype {
              return self.function(&words);
          }
-@@ -237,26 +306,39 @@ impl<'p> Stage<'p> {
+@@ -282,26 +351,39 @@ impl<'p> Stage<'p> {
          let mut storage = None;
          let mut location = None;
          let mut interpolation = String::new();
@@ -4394,10 +4188,10 @@ index 392538f03..c2d1b7b04 100644
                  storage = Some(w);
              } else if QUALIFIERS.contains(&w) {
                  if matches!(
-@@ -313,9 +395,18 @@ impl<'p> Stage<'p> {
+@@ -358,9 +440,18 @@ impl<'p> Stage<'p> {
              let decl = format!("{interpolation}{ty} @{array};");
              match storage {
-                 "uniform" if ty.contains("sampler") => self.samplers.push((name, ty.clone())),
+                 "uniform" if is_sampler_type(&ty) => self.samplers.push((name, ty.clone())),
 -                "uniform" if ty.contains("image") => self
 -                    .errors
 -                    .push(self.error(ty_at, &format!("`{name}`: images are not supported yet"))),
@@ -4416,7 +4210,7 @@ index 392538f03..c2d1b7b04 100644
                  "uniform" => self.uniforms.push((name, format!("{ty}{array}"), ty_at)),
                  _ if input && !fragment => {
                      let value = attribute_value(&name, &ty);
-@@ -368,7 +459,14 @@ impl<'p> Stage<'p> {
+@@ -437,7 +528,14 @@ impl<'p> Stage<'p> {
          let constant = words[..eq].iter().any(|&i| text(i) == "const");
          let conditional =
              |d: &(usize, Option<usize>, usize)| words[d.0..d.2].iter().any(|&i| text(i) == "?");
@@ -4432,7 +4226,7 @@ index 392538f03..c2d1b7b04 100644
              return;
          }
          // The first declarator's name ends the type.
-@@ -446,9 +544,531 @@ impl<'p> Stage<'p> {
+@@ -515,6 +613,9 @@ impl<'p> Stage<'p> {
              }
          }
          self.replaced.extend(replaced);
@@ -4440,6 +4234,10 @@ index 392538f03..c2d1b7b04 100644
 +            self.runtime_consts.extend(names.iter().cloned());
 +        }
          self.inits.extend(names);
+     }
+ 
+@@ -553,6 +654,526 @@ impl<'p> Stage<'p> {
+         self.structs.insert(name.to_owned(), members);
      }
  
 +    /// `layout(std430, binding = N) [readonly] buffer Name { members } [instance];` (Iris
@@ -4643,6 +4441,7 @@ index 392538f03..c2d1b7b04 100644
 +                let var = Var {
 +                    name: text(name).to_owned(),
 +                    decl: format!("{interpolation}{ty} @{array};"),
++                    structure: false,
 +                };
 +                let list = if input { &mut self.ins } else { &mut self.outs };
 +                if !list.iter().any(|v| v.name == var.name) {

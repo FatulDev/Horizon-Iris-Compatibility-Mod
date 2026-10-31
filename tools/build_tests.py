@@ -99,6 +99,17 @@ src = open(os.path.join(ROOT, 'ref/crates/horizon-client-render/src/gfx/pack_pos
 s = src.index('#[cfg(test)]\nmod tests {')
 e = src.index('#[cfg(test)]\nmod spv_tests {')
 t = src[s:e]
+t = sub1(t, 'Macros, Pack, Properties, dimension_folder', 'Macros, Pack, dimension_folder')
+t = sub1(t, '                menu_blur: None,\n            };', '''                menu_blur: None,
+                chunk_fade: 0.0,
+                post_effects: crate::post_chain::Request {
+                    effects: &[],
+                    root: std::path::Path::new(""),
+                    menu_blur_radius: 0.0,
+                    globals: Default::default(),
+                },
+                water_plane: None,
+            };''')
 t = sub1(t, '''        let macros = Macros::standard();
         let properties = Properties::parse(''', '''        let mut macros = Macros::standard();
         horizon_shaders::iris::define_iris(&mut macros);
@@ -164,6 +175,17 @@ t = sub1(t, '                outline: Vec::new(),\n', '''                outline
                 } else {
                     Vec::new()
                 },
+''')
+# `IRIS_TEST_OPTIONS="A=1,B=true"`: the pack's option values, as its options file would set them.
+t = sub1(t, '        let Some(dir) = std::env::var_os("IRIS_TEST_PACK") else { return };\n', '''        let Some(dir) = std::env::var_os("IRIS_TEST_PACK") else { return };
+        if let Ok(o) = std::env::var("IRIS_TEST_OPTIONS") {
+            let values: std::collections::BTreeMap<String, String> = o
+                .split(',')
+                .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())))
+                .collect();
+            let name = std::path::Path::new(&dir).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            horizon_shaders::iris_options::set_values(&name, values);
+        }
 ''')
 t = sub1(t, '            for f in 0..frames {\n', '''            // `IRIS_TEST_PROBE`: the floodfill diagnostics on (every 256 frames, to stdout too).
             if std::env::var_os("IRIS_TEST_PROBE").is_some() {
