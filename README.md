@@ -58,6 +58,7 @@ function.
 | `layer.*` in block.properties | Held blocks the pack moves to its translucent layer (Eclipse's and Complementary's `layer.translucent = glass glass_pane`) draw translucent, with `gbuffers_hand_water` |
 | Terrain alpha test | Terrain's cutout faces (leaves, plants, campfires) shed texels below alpha 0.1, as Iris tests its cutout layers, also for packs that declare their outputs; solid faces aren't tested |
 | Distant terrain | While a pack runs, distant terrain meshes each block's face on its own: merged runs repeat their texture through Horizon's sampler, which a pack's atlas lookups can't (grass sides stretched across far hills) |
+| `mc_midTexCoord` | The middle of the quad's own texture coordinates, as Iris gives it, not of its sprite (packs that rebuild the tile from it stretched grass sides) |
 | Decimal `#if` | `#if SPEED < 1.0`, as Iris's preprocessor allows |
 | `bufferObject.N` | Storage buffers (fixed or screen-relative), at set 0 binding 1000 + N |
 | `image.*` | Images, cleared per frame when asked, sized by the screen or fixed, readable through their sampler name |

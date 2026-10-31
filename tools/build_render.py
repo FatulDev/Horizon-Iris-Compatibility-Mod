@@ -494,8 +494,16 @@ ti = sub1(ti, '    pub fn terrain_inputs(', '    pub(crate) fn iris_terrain_inpu
 ti = sub1(ti, '            alpha_test: None,', '            alpha_test: Some(horizon_shaders::AlphaTest { op: ">", reference: 0.1 }),')
 ti = sub1(ti, '             hz_Color = vec4(hz_v_color.rgb, 1.0);\\n    \\\n', '             hz_Color = vec4(hz_v_color.rgb, 1.0);\\n    \\\n             hz_cutout = (hz_v_layer & 32768u) != 0u ? 0.0 : 1.0;\\n    \\\n')
 ti = sub1(ti, '            ("at_tangent", "hz_tangent"),', '            ("at_tangent", "hz_tangent"),\n            ("at_midBlock", mid_block),')
+# `mc_midTexCoord` at the middle of the quad's own texture coordinates, as Iris gives it, not
+# of its sprite: a quad over part of a sprite (grass sides, slabs, plants) had its middle
+# elsewhere, and packs that rebuild the tile from it (BSL's and Fantasy's parallax and
+# generated normals) stretched the texture.
+ti = sub1(ti, '"vec4((hz_cell + 0.5) * hz_scale, 0.0, 1.0)"', '"vec4((hz_cell + hz_mid_uv) * hz_scale, 0.0, 1.0)"')
+ti = sub1(ti, '             hz_cutout = (hz_v_layer & 32768u) != 0u ? 0.0 : 1.0;\\n    \\\n', '             hz_cutout = (hz_v_layer & 32768u) != 0u ? 0.0 : 1.0;\\n    \\\n             hz_mid_uv = vec2(0.5);\\n    \\\n')
+
 ti = sub1(ti, '        if flat {\n            body.push_str(FACE);\n        }',
-          '        if flat {\n            body.push_str(FACE);\n            body.push_str(IRIS_IDS);\n        }')
+          '        if flat {\n            body.push_str(FACE);\n            body.push_str(IRIS_IDS);\n            body.push_str("    hz_mid_uv = clamp((hz_t0 + 0.5 * hz_d2) * hz_origin.w, 0.0, 1.0);\\n");\n        }')
+ti = sub1(ti, 'declarations.push_str("vec2 hz_cell; vec2 hz_scale; vec4 hz_tangent;\\n");', 'declarations.push_str("vec2 hz_cell; vec2 hz_scale; vec4 hz_tangent; vec2 hz_mid_uv;\\n");')
 ti = sub1(ti, '"vec4(float(hz_block_ids[2u * hz_layer]), float(hz_block_ids[2u * hz_layer + 1u]), 0.0, 0.0)"',
           '"vec4(float(hz_id), float(hz_block_ids[hz_base + 1u]), 0.0, 0.0)"')
 ti = sub1(ti, '        let attributes = [', """        // Flat draws have the quad's corners: the block is the one its centre lies in, just
