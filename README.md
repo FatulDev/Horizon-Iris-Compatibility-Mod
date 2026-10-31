@@ -50,7 +50,7 @@ function.
 | Rain and snow depth | Weather writes depth only with `rain.depth=true`, as in Iris (Horizon alone always wrote it, so Eclipse took each whole rain quad for a surface in front of the camera: dark boxes, discoloured streaks, and the wrong lighting behind them) |
 | `at_midBlock` | Flat terrain draws give each vertex its offset to the block's centre (in 64ths), as Iris does. Eclipse's floodfill voxelises blocks there; without it each block landed on whichever neighbouring voxel its corners rounded to, and that changed as the camera moved |
 | Rain, snow and clouds that start later | Horizon dropped a pack's rain, snow and `gbuffers_clouds` passes on the first frame without them (a world loaded in clear weather), then drew its own rain into the pack's image: drops that showed block textures and an unlit scene behind them. The passes now stay |
-| Shader options | Options → Mods → Iris Features lists the running pack's own options as Iris's shader pack screen has them: its screens and sub-screens, profiles, and the names its `lang/` files give options and values. A click moves an option to its next value (Shift+click: the one before); **Apply** writes Iris's own `shaderpacks/<pack>.txt` (only values that differ from the pack's defaults, so the file moves between Iris and Horizon) and loads the pack again. The page's last switch, **Floodfill diagnostics in the log**, writes the floodfill voxels and light totals of two frames in a row to the game log every few seconds, for reporting flickering lights. Switches (`#define X` / `//#define X`), value options (`#define X 2 // [1 2 3]`, the list anywhere in the comment) and `const` options (`shadowMapResolution`, `sunPathRotation`) all work, in the programs and in `.properties` conditions |
+| Shader options | Options → Mods → Iris Features lists the running pack's own options as Iris's shader pack screen has them: its screens and sub-screens, profiles, and the names its `lang/` files give options and values. A click moves an option to its next value (Shift+click: the one before); **Apply** writes Iris's own `shaderpacks/<pack>.txt` (only values that differ from the pack's defaults, so the file moves between Iris and Horizon) and loads the pack again. The page's last switch, **Floodfill diagnostics in the log**, writes the floodfill voxels and light totals of four frames in a row to the game log every few seconds, and the voxels near the camera whose light kept changing (with the block ids around them), for reporting flickering lights. Switches (`#define X` / `//#define X`), value options (`#define X 2 // [1 2 3]`, the list anywhere in the comment) and `const` options (`shadowMapResolution`, `sunPathRotation`) all work, in the programs and in `.properties` conditions |
 | Block ids for floodfill | Flat draws know a face's sprite, not its block, and Horizon gave each sprite the id most of its blocks have: an unlit furnace's sides were the lit furnace's (194), pumpkins were jack o'lanterns, and one block's faces could carry two ids, so Eclipse's voxels held whichever face the GPU drew last (lights that flickered). The mod picks the id by sprite **and** by how brightly the face's block glows (the HDR tier Horizon puts in each vertex colour), counts blocks without an id, and leaves a shared sprite's faces out of the voxels when the block's other faces place it. Redstone dust gets its power's id from its tint |
 | Decimal `#if` | `#if SPEED < 1.0`, as Iris's preprocessor allows |
 | `bufferObject.N` | Storage buffers (fixed or screen-relative), at set 0 binding 1000 + N |
@@ -60,15 +60,20 @@ function.
 | Iris uniforms | `currentPlayerHealth/Hunger/Air` (0 to 1) and their maximums, `firstPersonCamera`, `isSpectator`, `playerLookVector`, `is_burning/hurt/invisible/on_ground/sneaking/sprinting`, `isRightHanded`, `alphaTestRef` (0.1: cutout textures like plants and leaves) |
 | `normals`/`specular` | Without a PBR resource pack: a flat normal, and zeros |
 | Geometry stages | A `.gsh` that emits one triangle per triangle (Eclipse's terrain and beacon ones, with shader grass off) is skipped and the program runs without it |
-| GLSL that Iris's drivers accept | `const` initialised with function calls, interface blocks, bool members of storage buffers, `ivec % int`, swizzles of shadow lookups, functions that end without a `return`, matrix-column swizzle assignments, `sampler`/`image` used as names, mixed `ivec`/`uvec` comparisons, and vector components passed to `out`/`inout` parameters |
+| GLSL that Iris's drivers accept | `const` initialised with function calls, interface blocks, bool members of storage buffers, `ivec % int`, swizzles of shadow lookups, functions that end without a `return`, matrix-column swizzle assignments, `sampler`/`image` used as names, mixed `ivec`/`uvec` comparisons, and vector components passed to `out`/`inout` parameters; also `dot` of two floats, `vec % int` with a constant, struct varyings, `float[6] name` struct members, functions called before they are defined, unmatched `#endif` (ignored, as Iris's preprocessor does), `texture.<stage>.<sampler>.N` keys, and SNORM raw textures |
 
 ## Limits
 
 - **Geometry and tessellation shaders that add geometry are impossible on wgpu.** Eclipse's shader
   grass (`SHADER_GRASS_SETTING`, off by default) can't run. Turning it on makes the terrain
   program skip with a note in the log.
-- Image and buffer atomics (`imageAtomic*`, `atomicAdd` on buffers) are not translated. Eclipse's
-  default settings don't use them.
+- Image atomics are translated only as statements (`imageAtomicMax(img, p, v);`); their return
+  value isn't available. Buffer atomics (`atomicAdd` on buffers) are not translated.
+- Other Iris packs, in the software-Vulkan harness: Bliss renders. Luster and Noble build every
+  program but the picture is still wrong (black, white); Pegasus builds most programs, but one
+  pass both samples and writes its light volume, which wgpu refuses. Iris's `colorimgN` images
+  (writing colour buffers as images) aren't supported yet, and swizzles of a scalar (`f().x`)
+  fail in naga's GLSL frontend.
 - `lightningBoltPosition` always reads "no bolt", so lightning doesn't cast Eclipse's lightning
   shadows.
 - The options page is a list of buttons (what Horizon gives native mods): an option with many

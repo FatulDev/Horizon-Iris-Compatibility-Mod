@@ -14,7 +14,7 @@ PRISTINE = os.path.expanduser('~/hz-pristine')
 OUT = os.path.join(ROOT, 'out', 'iris-features')
 
 MOD_ID = 'iris-features'
-VERSION = '0.1.17'
+VERSION = '0.1.18'
 HORIZON = 'fca2169de9c014be8b6606ac1f3dba0bcda3731a'
 MIXINS = '5140cdf81915c25f10a7745eb532e1c09f275068'
 
@@ -168,6 +168,15 @@ pfile = sub1(pfile, """        n += 1;
             }
         }
         let origin = Origin {""")
+# An `#endif` with no `#if` open is passed over, as Iris's preprocessor (JCPP) does: it reports
+# it and goes on (Pegasus closes one `#if` twice across an include).
+pfile = sub1(pfile, "    this.line(&line, origin, path, depth);", """    let stray_endif = !this.conditionals.open()
+        && line.trim_start().strip_prefix('#').and_then(split_directive).is_some_and(|(w, _)| w == "endif");
+    if stray_endif {
+        this.emit(String::new(), origin);
+    } else {
+        this.line(&line, origin, path, depth);
+    }""")
 pfile += open(os.path.join(ROOT, 'src', 'shaders_preprocess_extra.rs')).read()
 module('shaders-preprocess', SH + 'preprocess.rs', 'iris_preprocess',
        '// `Run::file` with macro calls that span lines joined first.\nuse super::*;\n\n' + pfile)
@@ -277,6 +286,19 @@ def submod(name, edit=lambda s: s):
 # GLSL names Iris's compatibility layer accepts: `gpu_shader4`'s `texelFetch2D` and
 # `textureSize2D`, and `textureGather` (naga's GLSL frontend has neither), as texel fetches.
 GATHER = r'''
+        for fun in ["Add", "Min", "Max", "And", "Or", "Xor", "Exchange"] {
+            if self.tokens.iter().any(|t| t.strip_prefix("imageAtomic") == Some(fun)) {
+                let f = fun.to_lowercase();
+                writeln!(p_out(&mut p_text), "uvec4 hz_atomic_{f}(uint v) {{ return uvec4(v); }}\n\
+                    ivec4 hz_atomic_{f}(int v) {{ return ivec4(v); }}").unwrap();
+            }
+        }
+        if self.tokens.iter().any(|t| *t == "dot") {
+            p_text.push_str("float hz_dot(float a, float b) { return a * b; }\n\
+                float hz_dot(vec2 a, vec2 b) { return dot(a, b); }\n\
+                float hz_dot(vec3 a, vec3 b) { return dot(a, b); }\n\
+                float hz_dot(vec4 a, vec4 b) { return dot(a, b); }\n");
+        }
         if self.tokens.iter().any(|t| t.starts_with("textureGather")) {
             for (p, v) in [("", "vec4"), ("i", "ivec4"), ("u", "uvec4")] {
                 for (name, off, arg) in [("hz_textureGather", "ivec2(0)", ""), ("hz_textureGatherOffset", "o", ", ivec2 o")] {
@@ -305,12 +327,18 @@ GATHER = r'''
         }
 '''
 def edit_rewrite(s):
+    # `gl_VertexID` before the vertex inputs (`gl_Vertex...`): it is not `hz_VertexID`.
+    s = sub1(s, '                "gl_VertexID" => Some("gl_VertexIndex".into()),\n', '')
+    s = sub1(s, '                "gl_FragColor" => Some("hz_out0".into()),\n',
+             '                "gl_VertexID" => Some("gl_VertexIndex".into()),\n                "gl_FragColor" => Some("hz_out0".into()),\n')
     s = sub1(s, '                "texture2DProj" if called => Some("textureProj".into()),',
              '                "texture2DProj" if called => Some("textureProj".into()),\n'
              '                "texelFetch1D" | "texelFetch2D" | "texelFetch3D" if called => Some("texelFetch".into()),\n'
              '                "textureSize1D" | "textureSize2D" | "textureSize3D" if called => Some("textureSize".into()),\n'
              '                "textureGather" if called => Some("hz_textureGather".into()),\n'
              '                "textureGatherOffset" if called => Some("hz_textureGatherOffset".into()),\n'
+             '                // naga takes `dot` of vectors only; GLSL also of two floats (Pegasus).\n'
+             '                "dot" if called => Some("hz_dot".into()),\n'
              '                // Memory barriers: naga has the one `barrier()` (all memory, the workgroup in step).\n'
              '                "memoryBarrierShared" | "memoryBarrier" | "groupMemoryBarrier" | "memoryBarrierImage"\n'
              '                | "memoryBarrierBuffer" if called => Some("barrier".into()),')
@@ -352,15 +380,215 @@ def edit_scan(s):
                             .frag_outs
                             .push((n, format!("layout(location = {n}) out {ty} {name}{array};"))),
                     }''')
+    # A struct varying (Luster's `flat out OverworldFogParams fogParams;`): naga's GLSL frontend
+    # takes none, and wgpu's stage interfaces only scalars and vectors. It stays a private global
+    # where the pack declared it, one varying per member carries it across, copied after the
+    # vertex stage's `main` and before the fragment stage's.
+    s = sub1(s, '    pub(super) widened: Vec<String>,\n',
+             '    pub(super) widened: Vec<String>,\n    /// Iris Features: struct varyings\' member copies.\n    pub(super) struct_copies: Vec<String>,\n')
+    s = sub1(s, '            widened: Vec::new(),\n', '            widened: Vec::new(),\n            struct_copies: Vec::new(),\n')
+    s = sub1(s, """        let input = matches!(storage, "in" | "attribute") || (storage == "varying" && fragment);
+""", """        let input = matches!(storage, "in" | "attribute") || (storage == "varying" && fragment);
+        if storage != "uniform" && input == fragment && let Some(members) = self.struct_members(&ty) {
+            for &w in &words[..k] {
+                self.removed.push(w..w + 1);
+            }
+            for (name, array) in declarators {
+                if !array.is_empty() {
+                    let e = self.error(ty_at, &format!("`{name}`: arrays of struct varyings are not supported"));
+                    self.errors.push(e);
+                    continue;
+                }
+                for (mty, member, marray) in &members {
+                    let part = format!("hz_sv_{name}_{member}");
+                    let decl = format!("{interpolation}{mty} @{marray};");
+                    if input {
+                        self.struct_copies.push(format!("{name}.{member} = {part};"));
+                        self.ins.push(Var { name: part, decl });
+                    } else {
+                        self.struct_copies.push(format!("{part} = {name}.{member};"));
+                        self.outs.push(Var { name: part, decl });
+                    }
+                }
+            }
+            return;
+        }
+""")
+    s = sub1(s, '    pub(super) fn global(&mut self, from: usize, to: usize, body: bool) {', """    /// Iris Features: the members of the pack's `struct ty { ... }`: type, name, array suffix.
+    fn struct_members(&self, ty: &str) -> Option<Vec<(String, String, String)>> {
+        let sig: Vec<&str> = self.tokens.iter().copied().filter(|t| significant(t)).collect();
+        let at = sig.windows(3).position(|w| w[0] == "struct" && w[1] == ty && w[2] == "{")?;
+        let mut i = at + 3;
+        let mut out = Vec::new();
+        while i < sig.len() && sig[i] != "}" {
+            let mut j = i;
+            while j < sig.len() && sig[j] != ";" {
+                j += 1;
+            }
+            let decl = &sig[i..j.min(sig.len())];
+            let d = decl.iter().take_while(|w| QUALIFIERS.contains(w)).count();
+            let mty = decl.get(d)?.to_string();
+            // `float[6] name`: the array goes with each name.
+            let mut rest = &decl[d + 1..];
+            let mut prefix = String::new();
+            while rest.first() == Some(&"[") {
+                let close = rest.iter().position(|t| *t == "]")?;
+                prefix.push_str(&rest[..=close].concat());
+                rest = &rest[close + 1..];
+            }
+            for part in rest.split(|t| *t == ",") {
+                let (name, array) = part.split_first()?;
+                out.push((mty.clone(), name.to_string(), format!("{prefix}{}", array.concat())));
+            }
+            i = j + 1;
+        }
+        Some(out)
+    }
+
+    pub(super) fn global(&mut self, from: usize, to: usize, body: bool) {""")
+    # A struct member declared `float[6] name;` (Luster's ACES tables): naga's GLSL frontend reads
+    # the member as a `float`. `float name[6];` is the same member.
+    s = sub1(s, """        let (mut start, mut depth, mut parens) = (0, 0usize, 0usize);
+""", """        {
+            let sig: Vec<usize> = (0..s.tokens.len()).filter(|&i| significant(s.tokens[i])).collect();
+            let at = |k: usize| sig.get(k).map_or("", |&i| s.tokens[i]);
+            let (mut in_struct, mut depth) = (false, 0i32);
+            let mut moves = Vec::new();
+            for k in 0..sig.len() {
+                match at(k) {
+                    "struct" => {
+                        in_struct = true;
+                        depth = 0;
+                    }
+                    "{" if in_struct => depth += 1,
+                    "}" if in_struct => {
+                        depth -= 1;
+                        in_struct = depth > 0;
+                    }
+                    "[" if in_struct && depth == 1 && k > 0 && is_ident(at(k - 1)) && at(k + 2) == "]"
+                        && is_ident(at(k + 3)) && matches!(at(k + 4), ";" | ",") =>
+                    {
+                        moves.push(k);
+                    }
+                    _ => {}
+                }
+            }
+            for k in moves {
+                let size = at(k + 1).to_owned();
+                let name = at(k + 3).to_owned();
+                for j in k..k + 3 {
+                    s.replaced.insert(sig[j], String::new());
+                }
+                s.replaced.insert(sig[k + 3], format!("{name}[{size}]"));
+            }
+        }
+        let (mut start, mut depth, mut parens) = (0, 0usize, 0usize);
+""")
+    # `imageAtomicMax(image, p, v)` (Pegasus's voxels), which naga's GLSL frontend lacks: written
+    # `imageStore(image, p, hz_atomic_max(v))`, a store of ours the compiler turns into the
+    # atomic (`image_atomics`). Only as a statement; its old value is not returned.
+    s = sub1(s, """        let (mut start, mut depth, mut parens) = (0, 0usize, 0usize);
+""", """        {
+            let sig: Vec<usize> = (0..s.tokens.len()).filter(|&i| significant(s.tokens[i])).collect();
+            for k in 0..sig.len() {
+                let fun = match s.tokens[sig[k]] {
+                    "imageAtomicAdd" => "add",
+                    "imageAtomicMin" => "min",
+                    "imageAtomicMax" => "max",
+                    "imageAtomicAnd" => "and",
+                    "imageAtomicOr" => "or",
+                    "imageAtomicXor" => "xor",
+                    "imageAtomicExchange" => "exchange",
+                    _ => continue,
+                };
+                if sig.get(k + 1).map(|&i| s.tokens[i]) != Some("(") {
+                    continue;
+                }
+                let (mut depth, mut commas, mut second, mut close) = (0i32, 0, None, None);
+                for j in k + 1..sig.len() {
+                    match s.tokens[sig[j]] {
+                        "(" | "[" | "{" => depth += 1,
+                        ")" | "]" | "}" => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(j);
+                                break;
+                            }
+                        }
+                        "," if depth == 1 => {
+                            commas += 1;
+                            if commas == 2 {
+                                second = Some(j);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let (Some(c2), Some(cl), 2) = (second, close, commas) {
+                    s.replaced.insert(sig[k], "imageStore".into());
+                    s.replaced.insert(sig[c2], format!(", hz_atomic_{fun}("));
+                    s.replaced.insert(sig[cl], "))".into());
+                }
+            }
+        }
+        let (mut start, mut depth, mut parens) = (0, 0usize, 0usize);
+""")
     return sub1(s, '            sampler_functions: HashMap::new(),',
                 '            // Iris Features: `textureGather` takes its sampler apart, as our helpers do.\n'
                 '            sampler_functions: [("textureGather", vec![true, false, false, false]), ("textureGatherOffset", vec![true, false, false, false])]\n'
                 '                .into_iter()\n                .map(|(n, p)| (n.to_owned(), p))\n                .collect(),')
+tr = sub1(tr, '    vertex_main.push_str("    hz_main();\\n");\n',
+          '    vertex_main.push_str("    hz_main();\\n");\n    for w in &v.struct_copies {\n        writeln!(vertex_main, "    {w}").unwrap();\n    }\n')
+tr = sub1(tr, '    fragment_main.push_str("    hz_main();\\n");\n',
+          '    for w in &f.struct_copies {\n        writeln!(fragment_main, "    {w}").unwrap();\n    }\n    fragment_main.push_str("    hz_main();\\n");\n')
 tr = sub1(tr, '    fragment_main.push_str("    hz_main();\\n");\n',
           '    fragment_main.push_str("    hz_main();\\n");\n    for w in &f.widened {\n        writeln!(fragment_main, "    {w}").unwrap();\n    }\n')
 tr += '\n' + submod('scan', edit_scan) + '\n' + submod('rewrite', edit_rewrite)
+# Any pointer into a variable passed to a function (`f(material.normal)` for an `inout`
+# parameter), not only a vector's component: naga's SPIR-V writer takes whole variables only.
+tr = sub1(tr, """            let into_vector = match finfo[base].ty.inner_with(types) {
+                naga::TypeInner::Pointer { base, .. } => {
+                    matches!(types[*base].inner, naga::TypeInner::Vector { .. })
+                }
+                naga::TypeInner::ValuePointer { size: Some(_), .. } => true,
+                _ => false,
+            };
+            if !into_vector {
+                continue;
+            }
+            if let naga::TypeInner::ValuePointer { size: None, scalar, .. } =
+                *finfo[h].ty.inner_with(types)
+            {
+                scalar_of.insert(h, scalar);
+            }""", """            let into = matches!(
+                finfo[base].ty.inner_with(types),
+                naga::TypeInner::Pointer { .. } | naga::TypeInner::ValuePointer { .. }
+            );
+            if !into {
+                continue;
+            }
+            let inner = match *finfo[h].ty.inner_with(types) {
+                naga::TypeInner::ValuePointer { size: None, scalar, .. } => naga::TypeInner::Scalar(scalar),
+                naga::TypeInner::ValuePointer { size: Some(size), scalar, .. } => {
+                    naga::TypeInner::Vector { size, scalar }
+                }
+                naga::TypeInner::Pointer { base, .. } => {
+                    scalar_of.insert(h, base);
+                    continue;
+                }
+                _ => continue,
+            };
+            let ty = types.insert(naga::Type { name: None, inner }, naga::Span::UNDEFINED);
+            scalar_of.insert(h, ty);""")
+tr = tr.replace("scalar_of: &std::collections::HashMap<naga::Handle<naga::Expression>, naga::Scalar>,",
+                "scalar_of: &std::collections::HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Type>>,")
+tr = sub1(tr, """                        let Some(&scalar) = scalar_of.get(a) else { continue };
+                        let ty = types.insert(
+                            naga::Type { name: None, inner: naga::TypeInner::Scalar(scalar) },
+                            naga::Span::UNDEFINED,
+                        );""", """                        let Some(&ty) = scalar_of.get(a) else { continue };""")
 tr += own('shaders_atomic_stores.rs')
-tr = sub1(tr, '    let mut module = module;\n', '    let mut module = module;\n    workgroup_barriers(&mut module);\n    if stage.kind == ShaderStage::Vertex {\n        atomic_vertex_stores(&mut module);\n    }\n')
+tr = sub1(tr, '    let mut module = module;\n', '    let mut module = module;\n    workgroup_barriers(&mut module);\n    vector_modulo(&mut module);\n    private_struct_strides(&mut module);\n    callees_first(&mut module);\n    image_atomics(&mut module);\n    if stage.kind == ShaderStage::Vertex {\n        atomic_vertex_stores(&mut module);\n    }\n')
 module('shaders-translate', SH + 'translate/mod.rs', 'iris_translate',
        '// The translator with Iris\'s storage buffers, images and compute programs, and the GLSL\n'
        '// packs written for Iris rely on.\n' + tr)

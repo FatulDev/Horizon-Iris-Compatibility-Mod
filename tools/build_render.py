@@ -149,11 +149,36 @@ ir = sub1(ir, 'pub(super) struct Iris {\n    pub resources: Resources,', 'pub(su
 # until one of them has written (flipped) the buffer; after that they read the buffer.
 ir = sub1(ir, '    pub features: wgpu::Features,\n}', '    pub features: wgpu::Features,\n    /// (stage, order, buffers written) of every post program.\n    pub writes: Vec<(&\'static str, u32, u16)>,\n}')
 ir = sub1(ir, '            features,\n        }\n    }', '            features,\n            writes: Vec::new(),\n        }\n    }')
+# `texture.deferred.colortex6.1`: Iris reads the sampler's name up to its first dot.
+ir = sub1(ir, '''                .map(|t| (t.decl.clone(), t.view_dimension))''', '''                .map(|t| {
+                    let mut decl = t.decl.clone();
+                    if let Some((name, _)) = decl.sampler.split_once('.') {
+                        decl.sampler = name.to_owned();
+                    }
+                    (decl, t.view_dimension)
+                })''')
 ir = sub1(ir, """        let horizon_has = s.name != "noisetex"
             && source(&s.name, group.shadow(), shadow.is_some(), watershadow) != Source::Dummy;""", """        let horizon_source = source(&s.name, group.shadow(), shadow.is_some(), watershadow);
+        // A custom texture of the name for this stage, and whether it is raw data.
+        let custom = with_build(|b| {
+            b.textures
+                .iter()
+                .find(|(t, _)| t.sampler == s.name && t.stage.as_deref().is_none_or(|st| st == stage))
+                // Iris renames a sampler for a custom texture only where it is declared of the
+                // texture's dimension (Luster's composites read `sampler2D colortex0`, its fog
+                // the 3D noise of the name).
+                .filter(|(_, d)| *d == shape)
+                .map(|(t, _)| t.raw.is_some())
+        })
+        .flatten();
         let overridable = match horizon_source {
-            Source::Color(n) => !group.shadow() && flipped & 1 << n == 0,
-            _ => false,
+            // Iris renames the sampler of a raw texture in the stage's programs: the texture,
+            // whatever wrote the buffer before (Luster's 3D noise as `colortex0`).
+            Source::Color(_) if custom == Some(true) => true,
+            Source::Color(n) => custom.is_some() && !group.shadow() && flipped & 1 << n == 0,
+            Source::Dummy => false,
+            // Another of Horizon's (`depthtex2`): a custom texture of the name takes it.
+            _ => custom.is_some(),
         };
         let horizon_has = s.name != "noisetex" && horizon_source != Source::Dummy && !overridable;""")
 ir = sub1(ir, '    let stage = stage_of(group);\n', '    let stage = stage_of(group);\n    let flipped = flipped_before(stage, program_order(group, name));\n')
@@ -262,6 +287,12 @@ bp = sub1(bp, '''        &p.name,
         &uses,
         &modules,''')
 bp = sub1(bp, '        iris: pass_iris,\n', '')
+# An output past the program's last buffer (Luster writes two, `RENDERTARGETS: 1` names one):
+# Iris drops it; a trailing empty target would not match the pass's attachments.
+bp = sub1(bp, '''    if !final_pass && writes.is_empty() {''', '''    while targets.last().is_some_and(|t| t.is_none()) {
+        targets.pop();
+    }
+    if !final_pass && writes.is_empty() {''')
 m = re.search(r'    Some\(Pass \{\n        ubo: (device\.create_buffer\(&wgpu::BufferDescriptor \{.*?\n        \}\)),\n', bp, re.S)
 bp = bp[:m.start()] + '    let ubo = ' + m.group(1).replace('\n    ', '\n') + ';\n    record_pass(&ubo, pass_iris);\n    Some(Pass {\n        ubo,\n' + bp[m.end():]
 bp = re.sub(r'(?<![\w:])super::', 'super::super::', bp)

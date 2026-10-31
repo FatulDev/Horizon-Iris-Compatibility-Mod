@@ -15,6 +15,8 @@ pub(super) struct IrisState {
     /// read-backs in flight.
     pub frames: u64,
     pub probes: Vec<Probe>,
+    /// The texels of the last frames read back: frame, image, texels (tight), size, bytes each.
+    pub probed: Vec<(u64, String, Vec<u8>, [u32; 3], u32)>,
 }
 
 pub(super) type Shared = std::rc::Rc<RefCell<IrisState>>;
@@ -45,6 +47,7 @@ pub(super) fn register(pp: &PackPost, iris: Iris) {
         particles_translucent_late: false,
         frames: 0,
         probes: Vec::new(),
+        probed: Vec::new(),
     }));
     STATE.with(|s| *s.borrow_mut() = Some((pp.dummy.clone(), shared)));
 }
@@ -88,7 +91,24 @@ pub(super) fn storage_uses(modules: &[(wgpu::ShaderStages, &naga::Module)]) -> (
     let mut images: Vec<ImageUse> = Vec::new();
     let mut buffers: Vec<u32> = Vec::new();
     for (_, m) in modules {
-        for (_, g) in m.global_variables.iter() {
+        // Only what the code reaches: a pack may declare an image it never touches (Pegasus's
+        // gbuffers declare the light volume they sample), and binding it as storage too would
+        // conflict with the sampling.
+        let used: std::collections::HashSet<naga::Handle<naga::GlobalVariable>> = m
+            .functions
+            .iter()
+            .map(|(_, f)| f)
+            .chain(m.entry_points.iter().map(|e| &e.function))
+            .flat_map(|f| f.expressions.iter())
+            .filter_map(|(_, e)| match e {
+                naga::Expression::GlobalVariable(g) => Some(*g),
+                _ => None,
+            })
+            .collect();
+        for (gh, g) in m.global_variables.iter() {
+            if !used.contains(&gh) {
+                continue;
+            }
             let Some(b) = &g.binding else { continue };
             if b.group != 0 {
                 continue;
@@ -595,9 +615,9 @@ pub(super) struct Probe {
     requested: bool,
 }
 
-/// Floodfill diagnostics, from Iris Features' page: every 4 seconds or so, two frames in a row
-/// of the voxels and light volumes go to the log. A light that flickers shows as numbers that
-/// change between the two.
+/// Floodfill diagnostics, from Iris Features' page: every 4 seconds or so, four frames in a row
+/// of the voxels and light volumes go to the log, and where each changed between frames that
+/// write the same light volume. A light that flickers shows as voxels that keep changing.
 pub static PROBE_FLOODFILL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl PackPost {
@@ -637,9 +657,10 @@ impl PackPost {
                     let Ok(data) = buffer.slice(..).get_mapped_range() else { continue };
                     let row = (size[0] * bpt).next_multiple_of(256) as usize;
                     let rows = (size[1] * size[2]) as usize;
-                    let texels = (0..rows).flat_map(|y| {
-                        data[y * row..y * row + (size[0] * bpt) as usize].chunks_exact(*bpt as usize)
-                    });
+                    let tight: Vec<u8> = (0..rows)
+                        .flat_map(|y| data[y * row..y * row + (size[0] * bpt) as usize].iter().copied())
+                        .collect();
+                    let texels = tight.chunks_exact(*bpt as usize);
                     if name == "imgVoxelMask" {
                         let mut counts: std::collections::BTreeMap<u32, usize> = Default::default();
                         for t in texels {
@@ -661,13 +682,33 @@ impl PackPost {
                         }
                         line += &format!(" {name} light {sum} in {lit} voxels;");
                     }
+                    // The 64 voxels around the camera each way, for where they changed.
+                    let crop = size.map(|n| n.min(64));
+                    let at = |n: u32, c: u32| ((n - c) / 2) as usize;
+                    let (x0, y0, z0) = (at(size[0], crop[0]), at(size[1], crop[1]), at(size[2], crop[2]));
+                    let b = *bpt as usize;
+                    let mut near = Vec::with_capacity((crop[0] * crop[1] * crop[2]) as usize * b);
+                    for z in z0..z0 + crop[2] as usize {
+                        for y in y0..y0 + crop[1] as usize {
+                            let start = ((z * size[1] as usize + y) * size[0] as usize + x0) * b;
+                            near.extend_from_slice(&tight[start..start + crop[0] as usize * b]);
+                        }
+                    }
+                    s.probed.push((p.frame, name.clone(), near, crop, *bpt));
                 }
                 buffer.unmap();
             }
             log::info!("{line} images cleared each frame: {}", s.iris.can_clear);
         }
-        // Two frames in a row, every 256 frames.
-        if !on || s.frames % 256 > 1 || s.probes.len() > 4 {
+        // All four frames read back (or nothing more coming): where they changed.
+        if let Some(last) = s.probed.iter().map(|p| p.0).find(|f| f % 256 == 3) {
+            let all = (last.saturating_sub(3)..=last).all(|f| s.probed.iter().any(|p| p.0 == f));
+            if all || s.probes.is_empty() {
+                log_changes(&std::mem::take(&mut s.probed));
+            }
+        }
+        // Four frames in a row, every 256 frames.
+        if !on || s.frames % 256 > 3 || s.probes.len() > 8 {
             return;
         }
         let mut images = Vec::new();
@@ -711,4 +752,72 @@ impl PackPost {
             });
         }
     }
+}
+
+/// Logs where the probed images changed: the voxels between consecutive frames, each light
+/// volume between frames two apart (the frames that write it). Where the light changed most,
+/// and the voxels around it, say which blocks it is.
+fn log_changes(probed: &[(u64, String, Vec<u8>, [u32; 3], u32)]) {
+    let find = |frame: u64, name: &str| probed.iter().find(|p| p.0 == frame && p.1 == name);
+    let Some(first) = probed.iter().map(|p| p.0).min() else { return };
+    let voxels = |frame: u64| find(frame, "imgVoxelMask");
+    let id_at = |v: &(u64, String, Vec<u8>, [u32; 3], u32), x: i64, y: i64, z: i64| -> Option<u32> {
+        let [w, h, d] = v.3;
+        if x < 0 || y < 0 || z < 0 || x >= w as i64 || y >= h as i64 || z >= d as i64 {
+            return None;
+        }
+        let i = ((z as usize * h as usize + y as usize) * w as usize + x as usize) * v.4 as usize;
+        Some(u32::from(v.2[i]) | u32::from(*v.2.get(i + 1).unwrap_or(&0)) << 8)
+    };
+    let mut line = String::from("floodfill changes:");
+    if let (Some(a), Some(b)) = (voxels(first), voxels(first + 1)) {
+        let n = a.2.chunks_exact(a.4 as usize).zip(b.2.chunks_exact(b.4 as usize)).filter(|(x, y)| x != y).count();
+        line += &format!(" voxels changed between frames {n};");
+    }
+    let names: std::collections::BTreeSet<&str> =
+        probed.iter().map(|p| p.1.as_str()).filter(|n| n.starts_with("imgLpv")).collect();
+    for name in names {
+        for f in [first, first + 1] {
+            let (Some(a), Some(b)) = (find(f, name), find(f + 2, name)) else { continue };
+            let bpt = a.4 as usize;
+            let [w, h, _] = a.3;
+            let mut changed = 0usize;
+            let mut worst: Vec<(u32, usize)> = Vec::new();
+            for (k, (x, y)) in a.2.chunks_exact(bpt).zip(b.2.chunks_exact(bpt)).enumerate() {
+                let delta = x.iter().zip(y).map(|(p, q)| u32::from(p.abs_diff(*q))).max().unwrap_or(0);
+                if delta > 1 {
+                    changed += 1;
+                    worst.push((delta, k));
+                }
+            }
+            worst.sort_by(|p, q| q.0.cmp(&p.0));
+            worst.truncate(4);
+            line += &format!(" {name} frames {f}/{}: {changed} voxels changed by more than 1", f + 2);
+            for (delta, k) in worst {
+                let (x, y, z) = ((k % w as usize) as i64, ((k / w as usize) % h as usize) as i64, (k / (w * h) as usize) as i64);
+                let around: Vec<u32> = voxels(f)
+                    .map(|v| {
+                        [(0, 0, 0), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+                            .iter()
+                            .filter_map(|(dx, dy, dz)| {
+                                // The voxel volume may be larger than the light volume; both
+                                // are centred on the camera.
+                                let off = |vw: u32, lw: u32| (i64::from(vw) - i64::from(lw)) / 2;
+                                id_at(v, x + dx + off(v.3[0], a.3[0]), y + dy + off(v.3[1], a.3[1]), z + dz + off(v.3[2], a.3[2]))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let c = |v: i64, n: u32| v - i64::from(n / 2);
+                line += &format!(
+                    " [{},{},{} from the camera, by {delta}; voxel and neighbours {around:?}]",
+                    c(x, a.3[0]),
+                    c(y, a.3[1]),
+                    c(z, a.3[2])
+                );
+            }
+            line.push(';');
+        }
+    }
+    log::info!("{line}");
 }

@@ -395,7 +395,7 @@ t = t[:-1] + '''
         impl log::Log for Out {
             fn enabled(&self, _: &log::Metadata<'_>) -> bool { true }
             fn log(&self, r: &log::Record<'_>) {
-                if r.args().to_string().starts_with("floodfill probe") {
+                if r.args().to_string().starts_with("floodfill") {
                     println!("  {}", r.args());
                 }
             }
