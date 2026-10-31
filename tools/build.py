@@ -14,7 +14,7 @@ PRISTINE = os.path.expanduser('~/hz-pristine')
 OUT = os.path.join(ROOT, 'out', 'iris-features')
 
 MOD_ID = 'iris-features'
-VERSION = '0.1.21'
+VERSION = '0.1.22'
 HORIZON = 'fca2169de9c014be8b6606ac1f3dba0bcda3731a'
 MIXINS = '5140cdf81915c25f10a7745eb532e1c09f275068'
 
@@ -109,6 +109,23 @@ module('shaders-iris', SH + 'lib.rs', 'iris', iris, 'pub')
 # Shader options: the pack's options, screens and profiles for the menu (game side), and the
 # player's values written into the sources as they are read.
 module('shaders-options', SH + 'lib.rs', 'iris_options', own('shaders_options.rs'), 'pub')
+# `layer.*` of block.properties, read as the ids are.
+hook('block-layers', 'horizon_shaders::block_ids::BlockIds::parse', '''\
+fn iris_block_layers(properties: &crate::Properties) {
+    crate::iris::set_layers(properties);
+}
+''', [binding('properties', '&crate::Properties', 'properties')], cancellable=False)
+# A held block the pack draws on its translucent layer (`layer.translucent = glass`) is drawn as
+# translucent (`gbuffers_hand_water`), as Iris does; a block it moves off it, as not.
+hook('held-layer', 'horizon_client::item_render::FileSprites::translucent', '''\
+fn iris_held_layer(sprite: &str) -> ::core::ops::ControlFlow<bool> {
+    match horizon_shaders::iris::sprite_layer(sprite) {
+        Some(2) => ::core::ops::ControlFlow::Break(true),
+        Some(_) => ::core::ops::ControlFlow::Break(false),
+        None => ::core::ops::ControlFlow::Continue(()),
+    }
+}
+''', [binding('sprite', '&str', 'sprite')])
 hook('pack-read-text', 'horizon_shaders::pack::Pack::read_text', '''\
 fn iris_read_text(pack: &Pack, path: &str) -> ::core::ops::ControlFlow<Option<String>> {
     ::core::ops::ControlFlow::Break(crate::iris_options::read_text(pack, path))

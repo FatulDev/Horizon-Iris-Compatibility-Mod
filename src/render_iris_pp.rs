@@ -1078,6 +1078,18 @@ impl PackPost {
         }
         let (opaque, translucent): (Vec<&[super::super::Vertex]>, Vec<&[super::super::Vertex]>) =
             frame.hand.chunks_exact(4).partition(|q| !translucent_hand_quad(q));
+        // What the hand holds, in the log when it changes (which quads drew translucent).
+        {
+            thread_local! { static LAST: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) }; }
+            let counts = (opaque.len(), translucent.len());
+            if LAST.with(|l| l.replace(counts)) != counts && counts != (0, 0) {
+                let layers: std::collections::BTreeSet<u32> = frame.hand.iter().map(|v| v.layer).collect();
+                log::info!(
+                    "held items: {} quads with gbuffers_hand, {} translucent with gbuffers_hand_water (overlays {layers:?})",
+                    counts.0, counts.1
+                );
+            }
+        }
         let opaque: Vec<super::super::Vertex> = opaque.concat();
         st.borrow_mut().hand_translucent_quads = translucent.concat();
         let Some((mut pass, mut geometry)) = self.hand.take() else { return true };

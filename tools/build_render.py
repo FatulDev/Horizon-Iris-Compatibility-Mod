@@ -487,6 +487,10 @@ fn iris_draw_entities(
 # flickered with the order the GPU drew them in).
 ti = take(pristine(RE + 'gfx/pack_atlas.rs'), r'^    pub fn terrain_inputs\(')
 ti = sub1(ti, '    pub fn terrain_inputs(', '    pub(crate) fn iris_terrain_inputs(')
+# Terrain sheds texels below alpha 0.1, as Iris tests its cutout layers (leaves, plants, glass
+# panes): packs that leave the test to Iris (Sildur's, BSL, Pegasus) drew their clear texels
+# as solid colour. Solid blocks' texels are opaque, so the one terrain program can test all.
+ti = sub1(ti, '            alpha_test: None,', '            alpha_test: Some(horizon_shaders::AlphaTest { op: ">", reference: 0.1 }),')
 ti = sub1(ti, '            ("at_tangent", "hz_tangent"),', '            ("at_tangent", "hz_tangent"),\n            ("at_midBlock", mid_block),')
 ti = sub1(ti, '        if flat {\n            body.push_str(FACE);\n        }',
           '        if flat {\n            body.push_str(FACE);\n            body.push_str(IRIS_IDS);\n        }')

@@ -55,6 +55,8 @@ function.
 | Translucent held items | Held items with translucent texels (stained glass, ice, slime) draw with the pack's `gbuffers_hand_water` after translucent terrain, as in Iris; the rest with `gbuffers_hand`. Horizon drew all of them with `gbuffers_hand`, which Eclipse dithers (grainy) |
 | Block outline | Drawn by the mod after the pack's deferred programs, into the buffer translucent terrain draws to, black at 40% (Horizon drew it before them, where packs lit and reflected it as the block behind it) |
 | GPU errors | Logged once each instead of ending the game while a pack runs |
+| `layer.*` in block.properties | Held blocks the pack moves to its translucent layer (Eclipse's and Complementary's `layer.translucent = glass glass_pane`) draw translucent, with `gbuffers_hand_water` |
+| Terrain alpha test | Terrain sheds texels below alpha 0.1, as Iris tests cutout layers (leaves, plants) for packs that don't discard them themselves |
 | Decimal `#if` | `#if SPEED < 1.0`, as Iris's preprocessor allows |
 | `bufferObject.N` | Storage buffers (fixed or screen-relative), at set 0 binding 1000 + N |
 | `image.*` | Images, cleared per frame when asked, sized by the screen or fixed, readable through their sampler name |
