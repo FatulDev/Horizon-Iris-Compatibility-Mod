@@ -3157,6 +3157,10 @@ impl Renderer {
     /// LevelRenderer.submitBlockOutline: the buffer holds `edges` per stroke, the black
     /// secondary stroke first when high contrast is on.
     fn draw_outline(&self, pass: &mut wgpu::RenderPass<'_>, edges: u32, high_contrast: bool) {
+        // A shader pack draws the outline itself (Iris Features: `pack_post::iris_extra`).
+        if horizon_shaders::iris::pack_terrain() {
+            return;
+        }
         pass.set_vertex_buffer(0, self.outline.slice(..));
         if high_contrast {
             pass.set_pipeline(&self.lines_secondary);

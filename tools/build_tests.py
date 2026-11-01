@@ -15,12 +15,12 @@ assert len(defs) == 6, defs
 a = '            let mut macros = Macros::standard();\n'
 assert body.count(a) == 1
 body = body.replace(a, a + ''.join(f'            macros.define("{n}", "{v}");\n' for n, v in defs))
-out = os.path.join(ROOT, 'out', 'iris-features-tests')
+out = os.path.join(ROOT, 'out', 'iris_features_tests')
 os.makedirs(out, exist_ok=True)
 open(os.path.join(out, 'tests.rs'), 'w').write(re.sub(r'^    ', '', body, flags=re.M))
 HORIZON = re.search(r"^HORIZON = '([^']+)'", open(os.path.join(HERE, 'build.py')).read(), re.M).group(1)
 open(os.path.join(out, 'horizon-mixin.toml'), 'w').write(f'''[mod]
-id = "iris-features-tests"
+id = "iris_features_tests"
 version = "0.1.0"
 priority = 100
 

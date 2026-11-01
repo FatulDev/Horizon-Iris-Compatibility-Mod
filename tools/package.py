@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Packs out/iris-features as the launcher's native mod formats: an unpacked .hnmod folder and the
+"""Packs out/iris_features as the launcher's native mod formats: an unpacked .hnmod folder and the
 .hnmod archive itself (horizon-native.json + mixins/<id>/), plus the deliverable zip."""
 import json, os, re, shutil, sys, zipfile
 
@@ -10,7 +10,7 @@ sys.path.insert(0, HERE)
 _build = open(os.path.join(HERE, 'build.py')).read()
 def _pin(name):
     return re.search(rf"^{name} = '([^']+)'", _build, re.M).group(1)
-MOD_ID, VERSION = 'iris-features', _pin('VERSION')
+MOD_ID, VERSION = 'iris_features', _pin('VERSION')
 HORIZON, MIXINS = _pin('HORIZON'), _pin('MIXINS')
 
 src = os.path.join(ROOT, 'out', MOD_ID)

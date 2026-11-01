@@ -1,5 +1,5 @@
 diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
-index e9990b6da..60f19e677 100644
+index e9990b6da..951dd9fb3 100644
 --- a/crates/horizon-client-render/src/gfx.rs
 +++ b/crates/horizon-client-render/src/gfx.rs
 @@ -103,6 +103,7 @@ pub mod pack_draw;
@@ -10,7 +10,18 @@ index e9990b6da..60f19e677 100644
  mod pack_post;
  mod pack_shadow;
  mod pack_sky;
-@@ -3921,6 +3922,7 @@ impl Renderer {
+@@ -3156,6 +3157,10 @@ impl Renderer {
+     /// LevelRenderer.submitBlockOutline: the buffer holds `edges` per stroke, the black
+     /// secondary stroke first when high contrast is on.
+     fn draw_outline(&self, pass: &mut wgpu::RenderPass<'_>, edges: u32, high_contrast: bool) {
++        // A shader pack draws the outline itself (Iris Features: `pack_post::iris_extra`).
++        if horizon_shaders::iris::pack_terrain() {
++            return;
++        }
+         pass.set_vertex_buffer(0, self.outline.slice(..));
+         if high_contrast {
+             pass.set_pipeline(&self.lines_secondary);
+@@ -3921,6 +3926,7 @@ impl Renderer {
          pack: Option<horizon_shaders::Post>,
          block_ids: &[i32],
      ) -> Option<(Vec<String>, Vec<String>)> {
@@ -18,7 +29,7 @@ index e9990b6da..60f19e677 100644
          if pack.is_none() {
              self.pack_atlas = None;
          }
-@@ -3980,6 +3982,7 @@ impl Renderer {
+@@ -3980,6 +3986,7 @@ impl Renderer {
      }
      /// Drops the running shader pack, of either kind.
      pub fn drop_shader_packs(&mut self) {
@@ -231,7 +242,7 @@ index 25fb917db..b01ca8a47 100644
                          wgpu::TextureDimension::D2
                      },
 diff --git a/crates/horizon-client-render/src/gfx/pack_post.rs b/crates/horizon-client-render/src/gfx/pack_post.rs
-index c6a037b22..faad4d110 100644
+index c6a037b22..2c2564267 100644
 --- a/crates/horizon-client-render/src/gfx/pack_post.rs
 +++ b/crates/horizon-client-render/src/gfx/pack_post.rs
 @@ -1008,7 +1008,11 @@ fn bindings(
@@ -273,7 +284,15 @@ index c6a037b22..faad4d110 100644
          // A first run finds the names neither the frame nor the pack defines.
          custom.eval(0.0, &|n| pack_uniforms::index(n).map(|_| Val::scalar(0.0)));
          // Its zeros are no start for `smooth`: the first frame's values are, as in Iris.
-@@ -3214,6 +3221,9 @@ impl PackPost {
+@@ -3006,6 +3013,7 @@ impl PackPost {
+         );
+         self.draw_entities(device, queue, encoder, size, true);
+         self.draw_weather(device, queue, encoder, size);
++        iris_extra::draw_outline(self, device, encoder);
+     }
+ 
+     /// The rain, then the snow, `set_weather` gave for this frame, with `gbuffers_weather`.
+@@ -3214,6 +3222,9 @@ impl PackPost {
                  let mipped = self.mipped & 1 << i != 0;
                  let levels = if mipped { full_chain(sizes[i]) } else { 1 };
                  let mut attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
@@ -283,12 +302,22 @@ index c6a037b22..faad4d110 100644
                  if self.storage & 1 << i != 0 {
                      attachment |= wgpu::TextureUsages::STORAGE_BINDING;
                      // Atomics on a texture need it made for them (Metal ignores them otherwise).
-@@ -3831,3 +3841,1397 @@ mod tests {
+@@ -3415,6 +3426,7 @@ impl PackPost {
+         pages: &[(u32, wgpu::Buffer)],
+         terrain: &mut TerrainDraw<'_>,
+     ) {
++        iris_extra::set_outline(frame);
+         self.resize(device, size);
+         if let Some((layout, ids)) = &self.block_ids {
+             // A page that grew has a new buffer.
+@@ -3831,3 +3843,1399 @@ mod tests {
          assert!(source("shadowtex1HW", false, true, false) == Source::ShadowDepth(1, true));
      }
  }
 +
 +#[cfg(test)]
++pub(crate) mod iris_extra;
++
 +pub(crate) mod iris_tests {
 +    #[cfg(test)]
 +    mod tests {
@@ -1681,6 +1710,183 @@ index c6a037b22..faad4d110 100644
 +        }
 +    }
 +}
+diff --git a/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs b/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs
+new file mode 100644
+index 000000000..1fa9d7c12
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs
+@@ -0,0 +1,171 @@
++// Iris Features: the block outline while a pack runs. Iris draws it after the pack's deferred
++// programs, into what translucent terrain writes, so the pack neither lights nor reflects it and
++// it follows the pack's own camera; Horizon's own outline goes into its world pass instead.
++use super::*;
++
++/// This frame's outline, camera-relative line segments (`Frame::outline`).
++static OUTLINE: std::sync::Mutex<Vec<[f32; 6]>> = std::sync::Mutex::new(Vec::new());
++
++/// Notes the frame's outline (before the pack runs).
++pub fn set_outline(frame: &crate::gfx::Frame) {
++    let edges = crate::gfx::outline_vertices(&frame.outline, frame.camera);
++    *OUTLINE.lock().unwrap_or_else(|e| e.into_inner()) = edges;
++}
++
++struct Lines {
++    format: wgpu::TextureFormat,
++    depth: wgpu::TextureFormat,
++    pipeline: wgpu::RenderPipeline,
++    layout: wgpu::BindGroupLayout,
++}
++
++static LINES: std::sync::Mutex<Option<Lines>> = std::sync::Mutex::new(None);
++
++const SHADER: &str = "
++struct U { m: mat4x4<f32> };
++@group(0) @binding(0) var<uniform> u: U;
++@vertex fn vs(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> {
++    return u.m * vec4<f32>(p, 1.0);
++}
++@fragment fn fs() -> @location(0) vec4<f32> {
++    return vec4<f32>(0.0, 0.0, 0.0, 0.4);
++}
++";
++
++/// Draws the outline into the buffer translucent terrain writes at location 0: black at 40%,
++/// as vanilla's, behind what stands in front of it.
++pub fn draw_outline(pp: &PackPost, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
++    let edges = OUTLINE.lock().unwrap_or_else(|e| e.into_inner()).clone();
++    if edges.is_empty() {
++        return;
++    }
++    let (Some(water), Some(targets)) = (&pp.water, &pp.targets) else {
++        return;
++    };
++    let Some(&(_, buffer)) = water.writes.iter().find(|w| w.0 == 0) else {
++        return;
++    };
++    let Some(sides) = &targets.color[buffer] else {
++        return;
++    };
++    let view = &sides[usize::from(pp.main & 1 << buffer != 0)];
++    let format = view.texture().format();
++    let depth_format = targets.depth_texture.format();
++    // The pack's camera: its projection (GL depth, -1 to 1, made wgpu's 0 to 1) and view.
++    let matrix = |name: &str| {
++        let i = pack_uniforms::index(name)?;
++        match pp.uniforms.values.get(i)? {
++            pack_uniforms::Value::F(f) => Some(glam::Mat4::from_cols_array(f)),
++            _ => None,
++        }
++    };
++    let (Some(projection), Some(model_view)) = (matrix("gbufferProjection"), matrix("gbufferModelView")) else {
++        return;
++    };
++    // As the translator ends a vertex stage drawing into buffers: y flipped (the buffers are
++    // stored as GL lays textures out), depth from -1..1 to 0..1.
++    let depth = glam::Mat4::from_cols_array(&[
++        1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
++    ]);
++    let m = depth * projection * model_view;
++    let mut lines = LINES.lock().unwrap_or_else(|e| e.into_inner());
++    if lines.as_ref().is_none_or(|l| l.format != format || l.depth != depth_format) {
++        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++            label: Some("Iris Features outline"),
++            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
++        });
++        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: None,
++            entries: &[wgpu::BindGroupLayoutEntry {
++                binding: 0,
++                visibility: wgpu::ShaderStages::VERTEX,
++                ty: wgpu::BindingType::Buffer {
++                    ty: wgpu::BufferBindingType::Uniform,
++                    has_dynamic_offset: false,
++                    min_binding_size: None,
++                },
++                count: None,
++            }],
++        });
++        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: None,
++            bind_group_layouts: &[Some(&layout)],
++            immediate_size: 0,
++        });
++        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++            label: Some("Iris Features outline"),
++            layout: Some(&pipeline_layout),
++            vertex: wgpu::VertexState {
++                module: &module,
++                entry_point: Some("vs"),
++                compilation_options: Default::default(),
++                buffers: &[Some(wgpu::VertexBufferLayout {
++                    array_stride: 12,
++                    step_mode: wgpu::VertexStepMode::Vertex,
++                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
++                })],
++            },
++            primitive: wgpu::PrimitiveState {
++                topology: wgpu::PrimitiveTopology::LineList,
++                ..Default::default()
++            },
++            depth_stencil: Some(wgpu::DepthStencilState {
++                format: depth_format,
++                depth_write_enabled: Some(false),
++                depth_compare: Some(wgpu::CompareFunction::LessEqual),
++                stencil: Default::default(),
++                bias: Default::default(),
++            }),
++            multisample: Default::default(),
++            fragment: Some(wgpu::FragmentState {
++                module: &module,
++                entry_point: Some("fs"),
++                compilation_options: Default::default(),
++                targets: &[Some(wgpu::ColorTargetState {
++                    format,
++                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
++                    write_mask: wgpu::ColorWrites::ALL,
++                })],
++            }),
++            multiview_mask: None,
++            cache: None,
++        });
++        *lines = Some(Lines { format, depth: depth_format, pipeline, layout });
++    }
++    let Some(lines) = lines.as_ref() else { return };
++    let vertices: Vec<f32> = edges.iter().flatten().copied().collect();
++    let vb = wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor {
++        label: None,
++        contents: bytemuck::cast_slice(&vertices),
++        usage: wgpu::BufferUsages::VERTEX,
++    });
++    let ub = wgpu::util::DeviceExt::create_buffer_init(device, &wgpu::util::BufferInitDescriptor {
++        label: None,
++        contents: bytemuck::cast_slice(&m.to_cols_array()),
++        usage: wgpu::BufferUsages::UNIFORM,
++    });
++    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++        label: None,
++        layout: &lines.layout,
++        entries: &[wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() }],
++    });
++    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++        label: Some("Iris Features outline"),
++        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++            view,
++            depth_slice: None,
++            resolve_target: None,
++            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
++        })],
++        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++            view: &targets.depth,
++            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
++            stencil_ops: None,
++        }),
++        ..Default::default()
++    });
++    pass.set_pipeline(&lines.pipeline);
++    pass.set_bind_group(0, &group, &[]);
++    pass.set_vertex_buffer(0, vb.slice(..));
++    pass.draw(0..(edges.len() * 2) as u32, 0..1);
++}
 diff --git a/crates/horizon-client-render/src/gfx/pack_uniforms.rs b/crates/horizon-client-render/src/gfx/pack_uniforms.rs
 index 59f8bb578..e435a4721 100644
 --- a/crates/horizon-client-render/src/gfx/pack_uniforms.rs
@@ -1753,6 +1959,42 @@ index b4dee5bf6..e6355261f 100644
      let pieces = ((rect.u1 - rect.u0) / MAX_FACE).ceil() * ((rect.v1 - rect.v0) / MAX_FACE).ceil();
      if pieces > MAX_PIECES {
          let extent = (rect.u1 - rect.u0).max(rect.v1 - rect.v0);
+diff --git a/crates/horizon-client-render/src/shader_options.rs b/crates/horizon-client-render/src/shader_options.rs
+index 04a7705fd..255f061ca 100644
+--- a/crates/horizon-client-render/src/shader_options.rs
++++ b/crates/horizon-client-render/src/shader_options.rs
+@@ -139,8 +139,30 @@ impl ShaderOptions {
+             .iter()
+             .position(|(n, _)| Some(n) == current.as_ref());
+         let (_, values) = profiles[at.map_or(0, |i| (i + 1) % profiles.len())].clone();
++        // A profile may write a value as its own text (`0.5` for the list's `0.50`): the list's
++        // value equal to it (Iris Features; a value left unset kept the profile from matching,
++        // and the next click started over from the first profile).
++        let same = |a: &str, b: &str| {
++            a.trim() == b.trim()
++                || matches!((a.trim().parse::<f64>(), b.trim().parse::<f64>()), (Ok(x), Ok(y)) if x == y)
++        };
+         for (name, value) in values {
+-            self.set(&name, value);
++            let Some(option) = self.options.get(&name) else {
++                continue;
++            };
++            match option.values.iter().find(|v| same(v, &value)).cloned() {
++                Some(listed) => self.set(&name, listed),
++                // A value the option's list lacks (Eclipse's water colour per profile): set as
++                // the profile writes it, as Iris does.
++                None if same(&value, &option.default) => {
++                    self.chosen.remove(&name);
++                    self.changed = true;
++                }
++                None => {
++                    self.chosen.insert(name.clone(), value);
++                    self.changed = true;
++                }
++            }
+         }
+     }
+ 
 diff --git a/crates/horizon-shaders/src/iris.rs b/crates/horizon-shaders/src/iris.rs
 new file mode 100644
 index 000000000..afff9fdb4

@@ -17,10 +17,10 @@ You need the Horizon launcher with native mods (Settings → Game → Native mod
 1. Build it from the command line, pointing at the unpacked folder:
 
    ```sh
-   horizon-launcher native-build path/to/iris-features --trust-native-code
+   horizon-launcher native-build path/to/iris_features --trust-native-code
    ```
 
-   Alternatively, copy `iris-features.hnmod` into your instance's `horizon-native-mods/` folder,
+   Alternatively, copy `iris_features.hnmod` into your instance's `horizon-native-mods/` folder,
    turn it on, and press **Build** on the Mods page.
 
    The first build downloads Rust and Horizon's source, then compiles the game: 10 to 30 minutes
@@ -60,16 +60,31 @@ The packs in brackets are examples of packs that needed each change.
 | Terrain alpha test | Cutout faces (leaves, plants, campfires) shed texels below alpha 0.1, as Iris tests its cutout layers, also with declared outputs; solid faces aren't tested |
 | `mc_midTexCoord` | The middle of the quad's own texture coordinates, not of its sprite (stretched grass sides) |
 | Distant terrain | While a pack runs, distant faces are meshed a block each (grass sides stretched across far hills) |
+| Block outline | Drawn by the mod after translucent terrain, into the buffer it writes, with the pack's own camera, black at 40% as vanilla's; Horizon's own outline (drawn into its world pass, where it floated at an angle or didn't show) is skipped while a pack runs |
+| Shader profiles | A profile's values are set even when written differently from the option's list (`0.5` for `0.50`) or not in it at all, as in Iris (the profile button worked once, then kept starting over) |
+| GPU errors | Logged once each instead of ending the game |
 
 ## Not carried over from 0.1.25 yet
 
 These worked on the old Horizon and still need porting onto Horizon's new pack renderer:
 
 - Translucent held items with `gbuffers_hand_water` (stained glass in hand grainy on Eclipse).
-- The block outline drawn after the pack's deferred programs (it can look reflective).
 - Block ids by sprite and glow for floodfill (lights that flicker with some blocks).
-- `gbuffers_particles_translucent`, rain depth with `rain.depth`, GPU errors logged instead of
-  ending the game.
+- `gbuffers_particles_translucent`, and rain depth with `rain.depth`.
+- Block-breaking cracks (`gbuffers_damagedblock`) while a pack runs.
+
+## Known issues
+
+Reported in the game and not reproduced in the test setup yet:
+
+- Complementary: a grey band between the horizon and distant terrain.
+- Sildur's: water reflections jitter and have no colour.
+- Pegasus: rain particles, and possibly the sky and clouds.
+- Solas, RedHat, Reverie: water flat and untextured; RedHat lacks exposure; Reverie starts black
+  until the camera moves, with jittering textures.
+- Rethinking Voxels: torches and campfires light only from a distance; water drawn as vanilla's.
+- Alpha Piscium: no terrain, only the water's top surface; the sky changes colour with the pitch.
+- Just Colored Lighting: caves see-through (as always).
 
 ## Pack status
 

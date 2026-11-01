@@ -3013,6 +3013,7 @@ impl PackPost {
         );
         self.draw_entities(device, queue, encoder, size, true);
         self.draw_weather(device, queue, encoder, size);
+        iris_extra::draw_outline(self, device, encoder);
     }
 
     /// The rain, then the snow, `set_weather` gave for this frame, with `gbuffers_weather`.
@@ -3425,6 +3426,7 @@ impl PackPost {
         pages: &[(u32, wgpu::Buffer)],
         terrain: &mut TerrainDraw<'_>,
     ) {
+        iris_extra::set_outline(frame);
         self.resize(device, size);
         if let Some((layout, ids)) = &self.block_ids {
             // A page that grew has a new buffer.
@@ -3843,6 +3845,8 @@ mod tests {
 }
 
 #[cfg(test)]
+pub(crate) mod iris_extra;
+
 pub(crate) mod iris_tests {
     #[cfg(test)]
     mod tests {
