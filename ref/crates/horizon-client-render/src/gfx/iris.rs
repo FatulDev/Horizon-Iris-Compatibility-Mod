@@ -2,6 +2,12 @@
 //! uniforms (the player), and which buffers the passes built so far write.
 use super::pack_uniforms::Value;
 
+/// Entity programs of the mod's own after `pack_entities`' (`pack_post::iris_extra` draws them):
+/// block-breaking cracks (`gbuffers_damagedblock`) and translucent particles
+/// (`gbuffers_particles_translucent`).
+pub const DAMAGED: usize = super::pack_entities::PROGRAMS;
+pub const PARTICLE_TRANSLUCENT: usize = super::pack_entities::PROGRAMS + 1;
+
 /// The local player as Iris's own uniforms describe it.
 #[derive(Clone, Copy, Debug)]
 pub struct IrisPlayer {
@@ -114,3 +120,167 @@ pub fn custom_count() -> usize {
     CUSTOM.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+
+/// `mc_Entity`'s table for flat terrain draws, which know a face's sprite layer and how it glows
+/// (the HDR code its colour's alpha carries, `mesher::emitting`), not its block. Horizon gives a
+/// layer the id most of its blocks have; where blocks of other ids share a sprite (a furnace's
+/// sides are the lit furnace's too) one block's faces then carried two ids, and a pack that
+/// voxelises terrain (Eclipse's floodfill) kept whichever face the GPU drew last: lights
+/// flickered, an unlit furnace or pumpkin shone.
+///
+/// The table, in `i32`s: 16 ids of `redstone_wire` by power, then [`ID_STRIDE`] per sprite
+/// layer: Horizon's (id, fluid) pair, an id for each glow code (0 to [`GLOW_CODES`] - 1), and
+/// flags: bit `c` set when faces of code `c` place their block in voxels (`at_midBlock`),
+/// [`IRIS_WIRE`] when the layer is redstone dust tinted by its power.
+pub const GLOW_CODES: usize = 9;
+pub const ID_STRIDE: usize = 2 + GLOW_CODES + 1;
+pub const IRIS_WIRE: i32 = 1 << 16;
+
+/// The glow code of HDR tier `tier` (`mesher::LOW`... plus `WHOLE`), as `mesher::emitting`
+/// writes it: 15 minus it is the colour alpha's low nibble.
+pub fn glow_code(tier: u8) -> u8 {
+    let level = (tier & !crate::mesher::WHOLE).min(crate::mesher::VERY_BRIGHT);
+    if level > 0 && tier & crate::mesher::WHOLE != 0 { level + 4 } else { level }
+}
+
+/// A block state as [`id_table`] sees it.
+pub struct IdState<'a> {
+    /// `minecraft:furnace`.
+    pub name: &'a str,
+    /// Its id in `block.properties`, -1 without one.
+    pub id: i32,
+    /// `redstone_wire`'s power.
+    pub wire_power: Option<usize>,
+    /// Its faces: (sprite layer, glow code, tinted).
+    pub faces: Vec<(u32, u8, bool)>,
+}
+
+/// The table for `states` over Horizon's (id, fluid) pairs by layer (`pairs`); `layer_name`
+/// gives a layer's sprite (`block/furnace_side`). Also how many (layer, code) uses blocks of
+/// different ids share, and how many of those are left out of voxels.
+pub fn id_table<'n>(
+    states: &[IdState<'_>],
+    layer_name: impl Fn(u32) -> Option<&'n str>,
+    pairs: &[i32],
+) -> (Vec<i32>, usize, usize) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let layers = pairs.len() / 2;
+    let mut table = vec![-1; 16 + ID_STRIDE * layers];
+    for l in 0..layers {
+        let at = 16 + ID_STRIDE * l;
+        table[at] = pairs[2 * l];
+        table[at + 1] = pairs[2 * l + 1];
+        table[at + 2..at + 2 + GLOW_CODES].fill(pairs[2 * l]);
+        table[at + 2 + GLOW_CODES] = (1 << GLOW_CODES) - 1;
+    }
+    let (mut mixed, mut left_out) = (0, 0);
+    let fluid = |l: u32| pairs.get(2 * l as usize + 1) == Some(&1);
+    // (layer, code) -> id -> (a block named like the sprite, the blocks).
+    type Votes<'s> = BTreeMap<i32, (bool, BTreeSet<&'s str>)>;
+    let mut slots: BTreeMap<(u32, u8), Votes<'_>> = BTreeMap::new();
+    let mut uses: Vec<BTreeSet<(u32, u8)>> = Vec::with_capacity(states.len());
+    let mut users: BTreeMap<(u32, u8), Vec<usize>> = BTreeMap::new();
+    // Per layer: (every face on it is redstone dust's, every one tinted).
+    let mut wire: BTreeMap<u32, (bool, bool)> = BTreeMap::new();
+    for (k, s) in states.iter().enumerate() {
+        let block = s.name.strip_prefix("minecraft:").unwrap_or(s.name);
+        if let Some(power) = s.wire_power
+            && power < 16
+            && table[power] == -1
+        {
+            table[power] = s.id;
+        }
+        let mut used = BTreeSet::new();
+        for &(layer, code, tinted) in &s.faces {
+            if layer as usize >= layers || fluid(layer) {
+                continue;
+            }
+            let code = code.min(GLOW_CODES as u8 - 1);
+            let named = layer_name(layer).and_then(|n| n.strip_prefix("block/")) == Some(block);
+            let v = slots.entry((layer, code)).or_default().entry(s.id).or_default();
+            v.0 |= named;
+            v.1.insert(s.name);
+            if used.insert((layer, code)) {
+                users.entry((layer, code)).or_default().push(k);
+            }
+            let w = wire.entry(layer).or_insert((true, true));
+            w.0 &= s.wire_power.is_some();
+            w.1 &= tinted;
+        }
+        uses.push(used);
+    }
+    let wire_layer = |l: u32| wire.get(&l).is_some_and(|&(w, t)| w && t);
+    // A use places its blocks rightly when they all have its id, or when it is tinted dust.
+    let placed =
+        |slot: &(u32, u8)| wire_layer(slot.0) || slots.get(slot).is_some_and(|v| v.len() == 1);
+    for (&(layer, code), votes) in &slots {
+        let at = 16 + ID_STRIDE * layer as usize;
+        if let Some(best) = votes
+            .iter()
+            .max_by_key(|(id, (named, blocks))| (*named, blocks.len(), -**id))
+            .map(|(id, _)| *id)
+        {
+            table[at + 2 + code as usize] = best;
+        }
+        if votes.len() > 1 && !wire_layer(layer) {
+            mixed += 1;
+            // Left out when each of its blocks has another face that places it; else kept with
+            // the commonest id (a stair of a block's sprite is better as that block than absent).
+            let of = users.get(&(layer, code)).map_or(&[][..], Vec::as_slice);
+            if of
+                .iter()
+                .all(|&k| uses[k].iter().any(|s| *s != (layer, code) && placed(s)))
+            {
+                table[at + 2 + GLOW_CODES] &= !(1 << code);
+                left_out += 1;
+            }
+        }
+    }
+    for &layer in wire.keys().filter(|l| wire_layer(**l)) {
+        table[16 + ID_STRIDE * layer as usize + 2 + GLOW_CODES] |= IRIS_WIRE;
+    }
+    (table, mixed, left_out)
+}
+
+/// GLSL after `pack_atlas`'s `FACE`: `hz_id`, the face's `mc_Entity`, and `hz_voxel`, whether it
+/// places its block in voxels ([`id_table`]'s table). Redstone dust is tinted by its power: the
+/// brightest corner's red gives it back.
+pub const IDS_GLSL: &str = "    uint hz_base = 16u + 12u * hz_layer;\n    \
+    uint hz_glow = min(15u - (uint(hz_v_color.a * 255.0 + 0.5) & 15u), 8u);\n    \
+    int hz_id = hz_block_ids[hz_base + 2u + hz_glow];\n    \
+    int hz_flags = hz_block_ids[hz_base + 11u];\n    \
+    bool hz_voxel = ((hz_flags >> int(hz_glow)) & 1) != 0;\n    \
+    if ((hz_flags & 65536) != 0) {\n        \
+        uint hz_red = max(max(hz_vertices[hz_q + 5u] & 255u, hz_vertices[hz_q + 11u] & 255u), \
+max(hz_vertices[hz_q + 17u] & 255u, hz_vertices[hz_q + 23u] & 255u));\n        \
+        float hz_rf = float(hz_red) / 255.0;\n        \
+        int hz_power = hz_rf < 0.37 ? 0 : clamp(int(round((hz_rf - 0.4) / 0.6 * 15.0)), 1, 15);\n        \
+        hz_id = hz_block_ids[uint(hz_power)];\n        \
+        hz_voxel = hz_voxel && abs(hz_Normal.y) > 0.5;\n    \
+    }\n";
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    #[test]
+    fn shared_sprites_take_ids_by_glow_and_leave_voxels_when_placed_elsewhere() {
+        // Layer 0 furnace_side (unlit 10, lit 11 glowing), layer 1 furnace_front_on (lit only),
+        // layer 2 furnace_front (unlit only).
+        let unlit = IdState { name: "minecraft:furnace", id: 10, wire_power: None, faces: vec![(0, 0, false), (2, 0, false)] };
+        let lit = IdState { name: "minecraft:lit_furnace", id: 11, wire_power: None, faces: vec![(0, 3, false), (1, 3, false)] };
+        let pairs = [10, -1, 11, -1, 10, -1];
+        let (t, mixed, left) = id_table(&[unlit, lit], |_| None, &pairs);
+        let at = |l: usize| 16 + ID_STRIDE * l;
+        assert_eq!(t[at(0) + 2], 10);
+        assert_eq!(t[at(0) + 2 + 3], 11);
+        assert_eq!((mixed, left), (0, 0));
+        // The same glow: one shared use, left out since each block's front places it.
+        let a = IdState { name: "minecraft:a", id: 1, wire_power: None, faces: vec![(0, 0, false), (1, 0, false)] };
+        let b = IdState { name: "minecraft:b", id: 2, wire_power: None, faces: vec![(0, 0, false), (2, 0, false)] };
+        let (t, mixed, left) = id_table(&[a, b], |_| None, &pairs);
+        assert_eq!((mixed, left), (1, 1));
+        assert_eq!(t[at(0) + 2 + GLOW_CODES] & 1, 0);
+        assert_eq!(t[at(1) + 2 + GLOW_CODES] & 1, 1);
+    }
+}

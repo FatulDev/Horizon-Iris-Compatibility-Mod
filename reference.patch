@@ -39,13 +39,19 @@ index e9990b6da..951dd9fb3 100644
          self.pack_atlas = None;
 diff --git a/crates/horizon-client-render/src/gfx/iris.rs b/crates/horizon-client-render/src/gfx/iris.rs
 new file mode 100644
-index 000000000..a73285f83
+index 000000000..a990d8465
 --- /dev/null
 +++ b/crates/horizon-client-render/src/gfx/iris.rs
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,286 @@
 +//! Iris Features: render state the mod's copies of Horizon's functions share: Iris's own
 +//! uniforms (the player), and which buffers the passes built so far write.
 +use super::pack_uniforms::Value;
++
++/// Entity programs of the mod's own after `pack_entities`' (`pack_post::iris_extra` draws them):
++/// block-breaking cracks (`gbuffers_damagedblock`) and translucent particles
++/// (`gbuffers_particles_translucent`).
++pub const DAMAGED: usize = super::pack_entities::PROGRAMS;
++pub const PARTICLE_TRANSLUCENT: usize = super::pack_entities::PROGRAMS + 1;
 +
 +/// The local player as Iris's own uniforms describe it.
 +#[derive(Clone, Copy, Debug)]
@@ -159,8 +165,172 @@ index 000000000..a73285f83
 +    CUSTOM.load(std::sync::atomic::Ordering::Relaxed)
 +}
 +
++
++/// `mc_Entity`'s table for flat terrain draws, which know a face's sprite layer and how it glows
++/// (the HDR code its colour's alpha carries, `mesher::emitting`), not its block. Horizon gives a
++/// layer the id most of its blocks have; where blocks of other ids share a sprite (a furnace's
++/// sides are the lit furnace's too) one block's faces then carried two ids, and a pack that
++/// voxelises terrain (Eclipse's floodfill) kept whichever face the GPU drew last: lights
++/// flickered, an unlit furnace or pumpkin shone.
++///
++/// The table, in `i32`s: 16 ids of `redstone_wire` by power, then [`ID_STRIDE`] per sprite
++/// layer: Horizon's (id, fluid) pair, an id for each glow code (0 to [`GLOW_CODES`] - 1), and
++/// flags: bit `c` set when faces of code `c` place their block in voxels (`at_midBlock`),
++/// [`IRIS_WIRE`] when the layer is redstone dust tinted by its power.
++pub const GLOW_CODES: usize = 9;
++pub const ID_STRIDE: usize = 2 + GLOW_CODES + 1;
++pub const IRIS_WIRE: i32 = 1 << 16;
++
++/// The glow code of HDR tier `tier` (`mesher::LOW`... plus `WHOLE`), as `mesher::emitting`
++/// writes it: 15 minus it is the colour alpha's low nibble.
++pub fn glow_code(tier: u8) -> u8 {
++    let level = (tier & !crate::mesher::WHOLE).min(crate::mesher::VERY_BRIGHT);
++    if level > 0 && tier & crate::mesher::WHOLE != 0 { level + 4 } else { level }
++}
++
++/// A block state as [`id_table`] sees it.
++pub struct IdState<'a> {
++    /// `minecraft:furnace`.
++    pub name: &'a str,
++    /// Its id in `block.properties`, -1 without one.
++    pub id: i32,
++    /// `redstone_wire`'s power.
++    pub wire_power: Option<usize>,
++    /// Its faces: (sprite layer, glow code, tinted).
++    pub faces: Vec<(u32, u8, bool)>,
++}
++
++/// The table for `states` over Horizon's (id, fluid) pairs by layer (`pairs`); `layer_name`
++/// gives a layer's sprite (`block/furnace_side`). Also how many (layer, code) uses blocks of
++/// different ids share, and how many of those are left out of voxels.
++pub fn id_table<'n>(
++    states: &[IdState<'_>],
++    layer_name: impl Fn(u32) -> Option<&'n str>,
++    pairs: &[i32],
++) -> (Vec<i32>, usize, usize) {
++    use std::collections::{BTreeMap, BTreeSet};
++    let layers = pairs.len() / 2;
++    let mut table = vec![-1; 16 + ID_STRIDE * layers];
++    for l in 0..layers {
++        let at = 16 + ID_STRIDE * l;
++        table[at] = pairs[2 * l];
++        table[at + 1] = pairs[2 * l + 1];
++        table[at + 2..at + 2 + GLOW_CODES].fill(pairs[2 * l]);
++        table[at + 2 + GLOW_CODES] = (1 << GLOW_CODES) - 1;
++    }
++    let (mut mixed, mut left_out) = (0, 0);
++    let fluid = |l: u32| pairs.get(2 * l as usize + 1) == Some(&1);
++    // (layer, code) -> id -> (a block named like the sprite, the blocks).
++    type Votes<'s> = BTreeMap<i32, (bool, BTreeSet<&'s str>)>;
++    let mut slots: BTreeMap<(u32, u8), Votes<'_>> = BTreeMap::new();
++    let mut uses: Vec<BTreeSet<(u32, u8)>> = Vec::with_capacity(states.len());
++    let mut users: BTreeMap<(u32, u8), Vec<usize>> = BTreeMap::new();
++    // Per layer: (every face on it is redstone dust's, every one tinted).
++    let mut wire: BTreeMap<u32, (bool, bool)> = BTreeMap::new();
++    for (k, s) in states.iter().enumerate() {
++        let block = s.name.strip_prefix("minecraft:").unwrap_or(s.name);
++        if let Some(power) = s.wire_power
++            && power < 16
++            && table[power] == -1
++        {
++            table[power] = s.id;
++        }
++        let mut used = BTreeSet::new();
++        for &(layer, code, tinted) in &s.faces {
++            if layer as usize >= layers || fluid(layer) {
++                continue;
++            }
++            let code = code.min(GLOW_CODES as u8 - 1);
++            let named = layer_name(layer).and_then(|n| n.strip_prefix("block/")) == Some(block);
++            let v = slots.entry((layer, code)).or_default().entry(s.id).or_default();
++            v.0 |= named;
++            v.1.insert(s.name);
++            if used.insert((layer, code)) {
++                users.entry((layer, code)).or_default().push(k);
++            }
++            let w = wire.entry(layer).or_insert((true, true));
++            w.0 &= s.wire_power.is_some();
++            w.1 &= tinted;
++        }
++        uses.push(used);
++    }
++    let wire_layer = |l: u32| wire.get(&l).is_some_and(|&(w, t)| w && t);
++    // A use places its blocks rightly when they all have its id, or when it is tinted dust.
++    let placed =
++        |slot: &(u32, u8)| wire_layer(slot.0) || slots.get(slot).is_some_and(|v| v.len() == 1);
++    for (&(layer, code), votes) in &slots {
++        let at = 16 + ID_STRIDE * layer as usize;
++        if let Some(best) = votes
++            .iter()
++            .max_by_key(|(id, (named, blocks))| (*named, blocks.len(), -**id))
++            .map(|(id, _)| *id)
++        {
++            table[at + 2 + code as usize] = best;
++        }
++        if votes.len() > 1 && !wire_layer(layer) {
++            mixed += 1;
++            // Left out when each of its blocks has another face that places it; else kept with
++            // the commonest id (a stair of a block's sprite is better as that block than absent).
++            let of = users.get(&(layer, code)).map_or(&[][..], Vec::as_slice);
++            if of
++                .iter()
++                .all(|&k| uses[k].iter().any(|s| *s != (layer, code) && placed(s)))
++            {
++                table[at + 2 + GLOW_CODES] &= !(1 << code);
++                left_out += 1;
++            }
++        }
++    }
++    for &layer in wire.keys().filter(|l| wire_layer(**l)) {
++        table[16 + ID_STRIDE * layer as usize + 2 + GLOW_CODES] |= IRIS_WIRE;
++    }
++    (table, mixed, left_out)
++}
++
++/// GLSL after `pack_atlas`'s `FACE`: `hz_id`, the face's `mc_Entity`, and `hz_voxel`, whether it
++/// places its block in voxels ([`id_table`]'s table). Redstone dust is tinted by its power: the
++/// brightest corner's red gives it back.
++pub const IDS_GLSL: &str = "    uint hz_base = 16u + 12u * hz_layer;\n    \
++    uint hz_glow = min(15u - (uint(hz_v_color.a * 255.0 + 0.5) & 15u), 8u);\n    \
++    int hz_id = hz_block_ids[hz_base + 2u + hz_glow];\n    \
++    int hz_flags = hz_block_ids[hz_base + 11u];\n    \
++    bool hz_voxel = ((hz_flags >> int(hz_glow)) & 1) != 0;\n    \
++    if ((hz_flags & 65536) != 0) {\n        \
++        uint hz_red = max(max(hz_vertices[hz_q + 5u] & 255u, hz_vertices[hz_q + 11u] & 255u), \
++max(hz_vertices[hz_q + 17u] & 255u, hz_vertices[hz_q + 23u] & 255u));\n        \
++        float hz_rf = float(hz_red) / 255.0;\n        \
++        int hz_power = hz_rf < 0.37 ? 0 : clamp(int(round((hz_rf - 0.4) / 0.6 * 15.0)), 1, 15);\n        \
++        hz_id = hz_block_ids[uint(hz_power)];\n        \
++        hz_voxel = hz_voxel && abs(hz_Normal.y) > 0.5;\n    \
++    }\n";
++
++#[cfg(test)]
++mod id_tests {
++    use super::*;
++
++    #[test]
++    fn shared_sprites_take_ids_by_glow_and_leave_voxels_when_placed_elsewhere() {
++        // Layer 0 furnace_side (unlit 10, lit 11 glowing), layer 1 furnace_front_on (lit only),
++        // layer 2 furnace_front (unlit only).
++        let unlit = IdState { name: "minecraft:furnace", id: 10, wire_power: None, faces: vec![(0, 0, false), (2, 0, false)] };
++        let lit = IdState { name: "minecraft:lit_furnace", id: 11, wire_power: None, faces: vec![(0, 3, false), (1, 3, false)] };
++        let pairs = [10, -1, 11, -1, 10, -1];
++        let (t, mixed, left) = id_table(&[unlit, lit], |_| None, &pairs);
++        let at = |l: usize| 16 + ID_STRIDE * l;
++        assert_eq!(t[at(0) + 2], 10);
++        assert_eq!(t[at(0) + 2 + 3], 11);
++        assert_eq!((mixed, left), (0, 0));
++        // The same glow: one shared use, left out since each block's front places it.
++        let a = IdState { name: "minecraft:a", id: 1, wire_power: None, faces: vec![(0, 0, false), (1, 0, false)] };
++        let b = IdState { name: "minecraft:b", id: 2, wire_power: None, faces: vec![(0, 0, false), (2, 0, false)] };
++        let (t, mixed, left) = id_table(&[a, b], |_| None, &pairs);
++        assert_eq!((mixed, left), (1, 1));
++        assert_eq!(t[at(0) + 2 + GLOW_CODES] & 1, 0);
++        assert_eq!(t[at(1) + 2 + GLOW_CODES] & 1, 1);
++    }
++}
 diff --git a/crates/horizon-client-render/src/gfx/pack_atlas.rs b/crates/horizon-client-render/src/gfx/pack_atlas.rs
-index 6dd7672bf..a145d121d 100644
+index 6dd7672bf..26c62d952 100644
 --- a/crates/horizon-client-render/src/gfx/pack_atlas.rs
 +++ b/crates/horizon-client-render/src/gfx/pack_atlas.rs
 @@ -190,6 +190,8 @@ impl PackAtlas {
@@ -172,10 +342,13 @@ index 6dd7672bf..a145d121d 100644
               hz_Normal = vec3(0.0, 1.0, 0.0);\n    \
               hz_tangent = vec4(1.0, 0.0, 0.0, 1.0);\n",
              scale[0], scale[1],
-@@ -197,8 +199,12 @@ impl PackAtlas {
+@@ -197,16 +199,24 @@ impl PackAtlas {
          let mut body = body;
          if flat {
              body.push_str(FACE);
++            // Iris Features: `mc_Entity` by sprite and glow, and whether the face places its
++            // block in voxels (`gfx::iris::id_table`).
++            body.push_str(crate::gfx::iris::IDS_GLSL);
 +            // `mc_midTexCoord` at the middle of the quad's own texture coordinates, as Iris
 +            // gives it, not of its sprite (packs that rebuild the tile from it stretched grass
 +            // sides). The UV step is the instance's w with the fade-in masked off.
@@ -184,9 +357,20 @@ index 6dd7672bf..a145d121d 100644
 -        declarations.push_str("vec2 hz_cell; vec2 hz_scale; vec4 hz_tangent;\n");
 +        declarations.push_str("vec2 hz_cell; vec2 hz_scale; vec4 hz_tangent; vec2 hz_mid_uv;\n");
          let entity = if flat {
-             "vec4(float(hz_block_ids[2u * hz_layer]), float(hz_block_ids[2u * hz_layer + 1u]), 0.0, 0.0)"
+-            "vec4(float(hz_block_ids[2u * hz_layer]), float(hz_block_ids[2u * hz_layer + 1u]), 0.0, 0.0)"
++            "vec4(float(hz_id), float(hz_block_ids[hz_base + 1u]), 0.0, 0.0)"
          } else {
-@@ -215,7 +221,7 @@ impl PackAtlas {
+             "vec4(-1.0, -1.0, 0.0, 0.0)"
+         };
+         // The block a face belongs to: half a block behind its centre (the quad's diagonal).
+         let mid_block = if flat {
+-            "vec4((floor((hz_p0 + hz_p2) * 0.5 - 0.5 * hz_Normal) + 0.5 - hz_v_pos) * 64.0, 0.0)"
++            // Iris Features: a face that doesn't place its block points far outside the voxels.
++            "(hz_voxel ? vec4((floor((hz_p0 + hz_p2) * 0.5 - 0.5 * hz_Normal) + 0.5 - hz_v_pos) * 64.0, 0.0) : vec4(1.0e8, 1.0e8, 1.0e8, 0.0))"
+         } else {
+             "vec4(0.0)"
+         };
+@@ -215,7 +225,7 @@ impl PackAtlas {
              ("at_midBlock", mid_block),
              (
                  "mc_midTexCoord",
@@ -195,7 +379,7 @@ index 6dd7672bf..a145d121d 100644
              ),
              ("at_tangent", "hz_tangent"),
              ("vaPosition", "hz_Vertex.xyz"),
-@@ -232,7 +238,9 @@ impl PackAtlas {
+@@ -232,7 +242,9 @@ impl PackAtlas {
                  .map(|&(n, v)| (n.to_owned(), v.to_owned()))
                  .collect(),
              after: String::new(),
@@ -206,6 +390,67 @@ index 6dd7672bf..a145d121d 100644
          }
      }
  }
+diff --git a/crates/horizon-client-render/src/gfx/pack_entities.rs b/crates/horizon-client-render/src/gfx/pack_entities.rs
+index f4ec2db43..312bf686c 100644
+--- a/crates/horizon-client-render/src/gfx/pack_entities.rs
++++ b/crates/horizon-client-render/src/gfx/pack_entities.rs
+@@ -328,10 +328,45 @@ impl PackEntities {
+         rest.clear();
+         let first = spans.first().map_or(entities.len(), |s| s.start as usize);
+         rest.extend_from_slice(&entities[..first.min(entities.len())]);
++        // Iris Features: particles split into runs of opaque and translucent quads, so the
++        // translucent ones can go to `gbuffers_particles_translucent`.
++        let translucent_particles = horizon_shaders::iris::extra_loaded("particles_translucent");
++        let is_translucent =
++            |v: &Vertex| v.layer & 0xffff == crate::gfx::entity_batch::TRANSLUCENT_PARTICLE_OVERLAY;
++        let mut split = Vec::new();
+         for (span, range) in runs(entities.len(), spans) {
++            if translucent_particles && span.stage == render_stage("PARTICLES") {
++                let mut start = range.start;
++                while start < range.end {
++                    let t = is_translucent(&entities[start]);
++                    let mut end = start;
++                    while end < range.end && is_translucent(&entities[end]) == t {
++                        end = (end + 4).min(range.end);
++                    }
++                    split.push((span, start..end));
++                    start = end;
++                }
++            } else {
++                split.push((span, range));
++            }
++        }
++        for (span, range) in split {
+             let run = &entities[range];
+-            let program = program_of(&span).filter(|_| plain(run));
+-            let pack = program.is_some_and(|p| drawn[p]) && !span.hidden;
++            // Iris Features: block-breaking cracks and translucent particles go to programs of
++            // the mod's (`pack_post::iris_extra`) when the pack has them.
++            let program = if span.stage == render_stage("DESTROY")
++                && horizon_shaders::iris::extra_loaded("damaged")
++            {
++                Some(crate::gfx::iris::DAMAGED)
++            } else if span.stage == render_stage("PARTICLES")
++                && translucent_particles
++                && run.first().is_some_and(is_translucent)
++            {
++                Some(crate::gfx::iris::PARTICLE_TRANSLUCENT)
++            } else {
++                program_of(&span).filter(|_| plain(run))
++            };
++            let pack = program.is_some_and(|p| drawn.get(p).copied().unwrap_or(true)) && !span.hidden;
+             let casts = program.is_some_and(|p| shadow.cast(&span, p));
+             if !pack && !span.hidden {
+                 rest.extend_from_slice(run);
+@@ -342,7 +377,7 @@ impl PackEntities {
+             let start = self.scratch.len() as u32;
+             self.scratch.extend_from_slice(run);
+             let (entity_id, block_id) = match program {
+-                BLOCK => (0, span.id),
++                BLOCK | crate::gfx::iris::DAMAGED => (0, span.id),
+                 _ => (span.id, 0),
+             };
+             let mut bytes = [0u8; SLOT as usize];
 diff --git a/crates/horizon-client-render/src/gfx/pack_images.rs b/crates/horizon-client-render/src/gfx/pack_images.rs
 index 25fb917db..b01ca8a47 100644
 --- a/crates/horizon-client-render/src/gfx/pack_images.rs
@@ -242,7 +487,7 @@ index 25fb917db..b01ca8a47 100644
                          wgpu::TextureDimension::D2
                      },
 diff --git a/crates/horizon-client-render/src/gfx/pack_post.rs b/crates/horizon-client-render/src/gfx/pack_post.rs
-index c6a037b22..2c2564267 100644
+index c6a037b22..e48918f4d 100644
 --- a/crates/horizon-client-render/src/gfx/pack_post.rs
 +++ b/crates/horizon-client-render/src/gfx/pack_post.rs
 @@ -1008,7 +1008,11 @@ fn bindings(
@@ -276,23 +521,65 @@ index c6a037b22..2c2564267 100644
          } else {
              wgpu::TextureViewDimension::D2
          };
-@@ -1642,6 +1648,7 @@ impl PackPost {
+@@ -1642,6 +1648,8 @@ impl PackPost {
          let shadow_config = post.config.shadow.clone();
          let mut custom = post.custom;
          let custom_names: Vec<String> = custom.uniforms().map(|u| u.0.to_owned()).collect();
 +        crate::gfx::iris::set_custom_count(custom_names.len());
++        iris_extra::new_pack();
          // A first run finds the names neither the frame nor the pack defines.
          custom.eval(0.0, &|n| pack_uniforms::index(n).map(|_| Val::scalar(0.0)));
          // Its zeros are no start for `smooth`: the first frame's values are, as in Iris.
-@@ -3006,6 +3013,7 @@ impl PackPost {
+@@ -2777,6 +2785,7 @@ impl PackPost {
+             self.mips_valid &= !pass.written;
+         }
+         self.entities = Some(entities);
++        iris_extra::draw_extra_entities(self, device, queue, encoder, size, late);
+     }
+ 
+     /// Entities and block entities into the shadow map, each run with the per-draw uniforms
+@@ -2903,6 +2912,9 @@ impl PackPost {
+         size: [u32; 2],
+         frame: &super::Frame,
+     ) {
++        if true {
++            return iris_extra::draw_hand(self, device, queue, encoder, size, frame);
++        }
+         let Some((mut pass, mut geometry)) = self.hand.take() else {
+             return;
+         };
+@@ -3006,6 +3018,8 @@ impl PackPost {
          );
          self.draw_entities(device, queue, encoder, size, true);
          self.draw_weather(device, queue, encoder, size);
++        iris_extra::draw_hand_water(self, device, queue, encoder, size);
 +        iris_extra::draw_outline(self, device, encoder);
      }
  
      /// The rain, then the snow, `set_weather` gave for this frame, with `gbuffers_weather`.
-@@ -3214,6 +3222,9 @@ impl PackPost {
+@@ -3016,6 +3030,13 @@ impl PackPost {
+         encoder: &mut wgpu::CommandEncoder,
+         size: [u32; 2],
+     ) {
++        // A frame without rain or snow leaves the passes in place (taking them and returning
++        // lost them for the rest of the game: Horizon then drew its own rain into the pack's
++        // buffers) (Iris Features).
++        if self.weather.is_none() || self.weather_draw.is_none() {
++            return;
++        }
++        iris_extra::weather_passes(self, device);
+         let (Some(mut passes), Some(weather)) = (self.weather.take(), self.weather_draw.take())
+         else {
+             return;
+@@ -3051,6 +3072,7 @@ impl PackPost {
+             self.mips_valid &= !pass.written;
+         }
+         self.weather = Some(passes);
++        iris_extra::weather_passes(self, device);
+     }
+ 
+     /// Whether the pack draws rain and snow itself.
+@@ -3214,6 +3236,9 @@ impl PackPost {
                  let mipped = self.mipped & 1 << i != 0;
                  let levels = if mipped { full_chain(sizes[i]) } else { 1 };
                  let mut attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
@@ -302,7 +589,7 @@ index c6a037b22..2c2564267 100644
                  if self.storage & 1 << i != 0 {
                      attachment |= wgpu::TextureUsages::STORAGE_BINDING;
                      // Atomics on a texture need it made for them (Metal ignores them otherwise).
-@@ -3415,6 +3426,7 @@ impl PackPost {
+@@ -3415,6 +3440,7 @@ impl PackPost {
          pages: &[(u32, wgpu::Buffer)],
          terrain: &mut TerrainDraw<'_>,
      ) {
@@ -310,14 +597,14 @@ index c6a037b22..2c2564267 100644
          self.resize(device, size);
          if let Some((layout, ids)) = &self.block_ids {
              // A page that grew has a new buffer.
-@@ -3831,3 +3843,1399 @@ mod tests {
+@@ -3831,3 +3857,1407 @@ mod tests {
          assert!(source("shadowtex1HW", false, true, false) == Source::ShadowDepth(1, true));
      }
  }
 +
-+#[cfg(test)]
 +pub(crate) mod iris_extra;
 +
++#[cfg(test)]
 +pub(crate) mod iris_tests {
 +    #[cfg(test)]
 +    mod tests {
@@ -741,24 +1028,26 @@ index c6a037b22..2c2564267 100644
 +                            entries: &[storage(0), storage(1)],
 +                        },
 +                    );
-+                let mut id_table = vec![- 1i32; 16 + 8 * 3];
-+                let mut set = |layer: usize, ids: [i32; 5], fluid: bool, flags: i32| {
-+                    let at = 16 + 8 * layer;
++                // `gfx::iris::id_table`'s layout: 16 redstone dust ids, then per layer Horizon's
++                // pair, an id per glow code and the voxel flags.
++                use crate::gfx::iris::{GLOW_CODES, ID_STRIDE};
++                let mut id_table = vec![- 1i32; 16 + ID_STRIDE * 3];
++                let mut set = |layer: usize, ids: [i32; GLOW_CODES], fluid: bool, flags: i32| {
++                    let at = 16 + ID_STRIDE * layer;
 +                    id_table[at] = ids[0];
 +                    id_table[at + 1] = if fluid { 1 } else { -1 };
-+                    id_table[at + 2..at + 7].copy_from_slice(&ids);
-+                    id_table[at + 7] = flags;
++                    id_table[at + 2..at + 2 + GLOW_CODES].copy_from_slice(&ids);
++                    id_table[at + 2 + GLOW_CODES] = flags;
 +                };
-+                set(0, [-1; 5], false, 31);
-+                set(1, [-1; 5], false, 31);
-+                set(2, [8; 5], true, 31);
++                let all = (1 << GLOW_CODES) - 1;
++                set(0, [-1; GLOW_CODES], false, all);
++                set(1, [-1; GLOW_CODES], false, all);
++                set(2, [8; GLOW_CODES], true, all);
 +                match std::env::var("IRIS_TEST_GLOW").as_deref() {
-+                    Ok("tier") => set(1, [-1, -1, 196, -1, -1], false, 1 << 2),
-+                    Ok(_) => set(1, [196; 5], false, 31),
++                    Ok("tier") => set(1, [-1, -1, 196, -1, -1, -1, -1, -1, -1], false, 1 << 2),
++                    Ok(_) => set(1, [196; GLOW_CODES], false, all),
 +                    Err(_) => {}
 +                }
-+                // Horizon's table: id, then 1 for fluids or -1, per sprite layer.
-+                let id_table: Vec<i32> = (0..3).flat_map(|l| [id_table[16 + 8 * l], id_table[16 + 8 * l + 1]]).collect();
 +                let world = World {
 +                    atlas: Some((atlas.view.clone(), atlas.size())),
 +                    lightmap,
@@ -1421,7 +1710,7 @@ index c6a037b22..2c2564267 100644
 +                                    j as f32 * 0.5 + 0.25,
 +                                    4.0,
 +                                );
-+                                let layer = if i >= 0 {
++                                let layer = if i >= 0 && std::env::var("IRIS_TEST_PARTICLES").as_deref() != Ok("destroy") {
 +                                    crate::gfx::TRANSLUCENT_PARTICLE_OVERLAY
 +                                } else {
 +                                    0
@@ -1439,7 +1728,7 @@ index c6a037b22..2c2564267 100644
 +                                            pos: p.to_array(),
 +                                            uv,
 +                                            layer,
-+                                            color: 0xffff_ffff,
++                                            color: if std::env::var("IRIS_TEST_PARTICLES").as_deref() == Ok("destroy") { 0xff00_0000 } else { 0xffff_ffff },
 +                                            light: 240 | 240 << 8,
 +                                            glint_uv: [0.0, 0.0],
 +                                        });
@@ -1449,7 +1738,13 @@ index c6a037b22..2c2564267 100644
 +                        let spans = [
 +                            crate::gfx::pack_draw::EntitySpan {
 +                                start: 0,
-+                                stage: horizon_shaders::render_stage("PARTICLES"),
++                                stage: horizon_shaders::render_stage(
++                                    if std::env::var("IRIS_TEST_PARTICLES").as_deref() == Ok("destroy") {
++                                        "DESTROY"
++                                    } else {
++                                        "PARTICLES"
++                                    },
++                                ),
 +                                ..Default::default()
 +                            },
 +                        ];
@@ -1712,10 +2007,10 @@ index c6a037b22..2c2564267 100644
 +}
 diff --git a/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs b/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs
 new file mode 100644
-index 000000000..1fa9d7c12
+index 000000000..909fa8124
 --- /dev/null
 +++ b/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,536 @@
 +// Iris Features: the block outline while a pack runs. Iris draws it after the pack's deferred
 +// programs, into what translucent terrain writes, so the pack neither lights nor reflects it and
 +// it follows the pack's own camera; Horizon's own outline goes into its world pass instead.
@@ -1887,6 +2182,371 @@ index 000000000..1fa9d7c12
 +    pass.set_vertex_buffer(0, vb.slice(..));
 +    pass.draw(0..(edges.len() * 2) as u32, 0..1);
 +}
++
++// --- Passes Horizon has no place for ---------------------------------------------------------
++// Built from the programs the pack's `load_post` put aside (`horizon_shaders::iris::take_extra`),
++// with the pack's own resources, the first time a frame needs them after the pack loaded.
++
++static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// A pack was built: its extra passes are built again.
++pub fn new_pack() {
++    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++}
++
++struct Extra {
++    generation: u64,
++    /// `gbuffers_hand_water`, and the held translucent items it draws this frame.
++    hand_water: Option<(Pass, super::super::pack_hand::PackHand)>,
++    translucent_hand: Vec<crate::mesher::Vertex>,
++    hand_projection: glam::Mat4,
++    /// Rain and snow without depth (`rain.depth` unset).
++    weather: Option<[Pass; 2]>,
++    /// Block-breaking cracks and translucent particles (`pack_entities::DAMAGED`...).
++    damaged: Option<Pass>,
++    particles_translucent: Option<Pass>,
++    /// The weather sprites' generation the depth-less passes were bound for.
++    weather_generation: Option<u64>,
++}
++
++thread_local! {
++    static EXTRA: std::cell::RefCell<Option<Extra>> = const { std::cell::RefCell::new(None) };
++}
++
++/// A pass of program `p` drawn over `geometry`, with the pack's resources.
++fn build_extra(
++    pp: &PackPost,
++    device: &wgpu::Device,
++    p: horizon_shaders::PostProgram,
++    geometry: &Geometry<'_>,
++) -> Option<Pass> {
++    let shadow: Option<[wgpu::TextureFormat; 2]> = pp.shadow_targets.as_ref().map(|s| {
++        std::array::from_fn(|n| {
++            s.color[n]
++                .as_ref()
++                .map_or(pp.formats[n], |c| c[0].texture().format())
++        })
++    });
++    let resources = Resources {
++        textures: &pp.textures,
++        images: &pp.images,
++        left_out: &[],
++        buffers: &pp.buffers,
++        indices: pp.indices.as_ref(),
++        gpu: pp.gpu,
++        storable: pp.storage,
++    };
++    let custom: Vec<String> = pp.custom.uniforms().map(|u| u.0.to_owned()).collect();
++    let mut notes = Vec::new();
++    let name = p.name.clone();
++    let pass = build_pass(
++        device,
++        p,
++        &pp.formats,
++        shadow.as_ref(),
++        pp.formats[0],
++        &mut notes,
++        Some(geometry),
++        &custom,
++        &pp.draws.layout,
++        &resources,
++    );
++    for n in notes {
++        log::info!("shader pack: {n}");
++    }
++    if pass.is_none() {
++        log::warn!("shader pack: {name} could not be built (Iris Features)");
++    }
++    pass
++}
++
++fn with_extra<R>(pp: &PackPost, device: &wgpu::Device, f: impl FnOnce(&mut Extra) -> R) -> R {
++    let generation = GENERATION.load(std::sync::atomic::Ordering::Relaxed);
++    EXTRA.with(|e| {
++        let mut e = e.borrow_mut();
++        if e.as_ref().is_none_or(|x| x.generation != generation) {
++            let entity_buffers = super::super::pack_entities::buffers();
++            let hand_water = horizon_shaders::iris::take_extra("hand_water").and_then(|p| {
++                let geometry = super::super::pack_hand::PackHand::new(device);
++                let g = Geometry {
++                    buffers: &entity_buffers,
++                    table: Some(&geometry.layout),
++                    depth_write: true,
++                    atlas: pp.hand.as_ref().and_then(|h| h.0.atlas.clone()),
++                    ids: None,
++                    cull: false,
++                };
++                build_extra(pp, device, p, &g).map(|pass| (pass, geometry))
++            });
++            let weather = horizon_shaders::iris::take_extra("weather").and_then(|p| {
++                let g = Geometry {
++                    buffers: &entity_buffers,
++                    table: None,
++                    depth_write: false,
++                    atlas: None,
++                    ids: None,
++                    cull: false,
++                };
++                build_extra(pp, device, p, &g).map(|rain| {
++                    let mut snow = rain.clone();
++                    snow.name = format!("{} (snow)", rain.name);
++                    [rain, snow]
++                })
++            });
++            let entity = |name: &str, depth_write: bool| {
++                let e = pp.entities.as_ref()?;
++                let p = horizon_shaders::iris::take_extra(name)?;
++                let atlas = e.passes.iter().flatten().find_map(|p| p.atlas.clone());
++                let g = Geometry {
++                    buffers: &entity_buffers,
++                    table: Some(&e.geometry.table),
++                    depth_write,
++                    atlas,
++                    ids: None,
++                    cull: false,
++                };
++                build_extra(pp, device, p, &g)
++            };
++            let damaged = entity("damaged", false);
++            let particles_translucent = entity("particles_translucent", true);
++            *e = Some(Extra {
++                generation,
++                damaged,
++                particles_translucent,
++                hand_water,
++                translucent_hand: Vec::new(),
++                hand_projection: glam::Mat4::IDENTITY,
++                weather,
++                weather_generation: None,
++            });
++        }
++        f(e.as_mut().expect("built"))
++    })
++}
++
++/// Whether held quad `q` is a translucent item's (stained glass, ice, slime: the item renderer's
++/// translucent layers).
++fn translucent_quad(q: &[crate::mesher::Vertex]) -> bool {
++    matches!(
++        q[0].layer,
++        super::super::entity_batch::TRANSLUCENT_ITEM_OVERLAY
++            | super::super::entity_batch::TRANSLUCENT_GLINT_ITEM_OVERLAY
++    )
++}
++
++/// `PackPost::draw_hand`, with held translucent items kept for `gbuffers_hand_water` when the
++/// pack has it (Iris draws them after translucent terrain with that program; with
++/// `gbuffers_hand`, Eclipse dithered stained glass into grain).
++pub fn draw_hand(
++    pp: &mut PackPost,
++    device: &wgpu::Device,
++    queue: &wgpu::Queue,
++    encoder: &mut wgpu::CommandEncoder,
++    size: [u32; 2],
++    frame: &crate::gfx::Frame,
++) {
++    let Some((mut pass, mut geometry)) = pp.hand.take() else {
++        return;
++    };
++    let unspin = frame.bob * frame.spin.inverse() * frame.bob.inverse();
++    let projection = super::super::pack_hand::projection(
++        frame.hand_fov_degrees,
++        size[0] as f32 / size[1].max(1) as f32,
++        frame.depth_far,
++    ) * unspin;
++    let split = with_extra(pp, device, |e| e.hand_water.is_some());
++    let (solid, translucent): (Vec<crate::mesher::Vertex>, Vec<crate::mesher::Vertex>) = if split {
++        let mut solid = Vec::new();
++        let mut translucent = Vec::new();
++        for q in frame.hand.chunks_exact(4) {
++            if translucent_quad(q) {
++                translucent.extend_from_slice(q);
++            } else {
++                solid.extend_from_slice(q);
++            }
++        }
++        (solid, translucent)
++    } else {
++        (frame.hand.to_vec(), Vec::new())
++    };
++    EXTRA.with(|e| {
++        if let Some(e) = e.borrow_mut().as_mut() {
++            e.translucent_hand = translucent;
++            e.hand_projection = projection;
++        }
++    });
++    geometry.prepare(device, queue, &solid, projection);
++    if geometry.quads > 0 {
++        let group = pp.bind(device, queue, encoder, &mut pass, size);
++        {
++            let mut rp = pp.begin(encoder, &pass);
++            rp.set_pipeline(pass.render());
++            rp.set_bind_group(0, &group, &[]);
++            if pass.buffers
++                && let Some(g) = &pp.buffers.group
++            {
++                rp.set_bind_group(4, g, &[]);
++            }
++            rp.set_bind_group(1, &geometry.group, &[]);
++            if pass.draw {
++                pp.draws.bind(&mut rp, "HAND_SOLID");
++            }
++            rp.set_vertex_buffer(0, geometry.vertices());
++            rp.set_index_buffer(geometry.indices.slice(..), wgpu::IndexFormat::Uint32);
++            rp.draw_indexed(0..geometry.quads * 6, 0, 0..1);
++        }
++        pp.mips_valid &= !pass.written;
++    }
++    pp.hand = Some((pass, geometry));
++}
++
++/// The held translucent items `draw_hand` kept, with `gbuffers_hand_water`, after translucent
++/// terrain.
++pub fn draw_hand_water(
++    pp: &mut PackPost,
++    device: &wgpu::Device,
++    queue: &wgpu::Queue,
++    encoder: &mut wgpu::CommandEncoder,
++    size: [u32; 2],
++) {
++    let taken = EXTRA.with(|e| {
++        let mut e = e.borrow_mut();
++        let e = e.as_mut()?;
++        if e.translucent_hand.is_empty() {
++            return None;
++        }
++        let (pass, geometry) = e.hand_water.take()?;
++        Some((pass, geometry, std::mem::take(&mut e.translucent_hand), e.hand_projection))
++    });
++    let Some((mut pass, mut geometry, quads, projection)) = taken else {
++        return;
++    };
++    geometry.prepare(device, queue, &quads, projection);
++    if geometry.quads > 0 {
++        let group = pp.bind(device, queue, encoder, &mut pass, size);
++        {
++            let mut rp = pp.begin(encoder, &pass);
++            rp.set_pipeline(pass.render());
++            rp.set_bind_group(0, &group, &[]);
++            if pass.buffers
++                && let Some(g) = &pp.buffers.group
++            {
++                rp.set_bind_group(4, g, &[]);
++            }
++            rp.set_bind_group(1, &geometry.group, &[]);
++            if pass.draw {
++                pp.draws.bind(&mut rp, "HAND_TRANSLUCENT");
++            }
++            rp.set_vertex_buffer(0, geometry.vertices());
++            rp.set_index_buffer(geometry.indices.slice(..), wgpu::IndexFormat::Uint32);
++            rp.draw_indexed(0..geometry.quads * 6, 0, 0..1);
++        }
++        pp.mips_valid &= !pass.written;
++    }
++    EXTRA.with(|e| {
++        if let Some(e) = e.borrow_mut().as_mut() {
++            e.hand_water = Some((pass, geometry));
++        }
++    });
++}
++
++/// Rain and snow drawn without depth unless the pack sets `rain.depth=true` (Iris): with depth,
++/// a pack's later programs took each drop for a surface (Eclipse's water and fog behind rain).
++/// Swaps the depth-less passes in for `PackPost::draw_weather`, and back after.
++pub fn weather_passes(pp: &mut PackPost, device: &wgpu::Device) {
++    if horizon_shaders::iris::rain_depth() || pp.weather.is_none() {
++        return;
++    }
++    let generation = pp.weather_generation;
++    let ours = with_extra(pp, device, |e| {
++        let stale = e.weather_generation != Some(generation);
++        e.weather_generation = Some(generation);
++        e.weather.take().map(|w| (w, stale))
++    });
++    if let Some((mut ours, stale)) = ours {
++        // The sprites the game's passes were last bound with (`draw_weather` rebinds them when
++        // the generation changes).
++        if let Some(theirs) = &pp.weather {
++            for (o, t) in ours.iter_mut().zip(theirs) {
++                if stale || o.atlas.is_none() {
++                    o.atlas = t.atlas.clone();
++                    o.groups.clear();
++                }
++            }
++        }
++        let theirs = pp.weather.replace(ours);
++        EXTRA.with(|e| {
++            if let Some(e) = e.borrow_mut().as_mut() {
++                e.weather = theirs;
++            }
++        });
++    }
++}
++
++/// The entity runs of the mod's programs (`pack_entities::DAMAGED` after the opaque entities,
++/// `PARTICLE_TRANSLUCENT` with the translucent ones), as `PackPost::draw_entities` draws its own.
++pub fn draw_extra_entities(
++    pp: &mut PackPost,
++    device: &wgpu::Device,
++    queue: &wgpu::Queue,
++    encoder: &mut wgpu::CommandEncoder,
++    size: [u32; 2],
++    late: bool,
++) {
++    let program = if late {
++        crate::gfx::iris::PARTICLE_TRANSLUCENT
++    } else {
++        crate::gfx::iris::DAMAGED
++    };
++    if !pp.entities.as_ref().is_some_and(|e| {
++        e.geometry.draws.iter().any(|d| d.pack && d.program == program)
++    }) {
++        return;
++    }
++    // Built while the entities are still in place: their passes give the atlas and table.
++    let taken = with_extra(pp, device, |e| {
++        if late { e.particles_translucent.take() } else { e.damaged.take() }
++    });
++    let Some(entities) = pp.entities.take() else {
++        return;
++    };
++    {
++        if let Some(mut pass) = taken {
++            let geometry = &entities.geometry;
++            let group = pp.bind(device, queue, encoder, &mut pass, size);
++            {
++                let mut rp = pp.begin(encoder, &pass);
++                rp.set_pipeline(pass.render());
++                rp.set_bind_group(0, &group, &[]);
++                if pass.buffers
++                    && let Some(g) = &pp.buffers.group
++                {
++                    rp.set_bind_group(4, g, &[]);
++                }
++                rp.set_bind_group(1, &geometry.table_group, &[]);
++                rp.set_vertex_buffer(0, geometry.vertices());
++                rp.set_index_buffer(geometry.indices.slice(..), wgpu::IndexFormat::Uint32);
++                for d in geometry.draws.iter().filter(|d| d.pack && d.program == program) {
++                    if pass.draw {
++                        rp.set_bind_group(2, &geometry.group, &[geometry.offset(d.slot)]);
++                    }
++                    rp.draw_indexed(0..d.quads * 6, d.base as i32, 0..1);
++                }
++            }
++            pp.mips_valid &= !pass.written;
++            EXTRA.with(|e| {
++                if let Some(e) = e.borrow_mut().as_mut() {
++                    if late {
++                        e.particles_translucent = Some(pass);
++                    } else {
++                        e.damaged = Some(pass);
++                    }
++                }
++            });
++        }
++    }
++    pp.entities = Some(entities);
++}
 diff --git a/crates/horizon-client-render/src/gfx/pack_uniforms.rs b/crates/horizon-client-render/src/gfx/pack_uniforms.rs
 index 59f8bb578..e435a4721 100644
 --- a/crates/horizon-client-render/src/gfx/pack_uniforms.rs
@@ -1995,12 +2655,79 @@ index 04a7705fd..255f061ca 100644
          }
      }
  
+diff --git a/crates/horizon-client/src/game/shader_packs.rs b/crates/horizon-client/src/game/shader_packs.rs
+index d0fe7a991..8c6c1c4b7 100644
+--- a/crates/horizon-client/src/game/shader_packs.rs
++++ b/crates/horizon-client/src/game/shader_packs.rs
+@@ -210,8 +210,8 @@ impl Game<'_> {
+                         let table = block_id_table(&self.pack, &ids);
+                         log::info!(
+                             "shader pack {name}: mc_Entity for {} of {} block sprites in {} ms",
+-                            table.chunks(2).filter(|p| p[0] != -1).count(),
+-                            table.len() / 2,
++                            table[16..].chunks(horizon_client::gfx::iris::ID_STRIDE).filter(|p| p[0] != -1).count(),
++                            (table.len() - 16) / horizon_client::gfx::iris::ID_STRIDE,
+                             started_ids.elapsed().as_millis()
+                         );
+                         if let Some((programs, notes)) =
+@@ -544,6 +544,51 @@ fn block_id_table(pack: &super::PackResources, ids: &BlockIds) -> Vec<i32> {
+             *slot = 1;
+         }
+     }
++    // Iris Features: ids by sprite and glow, and which faces place their block in voxels
++    // (`gfx::iris::id_table`).
++    let tables = &pack.context.tables;
++    let mut states = Vec::new();
++    for i in 0..registry.len() {
++        let state_id = horizon_world::registry::BlockStateId(i as u32);
++        let Some(state) = registry.state(state_id) else {
++            continue;
++        };
++        let block = state.name.strip_prefix("minecraft:").unwrap_or(&state.name);
++        let id = ids
++            .id(&state.name, |k| state.properties.get(k).map(String::as_str))
++            .unwrap_or(-1);
++        let emission = tables.facts(state_id).map_or(0, |f| f.emission);
++        let tier = horizon_client::mesher::hdr_tier(block, emission);
++        let whole = tier & horizon_client::mesher::WHOLE;
++        let origin = horizon_core::position::BlockPos::new(0, 0, 0);
++        let faces = catalog
++            .collect(state_id, origin)
++            .unwrap_or_default()
++            .into_iter()
++            .flat_map(|(_, model)| &model.faces)
++            .map(|f| {
++                let glow = (tier & !whole).max(horizon_client::mesher::hdr_tier("", f.quad.light_emission));
++                (f.layer, horizon_client::gfx::iris::glow_code(glow | whole), f.quad.tint_index >= 0)
++            })
++            .collect();
++        states.push(horizon_client::gfx::iris::IdState {
++            name: &state.name,
++            id,
++            wire_power: (block == "redstone_wire")
++                .then(|| state.properties.get("power").and_then(|p| p.parse().ok()))
++                .flatten(),
++            faces,
++        });
++    }
++    let (table, mixed, left_out) = horizon_client::gfx::iris::id_table(
++        &states,
++        |l| pack.layer_names.get(&l).map(String::as_str),
++        &table,
++    );
++    log::info!(
++        "shader pack: {mixed} sprite uses shared by blocks of other ids, {left_out} of them left \
++         out of voxels (their blocks' other faces place them)"
++    );
+     table
+ }
+ 
 diff --git a/crates/horizon-shaders/src/iris.rs b/crates/horizon-shaders/src/iris.rs
 new file mode 100644
-index 000000000..afff9fdb4
+index 000000000..2faa1882d
 --- /dev/null
 +++ b/crates/horizon-shaders/src/iris.rs
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,78 @@
 +//! Iris Features: state the mod's copies of Horizon's functions share.
 +use std::sync::atomic::{AtomicBool, Ordering};
 +
@@ -2049,6 +2776,36 @@ index 000000000..afff9fdb4
 +        .find(|(n, _)| n == program)
 +        .map_or(0, |e| e.1)
 +}
++
++/// Programs Horizon has no place for, loaded with the pack (`gbuffers_hand_water`, the weather
++/// program again for drawing without depth), for the renderer to take.
++static EXTRA: std::sync::Mutex<Vec<(String, crate::PostProgram)>> = std::sync::Mutex::new(Vec::new());
++pub fn set_extra(programs: Vec<(String, crate::PostProgram)>) {
++    *LOADED.lock().unwrap_or_else(|e| e.into_inner()) =
++        programs.iter().map(|(n, _)| n.clone()).collect();
++    *EXTRA.lock().unwrap_or_else(|e| e.into_inner()) = programs;
++}
++
++static LOADED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
++/// Whether the pack being run has the extra program `name` (taken or not).
++pub fn extra_loaded(name: &str) -> bool {
++    LOADED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|n| n == name)
++}
++/// Takes the program loaded as `name`.
++pub fn take_extra(name: &str) -> Option<crate::PostProgram> {
++    let mut l = EXTRA.lock().unwrap_or_else(|e| e.into_inner());
++    let at = l.iter().position(|(n, _)| n == name)?;
++    Some(l.remove(at).1)
++}
++
++static RAIN_DEPTH: AtomicBool = AtomicBool::new(false);
++/// `rain.depth`: whether rain and snow write depth (Iris: only when `true`).
++pub fn set_rain_depth(on: bool) {
++    RAIN_DEPTH.store(on, Ordering::Relaxed);
++}
++pub fn rain_depth() -> bool {
++    RAIN_DEPTH.load(Ordering::Relaxed)
++}
 diff --git a/crates/horizon-shaders/src/lib.rs b/crates/horizon-shaders/src/lib.rs
 index 31ecded76..aac547311 100644
 --- a/crates/horizon-shaders/src/lib.rs
@@ -2081,7 +2838,7 @@ index 2c0f69d8b..7f890f2ba 100644
      }
  
 diff --git a/crates/horizon-shaders/src/post.rs b/crates/horizon-shaders/src/post.rs
-index cef9e4654..b78234931 100644
+index cef9e4654..17d199066 100644
 --- a/crates/horizon-shaders/src/post.rs
 +++ b/crates/horizon-shaders/src/post.rs
 @@ -319,9 +319,12 @@ impl CustomImage {
@@ -2192,7 +2949,61 @@ index cef9e4654..b78234931 100644
      let mut gbuffers = |names: &[&str], group, inputs: &GbuffersInputs| {
          names.iter().find_map(|name| {
              // `alphaTest.<program>` replaces the geometry's default test (OQ-23).
-@@ -879,7 +942,18 @@ impl Loader<'_> {
+@@ -655,6 +718,53 @@ pub fn load_post(
+             p.blend = blend(properties, &p.name).flatten();
+             p
+         });
++    // Iris Features: what Horizon has no place for. Held translucent items draw with
++    // `gbuffers_hand_water` when the pack has it (no fallback: without it they stay with
++    // `gbuffers_hand`), and the weather program again, to draw without depth unless
++    // `rain.depth=true` (Iris writes rain's depth only then).
++    let mut extra = Vec::new();
++    if let Some(i) = inputs.hand.as_ref()
++        && let Some(mut p) = gbuffers(&["gbuffers_hand_water"], Group::Translucent, i)
++    {
++        p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
++        extra.push(("hand_water".to_owned(), p));
++    }
++    // Block-breaking cracks with `gbuffers_damagedblock` (Iris's chain: terrain's after it),
++    // multiplied into what's under them as vanilla's are; translucent particles with
++    // `gbuffers_particles_translucent` when the pack has it.
++    if let Some(i) = inputs.entities.as_ref() {
++        let mut cut = i.clone();
++        cut.alpha_test = Some(crate::AlphaTest { op: ">", reference: 0.1 });
++        if let Some(mut p) = gbuffers(
++            &[
++                "gbuffers_damagedblock",
++                "gbuffers_terrain",
++                "gbuffers_textured_lit",
++                "gbuffers_textured",
++                "gbuffers_basic",
++            ],
++            Group::Gbuffers,
++            &cut,
++        ) {
++            p.blend = blend(properties, &p.name)
++                .unwrap_or(Some([Factor::DstColor, Factor::SrcColor, Factor::One, Factor::Zero]));
++            extra.push(("damaged".to_owned(), p));
++        }
++        if let Some(mut p) = gbuffers(&["gbuffers_particles_translucent"], Group::Translucent, &cut) {
++            p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
++            extra.push(("particles_translucent".to_owned(), p));
++        }
++    }
++    let rain_depth = properties.get("rain.depth").is_some_and(|v| v.trim() == "true");
++    crate::iris::set_rain_depth(rain_depth);
++    if !rain_depth
++        && let Some(i) = inputs.weather.as_ref()
++        && let Some(mut p) = gbuffers(&WEATHER, Group::Translucent, i)
++    {
++        p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
++        extra.push(("weather".to_owned(), p));
++    }
++    crate::iris::set_extra(extra);
+     if let Some(inputs) = &inputs.terrain {
+         // Solid and cutout terrain draw together: the cutout test, unless `alphaTest.*` says
+         // otherwise (3.2).
+@@ -879,7 +989,18 @@ impl Loader<'_> {
          ) {
              return None;
          }
@@ -2212,7 +3023,7 @@ index cef9e4654..b78234931 100644
              let Some(inputs) = self.geometry.clone() else {
                  self.post.notes.push(format!(
                      "{name}: uses a geometry stage (supported for terrain's shadow only); skipped"
-@@ -1120,6 +1194,39 @@ fn located(pp: &Preprocessed, list: &[crate::preprocess::Diagnostic]) -> Vec<Str
+@@ -1120,6 +1241,39 @@ fn located(pp: &Preprocessed, list: &[crate::preprocess::Diagnostic]) -> Vec<Str
          .collect()
  }
  

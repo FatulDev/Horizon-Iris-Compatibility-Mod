@@ -1649,6 +1649,7 @@ impl PackPost {
         let mut custom = post.custom;
         let custom_names: Vec<String> = custom.uniforms().map(|u| u.0.to_owned()).collect();
         crate::gfx::iris::set_custom_count(custom_names.len());
+        iris_extra::new_pack();
         // A first run finds the names neither the frame nor the pack defines.
         custom.eval(0.0, &|n| pack_uniforms::index(n).map(|_| Val::scalar(0.0)));
         // Its zeros are no start for `smooth`: the first frame's values are, as in Iris.
@@ -2784,6 +2785,7 @@ impl PackPost {
             self.mips_valid &= !pass.written;
         }
         self.entities = Some(entities);
+        iris_extra::draw_extra_entities(self, device, queue, encoder, size, late);
     }
 
     /// Entities and block entities into the shadow map, each run with the per-draw uniforms
@@ -2910,6 +2912,9 @@ impl PackPost {
         size: [u32; 2],
         frame: &super::Frame,
     ) {
+        if true {
+            return iris_extra::draw_hand(self, device, queue, encoder, size, frame);
+        }
         let Some((mut pass, mut geometry)) = self.hand.take() else {
             return;
         };
@@ -3013,6 +3018,7 @@ impl PackPost {
         );
         self.draw_entities(device, queue, encoder, size, true);
         self.draw_weather(device, queue, encoder, size);
+        iris_extra::draw_hand_water(self, device, queue, encoder, size);
         iris_extra::draw_outline(self, device, encoder);
     }
 
@@ -3024,6 +3030,13 @@ impl PackPost {
         encoder: &mut wgpu::CommandEncoder,
         size: [u32; 2],
     ) {
+        // A frame without rain or snow leaves the passes in place (taking them and returning
+        // lost them for the rest of the game: Horizon then drew its own rain into the pack's
+        // buffers) (Iris Features).
+        if self.weather.is_none() || self.weather_draw.is_none() {
+            return;
+        }
+        iris_extra::weather_passes(self, device);
         let (Some(mut passes), Some(weather)) = (self.weather.take(), self.weather_draw.take())
         else {
             return;
@@ -3059,6 +3072,7 @@ impl PackPost {
             self.mips_valid &= !pass.written;
         }
         self.weather = Some(passes);
+        iris_extra::weather_passes(self, device);
     }
 
     /// Whether the pack draws rain and snow itself.
@@ -3844,9 +3858,9 @@ mod tests {
     }
 }
 
-#[cfg(test)]
 pub(crate) mod iris_extra;
 
+#[cfg(test)]
 pub(crate) mod iris_tests {
     #[cfg(test)]
     mod tests {
@@ -4270,24 +4284,26 @@ pub(crate) mod iris_tests {
                             entries: &[storage(0), storage(1)],
                         },
                     );
-                let mut id_table = vec![- 1i32; 16 + 8 * 3];
-                let mut set = |layer: usize, ids: [i32; 5], fluid: bool, flags: i32| {
-                    let at = 16 + 8 * layer;
+                // `gfx::iris::id_table`'s layout: 16 redstone dust ids, then per layer Horizon's
+                // pair, an id per glow code and the voxel flags.
+                use crate::gfx::iris::{GLOW_CODES, ID_STRIDE};
+                let mut id_table = vec![- 1i32; 16 + ID_STRIDE * 3];
+                let mut set = |layer: usize, ids: [i32; GLOW_CODES], fluid: bool, flags: i32| {
+                    let at = 16 + ID_STRIDE * layer;
                     id_table[at] = ids[0];
                     id_table[at + 1] = if fluid { 1 } else { -1 };
-                    id_table[at + 2..at + 7].copy_from_slice(&ids);
-                    id_table[at + 7] = flags;
+                    id_table[at + 2..at + 2 + GLOW_CODES].copy_from_slice(&ids);
+                    id_table[at + 2 + GLOW_CODES] = flags;
                 };
-                set(0, [-1; 5], false, 31);
-                set(1, [-1; 5], false, 31);
-                set(2, [8; 5], true, 31);
+                let all = (1 << GLOW_CODES) - 1;
+                set(0, [-1; GLOW_CODES], false, all);
+                set(1, [-1; GLOW_CODES], false, all);
+                set(2, [8; GLOW_CODES], true, all);
                 match std::env::var("IRIS_TEST_GLOW").as_deref() {
-                    Ok("tier") => set(1, [-1, -1, 196, -1, -1], false, 1 << 2),
-                    Ok(_) => set(1, [196; 5], false, 31),
+                    Ok("tier") => set(1, [-1, -1, 196, -1, -1, -1, -1, -1, -1], false, 1 << 2),
+                    Ok(_) => set(1, [196; GLOW_CODES], false, all),
                     Err(_) => {}
                 }
-                // Horizon's table: id, then 1 for fluids or -1, per sprite layer.
-                let id_table: Vec<i32> = (0..3).flat_map(|l| [id_table[16 + 8 * l], id_table[16 + 8 * l + 1]]).collect();
                 let world = World {
                     atlas: Some((atlas.view.clone(), atlas.size())),
                     lightmap,
@@ -4950,7 +4966,7 @@ pub(crate) mod iris_tests {
                                     j as f32 * 0.5 + 0.25,
                                     4.0,
                                 );
-                                let layer = if i >= 0 {
+                                let layer = if i >= 0 && std::env::var("IRIS_TEST_PARTICLES").as_deref() != Ok("destroy") {
                                     crate::gfx::TRANSLUCENT_PARTICLE_OVERLAY
                                 } else {
                                     0
@@ -4968,7 +4984,7 @@ pub(crate) mod iris_tests {
                                             pos: p.to_array(),
                                             uv,
                                             layer,
-                                            color: 0xffff_ffff,
+                                            color: if std::env::var("IRIS_TEST_PARTICLES").as_deref() == Ok("destroy") { 0xff00_0000 } else { 0xffff_ffff },
                                             light: 240 | 240 << 8,
                                             glint_uv: [0.0, 0.0],
                                         });
@@ -4978,7 +4994,13 @@ pub(crate) mod iris_tests {
                         let spans = [
                             crate::gfx::pack_draw::EntitySpan {
                                 start: 0,
-                                stage: horizon_shaders::render_stage("PARTICLES"),
+                                stage: horizon_shaders::render_stage(
+                                    if std::env::var("IRIS_TEST_PARTICLES").as_deref() == Ok("destroy") {
+                                        "DESTROY"
+                                    } else {
+                                        "PARTICLES"
+                                    },
+                                ),
                                 ..Default::default()
                             },
                         ];

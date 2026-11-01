@@ -718,6 +718,53 @@ pub fn load_post(
             p.blend = blend(properties, &p.name).flatten();
             p
         });
+    // Iris Features: what Horizon has no place for. Held translucent items draw with
+    // `gbuffers_hand_water` when the pack has it (no fallback: without it they stay with
+    // `gbuffers_hand`), and the weather program again, to draw without depth unless
+    // `rain.depth=true` (Iris writes rain's depth only then).
+    let mut extra = Vec::new();
+    if let Some(i) = inputs.hand.as_ref()
+        && let Some(mut p) = gbuffers(&["gbuffers_hand_water"], Group::Translucent, i)
+    {
+        p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
+        extra.push(("hand_water".to_owned(), p));
+    }
+    // Block-breaking cracks with `gbuffers_damagedblock` (Iris's chain: terrain's after it),
+    // multiplied into what's under them as vanilla's are; translucent particles with
+    // `gbuffers_particles_translucent` when the pack has it.
+    if let Some(i) = inputs.entities.as_ref() {
+        let mut cut = i.clone();
+        cut.alpha_test = Some(crate::AlphaTest { op: ">", reference: 0.1 });
+        if let Some(mut p) = gbuffers(
+            &[
+                "gbuffers_damagedblock",
+                "gbuffers_terrain",
+                "gbuffers_textured_lit",
+                "gbuffers_textured",
+                "gbuffers_basic",
+            ],
+            Group::Gbuffers,
+            &cut,
+        ) {
+            p.blend = blend(properties, &p.name)
+                .unwrap_or(Some([Factor::DstColor, Factor::SrcColor, Factor::One, Factor::Zero]));
+            extra.push(("damaged".to_owned(), p));
+        }
+        if let Some(mut p) = gbuffers(&["gbuffers_particles_translucent"], Group::Translucent, &cut) {
+            p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
+            extra.push(("particles_translucent".to_owned(), p));
+        }
+    }
+    let rain_depth = properties.get("rain.depth").is_some_and(|v| v.trim() == "true");
+    crate::iris::set_rain_depth(rain_depth);
+    if !rain_depth
+        && let Some(i) = inputs.weather.as_ref()
+        && let Some(mut p) = gbuffers(&WEATHER, Group::Translucent, i)
+    {
+        p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
+        extra.push(("weather".to_owned(), p));
+    }
+    crate::iris::set_extra(extra);
     if let Some(inputs) = &inputs.terrain {
         // Solid and cutout terrain draw together: the cutout test, unless `alphaTest.*` says
         // otherwise (3.2).

@@ -61,17 +61,13 @@ The packs in brackets are examples of packs that needed each change.
 | `mc_midTexCoord` | The middle of the quad's own texture coordinates, not of its sprite (stretched grass sides) |
 | Distant terrain | While a pack runs, distant faces are meshed a block each (grass sides stretched across far hills) |
 | Block outline | Drawn by the mod after translucent terrain, into the buffer it writes, with the pack's own camera, black at 40% as vanilla's; Horizon's own outline (drawn into its world pass, where it floated at an angle or didn't show) is skipped while a pack runs |
+| Held translucent items | Stained glass and other translucent items in hand draw with `gbuffers_hand_water` when the pack has it, blended over the scene, as in Iris (they were grainy through `gbuffers_hand`; Eclipse) |
+| Block-breaking cracks | Drawn with `gbuffers_damagedblock` (or Iris's fallbacks: terrain, textured_lit, textured, basic), multiplied into the block under them as vanilla's are (they didn't show while a pack ran) |
+| Translucent particles | `gbuffers_particles_translucent` when the pack has it, after the translucent terrain |
+| Rain depth | Rain and snow write depth only with `rain.depth=true`, as in Iris. A frame without weather keeps the pack's weather passes (they were lost after the first clear frame, and Horizon drew its own rain into the pack's buffers) |
+| Block ids for floodfill | Flat terrain knows a face's sprite, not its block. Ids are now picked by sprite **and** by how the face glows, so an unlit furnace isn't the lit one and a pumpkin isn't a jack o'lantern. A face whose sprite blocks of other ids share is left out of voxels when the block's other faces place it (one block's faces carried two ids, and lights flickered with draw order). Redstone dust takes its power's id from its tint |
 | Shader profiles | A profile's values are set even when written differently from the option's list (`0.5` for `0.50`) or not in it at all, as in Iris (the profile button worked once, then kept starting over) |
 | GPU errors | Logged once each instead of ending the game |
-
-## Not carried over from 0.1.25 yet
-
-These worked on the old Horizon and still need porting onto Horizon's new pack renderer:
-
-- Translucent held items with `gbuffers_hand_water` (stained glass in hand grainy on Eclipse).
-- Block ids by sprite and glow for floodfill (lights that flicker with some blocks).
-- `gbuffers_particles_translucent`, and rain depth with `rain.depth`.
-- Block-breaking cracks (`gbuffers_damagedblock`) while a pack runs.
 
 ## Known issues
 
@@ -103,7 +99,7 @@ most.
 - Geometry and tessellation stages that add geometry can't run on wgpu: a pack feature built on
   them (Eclipse's shader grass) stays off.
 - Testing: applied with `horizon-mixins apply` to pristine Horizon `10b16c4`, the whole game
-  compiled with `--locked` and no warnings; Horizon's 810 renderer tests pass (the two `crash::`
+  compiled with `--locked` and no warnings; Horizon's renderer tests and the mod's own pass, 811 in all (the two `crash::`
   tests fail without the mod too); of the shader crate's 93 tests, one fails by design
   (`the_alpha_test_discards_below_its_reference`: Iris tests alpha with declared outputs too).
 

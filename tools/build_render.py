@@ -16,6 +16,8 @@ replace('lod-emit', RE + 'lod/mesh.rs', r'^/// While a shader pack.*\nfn emit\(|
 hook('pack-new', 'horizon_client_render::gfx::pack_post::PackPost::new', '''\
 fn iris_pack_new(device: &wgpu::Device, post: &horizon_shaders::Post) {
     crate::gfx::iris::set_custom_count(post.custom.uniforms().count());
+    // The mod's own passes are built again for the new pack.
+    iris_extra::new_pack();
     // A pack's GPU errors are logged, each once, instead of ending the game (wgpu's default).
     static HANDLER: std::sync::Once = std::sync::Once::new();
     HANDLER.call_once(|| {
@@ -88,12 +90,15 @@ fn iris_outline_frame(frame: &super::Frame) {
 }
 ''', [binding('frame', '&super::Frame', 'frame')], cancellable=False)
 hook('outline-draw', 'horizon_client_render::gfx::pack_post::PackPost::draw_translucent', '''\
-fn iris_outline_draw(value: (), pp: &mut PackPost, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
+fn iris_outline_draw(value: (), pp: &mut PackPost, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, size: [u32; 2]) {
+    // Held translucent items with `gbuffers_hand_water`, then the outline.
+    iris_extra::draw_hand_water(pp, device, queue, encoder, size);
     iris_extra::draw_outline(pp, device, encoder);
     value
 }
 ''', [binding('value', '()', '$value'), binding('pp', '&mut PackPost', '&mut *self'), binding('device', '&wgpu::Device', 'device'),
-      binding('encoder', '&mut wgpu::CommandEncoder', '&mut *encoder')], kind='RETURN')
+      binding('queue', '&wgpu::Queue', 'queue'), binding('encoder', '&mut wgpu::CommandEncoder', '&mut *encoder'),
+      binding('size', '[u32; 2]', 'size')], kind='RETURN')
 hook('horizon-outline', 'horizon_client_render::gfx::Renderer::draw_outline', '''\
 fn iris_horizon_outline() -> ::core::ops::ControlFlow<()> {
     // A shader pack draws the outline itself (`pack_post::iris_extra`).
@@ -104,3 +109,23 @@ fn iris_horizon_outline() -> ::core::ops::ControlFlow<()> {
     }
 }
 ''', [])
+
+# Held items: translucent ones with `gbuffers_hand_water` (`iris_extra::draw_hand`).
+hook('draw-hand', 'horizon_client_render::gfx::pack_post::PackPost::draw_hand', '''\
+fn iris_draw_hand(pp: &mut PackPost, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, size: [u32; 2], frame: &super::Frame) -> ::core::ops::ControlFlow<()> {
+    ::core::ops::ControlFlow::Break(iris_extra::draw_hand(pp, device, queue, encoder, size, frame))
+}
+''', [binding('pp', '&mut PackPost', '&mut *self'), binding('device', '&wgpu::Device', 'device'), binding('queue', '&wgpu::Queue', 'queue'),
+      binding('encoder', '&mut wgpu::CommandEncoder', '&mut *encoder'), binding('size', '[u32; 2]', 'size'), binding('frame', '&super::Frame', 'frame')])
+
+# Rain and snow: passes kept across clear frames, and drawn without depth unless `rain.depth`.
+replace('draw-weather', RE + 'gfx/pack_post.rs', r'^    fn draw_weather\(', 'horizon_client_render::gfx::pack_post::PackPost::draw_weather', owner='PackPost')
+
+# Block-breaking cracks (`gbuffers_damagedblock`) and translucent particles
+# (`gbuffers_particles_translucent`): routed in `prepare`, drawn after Horizon's entity passes.
+replace('entities-prepare', RE + 'gfx/pack_entities.rs', r'^    pub fn prepare\(', 'horizon_client_render::gfx::pack_entities::PackEntities::prepare', owner='PackEntities')
+replace('draw-entities', RE + 'gfx/pack_post.rs', r'^    fn draw_entities\(', 'horizon_client_render::gfx::pack_post::PackPost::draw_entities', owner='PackPost')
+
+# `mc_Entity` by sprite and glow, and which faces place their block in voxels (floodfill).
+replace('block-id-table', GA + 'game/shader_packs.rs', r'^fn block_id_table\(', 'horizon_client::game::shader_packs::block_id_table',
+        edit=lambda src: src.replace('super::PackResources', 'crate::game::PackResources'))

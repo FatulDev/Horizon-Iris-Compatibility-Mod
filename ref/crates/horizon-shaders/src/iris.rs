@@ -46,3 +46,33 @@ pub fn written_before(program: &str) -> u16 {
         .find(|(n, _)| n == program)
         .map_or(0, |e| e.1)
 }
+
+/// Programs Horizon has no place for, loaded with the pack (`gbuffers_hand_water`, the weather
+/// program again for drawing without depth), for the renderer to take.
+static EXTRA: std::sync::Mutex<Vec<(String, crate::PostProgram)>> = std::sync::Mutex::new(Vec::new());
+pub fn set_extra(programs: Vec<(String, crate::PostProgram)>) {
+    *LOADED.lock().unwrap_or_else(|e| e.into_inner()) =
+        programs.iter().map(|(n, _)| n.clone()).collect();
+    *EXTRA.lock().unwrap_or_else(|e| e.into_inner()) = programs;
+}
+
+static LOADED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Whether the pack being run has the extra program `name` (taken or not).
+pub fn extra_loaded(name: &str) -> bool {
+    LOADED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|n| n == name)
+}
+/// Takes the program loaded as `name`.
+pub fn take_extra(name: &str) -> Option<crate::PostProgram> {
+    let mut l = EXTRA.lock().unwrap_or_else(|e| e.into_inner());
+    let at = l.iter().position(|(n, _)| n == name)?;
+    Some(l.remove(at).1)
+}
+
+static RAIN_DEPTH: AtomicBool = AtomicBool::new(false);
+/// `rain.depth`: whether rain and snow write depth (Iris: only when `true`).
+pub fn set_rain_depth(on: bool) {
+    RAIN_DEPTH.store(on, Ordering::Relaxed);
+}
+pub fn rain_depth() -> bool {
+    RAIN_DEPTH.load(Ordering::Relaxed)
+}

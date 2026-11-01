@@ -199,6 +199,9 @@ impl PackAtlas {
         let mut body = body;
         if flat {
             body.push_str(FACE);
+            // Iris Features: `mc_Entity` by sprite and glow, and whether the face places its
+            // block in voxels (`gfx::iris::id_table`).
+            body.push_str(crate::gfx::iris::IDS_GLSL);
             // `mc_midTexCoord` at the middle of the quad's own texture coordinates, as Iris
             // gives it, not of its sprite (packs that rebuild the tile from it stretched grass
             // sides). The UV step is the instance's w with the fade-in masked off.
@@ -206,13 +209,14 @@ impl PackAtlas {
         }
         declarations.push_str("vec2 hz_cell; vec2 hz_scale; vec4 hz_tangent; vec2 hz_mid_uv;\n");
         let entity = if flat {
-            "vec4(float(hz_block_ids[2u * hz_layer]), float(hz_block_ids[2u * hz_layer + 1u]), 0.0, 0.0)"
+            "vec4(float(hz_id), float(hz_block_ids[hz_base + 1u]), 0.0, 0.0)"
         } else {
             "vec4(-1.0, -1.0, 0.0, 0.0)"
         };
         // The block a face belongs to: half a block behind its centre (the quad's diagonal).
         let mid_block = if flat {
-            "vec4((floor((hz_p0 + hz_p2) * 0.5 - 0.5 * hz_Normal) + 0.5 - hz_v_pos) * 64.0, 0.0)"
+            // Iris Features: a face that doesn't place its block points far outside the voxels.
+            "(hz_voxel ? vec4((floor((hz_p0 + hz_p2) * 0.5 - 0.5 * hz_Normal) + 0.5 - hz_v_pos) * 64.0, 0.0) : vec4(1.0e8, 1.0e8, 1.0e8, 0.0))"
         } else {
             "vec4(0.0)"
         };
