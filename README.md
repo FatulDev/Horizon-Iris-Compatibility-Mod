@@ -1,7 +1,6 @@
 # Iris Features: a native mod for Horizon
 
-This mod makes Horizon load shader packs written for Iris's own extensions. Unmodified Eclipse
-Shader runs with it: compute programs, storage buffers, images, custom textures (the real moon,
+This mod makes Horizon load shader packs written for Iris's own extensions. Unmodified shader packs should runs with it: compute programs, storage buffers, images, custom textures (the real moon,
 noise, cloud and water textures), and the Iris-only uniforms and macros.
 
 It is a native mixin bundle (`horizon-mixins`). The launcher compiles it into a game build of its own.
