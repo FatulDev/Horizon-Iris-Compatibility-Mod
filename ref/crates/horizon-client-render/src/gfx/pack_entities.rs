@@ -376,6 +376,9 @@ impl PackEntities {
             };
             let start = self.scratch.len() as u32;
             self.scratch.extend_from_slice(run);
+            if program == crate::gfx::iris::DAMAGED {
+                crate::gfx::iris::crack_uvs(&mut self.scratch[start as usize..]);
+            }
             let (entity_id, block_id) = match program {
                 BLOCK | crate::gfx::iris::DAMAGED => (0, span.id),
                 _ => (span.id, 0),

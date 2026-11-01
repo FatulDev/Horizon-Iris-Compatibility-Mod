@@ -129,3 +129,19 @@ replace('draw-entities', RE + 'gfx/pack_post.rs', r'^    fn draw_entities\(', 'h
 # `mc_Entity` by sprite and glow, and which faces place their block in voxels (floodfill).
 replace('block-id-table', GA + 'game/shader_packs.rs', r'^fn block_id_table\(', 'horizon_client::game::shader_packs::block_id_table',
         edit=lambda src: src.replace('super::PackResources', 'crate::game::PackResources'))
+
+# A buffer's own blend (`blend.<program>.<buffer>`): queued per pass, handed out in order.
+hook('buffer-blends', 'horizon_client_render::gfx::pack_post::build_pass', '''\
+fn iris_buffer_blends(device: &wgpu::Device, p: &horizon_shaders::PostProgram, formats: &[wgpu::TextureFormat; BUFFERS]) {
+    crate::gfx::iris::queue_buffer_blends(p, formats, device.features());
+}
+''', [binding('device', '&wgpu::Device', 'device'), binding('p', '&horizon_shaders::PostProgram', '&p'),
+      binding('formats', '&[wgpu::TextureFormat; BUFFERS]', 'formats')], cancellable=False)
+hook('buffer-blend', 'horizon_client_render::gfx::pack_post::blend_state', '''\
+fn iris_buffer_blend() -> ::core::ops::ControlFlow<wgpu::BlendState> {
+    match crate::gfx::iris::next_buffer_blend() {
+        Some(own) => ::core::ops::ControlFlow::Break(own),
+        None => ::core::ops::ControlFlow::Continue(()),
+    }
+}
+''', [])

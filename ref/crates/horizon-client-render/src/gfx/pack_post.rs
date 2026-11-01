@@ -797,6 +797,10 @@ fn texture_entry_of(
 
 /// `blend.<program>`'s factors as wgpu's, adding both terms.
 fn blend_state(b: horizon_shaders::Blend) -> wgpu::BlendState {
+    // A buffer's own blend, when the pack sets one (Iris Features: `gfx::iris`).
+    if let Some(own) = crate::gfx::iris::next_buffer_blend() {
+        return own;
+    }
     use horizon_shaders::Factor as F;
     use wgpu::BlendFactor as W;
     let f = |f| match f {
@@ -1274,6 +1278,8 @@ fn build_pass(
     draws: &wgpu::BindGroupLayout,
     pack: &Resources<'_>,
 ) -> Option<Pass> {
+    // Iris Features: the outputs' own blends (`blend.<program>.<buffer>`).
+    crate::gfx::iris::queue_buffer_blends(&p, formats, device.features());
     let features = device.features();
     // The frame's uniforms, then the pack's custom ones.
     let index = |name: &str| {
@@ -4298,7 +4304,11 @@ pub(crate) mod iris_tests {
                 let all = (1 << GLOW_CODES) - 1;
                 set(0, [-1; GLOW_CODES], false, all);
                 set(1, [-1; GLOW_CODES], false, all);
-                set(2, [8; GLOW_CODES], true, all);
+                // `IRIS_TEST_GLASS=<id>`: the water quads as a translucent block of that id.
+                match std::env::var("IRIS_TEST_GLASS").ok().and_then(|g| g.parse().ok()) {
+                    Some(id) => set(2, [id; GLOW_CODES], false, all),
+                    None => set(2, [8; GLOW_CODES], true, all),
+                }
                 match std::env::var("IRIS_TEST_GLOW").as_deref() {
                     Ok("tier") => set(1, [-1, -1, 196, -1, -1, -1, -1, -1, -1], false, 1 << 2),
                     Ok(_) => set(1, [196; GLOW_CODES], false, all),
@@ -4618,7 +4628,7 @@ pub(crate) mod iris_tests {
                     game_time: 0.0,
                     shader_game_time: 0.0,
                     end_portal_sprites: [[0.0; 4]; 2],
-                    crumbling_sprite: [0.0; 4],
+                    crumbling_sprite: [0.0, 0.0, 0.0625, 0.0625],
                     ticks: 0,
                     darkness: (0.0, 0.0),
                     night_vision: 0.0,

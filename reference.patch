@@ -39,10 +39,10 @@ index e9990b6da..951dd9fb3 100644
          self.pack_atlas = None;
 diff --git a/crates/horizon-client-render/src/gfx/iris.rs b/crates/horizon-client-render/src/gfx/iris.rs
 new file mode 100644
-index 000000000..a990d8465
+index 000000000..34df519ea
 --- /dev/null
 +++ b/crates/horizon-client-render/src/gfx/iris.rs
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,427 @@
 +//! Iris Features: render state the mod's copies of Horizon's functions share: Iris's own
 +//! uniforms (the player), and which buffers the passes built so far write.
 +use super::pack_uniforms::Value;
@@ -52,6 +52,109 @@ index 000000000..a990d8465
 +/// (`gbuffers_particles_translucent`).
 +pub const DAMAGED: usize = super::pack_entities::PROGRAMS;
 +pub const PARTICLE_TRANSLUCENT: usize = super::pack_entities::PROGRAMS + 1;
++
++thread_local! {
++    /// The blends `build_pass` gives its blended outputs, in order, where the pack sets a
++    /// buffer's own (`blend.<program>.<buffer>`); `None` keeps the program's.
++    static BLENDS: std::cell::RefCell<std::collections::VecDeque<Option<wgpu::BlendState>>> =
++        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
++}
++
++/// At the start of `build_pass`: the per-buffer blends of `p`'s outputs that take its blend
++/// (those `pack_post::blend_state` is asked for, in the same order).
++pub fn queue_buffer_blends(
++    p: &horizon_shaders::PostProgram,
++    formats: &[wgpu::TextureFormat; horizon_shaders::BUFFERS],
++    features: wgpu::Features,
++) {
++    let mut queue = std::collections::VecDeque::new();
++    if p.blend.is_some()
++        && p.group != horizon_shaders::Group::Final
++        && let Some(program) = &p.program
++    {
++        for &location in &program.interface.outputs {
++            let Some(&buffer) = p.buffers.get(location as usize) else {
++                continue;
++            };
++            let blendable = formats[buffer as usize]
++                .guaranteed_format_features(features)
++                .flags
++                .contains(wgpu::TextureFormatFeatureFlags::BLENDABLE);
++            if blendable {
++                queue.push_back(
++                    horizon_shaders::iris::buffer_blend(&p.name, buffer as u8)
++                        .map(|b| b.map_or(wgpu::BlendState::REPLACE, blend_state)),
++                );
++            }
++        }
++    }
++    BLENDS.with(|b| *b.borrow_mut() = queue);
++}
++
++/// In `pack_post::blend_state`: the next output's own blend, when the pack sets one.
++pub fn next_buffer_blend() -> Option<wgpu::BlendState> {
++    BLENDS.with(|b| b.borrow_mut().pop_front().flatten())
++}
++
++/// `pack_post::blend_state`'s mapping (that function hands out the queued blends, so it isn't
++/// called from here).
++fn blend_state(b: horizon_shaders::Blend) -> wgpu::BlendState {
++    use horizon_shaders::Factor as F;
++    use wgpu::BlendFactor as W;
++    let f = |f| match f {
++        F::Zero => W::Zero,
++        F::One => W::One,
++        F::SrcColor => W::Src,
++        F::OneMinusSrcColor => W::OneMinusSrc,
++        F::DstColor => W::Dst,
++        F::OneMinusDstColor => W::OneMinusDst,
++        F::SrcAlpha => W::SrcAlpha,
++        F::OneMinusSrcAlpha => W::OneMinusSrcAlpha,
++        F::DstAlpha => W::DstAlpha,
++        F::OneMinusDstAlpha => W::OneMinusDstAlpha,
++        F::SrcAlphaSaturate => W::SrcAlphaSaturated,
++    };
++    let component = |src, dst| wgpu::BlendComponent {
++        src_factor: f(src),
++        dst_factor: f(dst),
++        operation: wgpu::BlendOperation::Add,
++    };
++    wgpu::BlendState { color: component(b[0], b[1]), alpha: component(b[2], b[3]) }
++}
++
++static CRUMBLING: std::sync::Mutex<[f32; 4]> = std::sync::Mutex::new([0.0; 4]);
++/// The frame's destroy-stage sprite rect (`Frame::crumbling_sprite`): its size, which every
++/// stage's sprite shares.
++pub fn set_crumbling(rect: [f32; 4]) {
++    *CRUMBLING.lock().unwrap_or_else(|e| e.into_inner()) = rect;
++}
++
++/// Crack quads (`breaking::geometry`) as a pack's program reads them: Horizon's carry a decal
++/// UV that repeats over the block and their stage sprite's origin in the light bytes
++/// (`breaking::stage_light`), which entity.wgsl wraps per pixel. A pack samples the atlas at
++/// the UV as given, so each quad's UVs become atlas UVs inside its stage's sprite here (they
++/// read the whole atlas), and the light full: the pass is unlit.
++pub fn crack_uvs(quads: &mut [crate::gfx::Vertex]) {
++    let [_, _, w, h] = *CRUMBLING.lock().unwrap_or_else(|e| e.into_inner());
++    for quad in quads.chunks_exact_mut(4) {
++        let light = quad[0].light;
++        let origin = [
++            (light & 0xffff) as f32 / 65535.0,
++            (light >> 16) as f32 / 65535.0,
++        ];
++        // The tile the quad's corners lie in: the lowest corner's, so a face's 0 and 1 edges
++        // land on the sprite's two sides.
++        let low = |k: usize| (quad.iter().map(|v| v.uv[k]).fold(f32::INFINITY, f32::min) + 1e-4).floor();
++        let base = [low(0), low(1)];
++        for v in quad.iter_mut() {
++            v.uv = [
++                origin[0] + (v.uv[0] - base[0]).clamp(0.0, 1.0) * w,
++                origin[1] + (v.uv[1] - base[1]).clamp(0.0, 1.0) * h,
++            ];
++            v.light = 240 | 240 << 8;
++        }
++    }
++}
 +
 +/// The local player as Iris's own uniforms describe it.
 +#[derive(Clone, Copy, Debug)]
@@ -98,7 +201,7 @@ index 000000000..a990d8465
 +}
 +
 +/// Iris's own uniforms: after Horizon's and the pack's custom ones.
-+pub const NAMES: [&str; 15] = [
++pub const NAMES: [&str; 16] = [
 +    "currentPlayerHealth",
 +    "maxPlayerHealth",
 +    "currentPlayerHunger",
@@ -114,6 +217,7 @@ index 000000000..a990d8465
 +    "is_on_ground",
 +    "is_sneaking",
 +    "is_sprinting",
++    "cloudHeight",
 +];
 +
 +/// The position of `name` among [`NAMES`].
@@ -153,6 +257,10 @@ index 000000000..a990d8465
 +        flag(p.on_ground),
 +        flag(p.sneaking),
 +        flag(p.sprinting),
++        // The clouds' altitude, as Horizon draws them (`clouds.rs`): read as 0, Complementary
++        // and its kin put their clouds at the floor of the world, seen edge-on as a grey band
++        // at the horizon, and none in the sky.
++        f(&[192.33]),
 +    ]
 +}
 +
@@ -309,6 +417,39 @@ index 000000000..a990d8465
 +    use super::*;
 +
 +    #[test]
++    fn crack_uvs_land_inside_their_stage_sprite() {
++        set_crumbling([0.0, 0.0, 0.25, 0.5]);
++        let v = |u: f32, w: f32| crate::gfx::Vertex {
++            uv: [u, w],
++            light: crate::breaking::stage_light([0.5, 0.25]),
++            ..bytemuck::Zeroable::zeroed()
++        };
++        // A full face's decal UVs, -1 to 0 (`breaking::decal_uv` negates).
++        let mut quad = [v(-1.0, -1.0), v(-1.0, 0.0), v(0.0, 0.0), v(0.0, -1.0)];
++        crack_uvs(&mut quad);
++        let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
++        assert!(close(quad[0].uv[0], 0.5) && close(quad[0].uv[1], 0.25));
++        assert!(close(quad[2].uv[0], 0.75) && close(quad[2].uv[1], 0.75));
++        set_crumbling([0.0; 4]);
++    }
++
++    #[test]
++    fn cracks_sample_their_stage_sprite() {
++        set_crumbling([0.0, 0.0, 0.25, 0.5]);
++        let v = |uv: [f32; 2]| crate::gfx::Vertex {
++            uv,
++            light: (0.5f32 * 65535.0) as u32 | (0.25f32 * 65535.0).round() as u32 >> 0 << 16,
++            ..bytemuck::Zeroable::zeroed()
++        };
++        let mut q = [v([-1.0, 0.0]), v([0.0, 0.0]), v([0.0, -1.0]), v([-1.0, -1.0])];
++        crack_uvs(&mut q);
++        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
++        assert!(near(q[0].uv[0], 0.5) && near(q[0].uv[1], 0.75));
++        assert!(near(q[2].uv[0], 0.75) && near(q[2].uv[1], 0.25));
++        assert_eq!(q[0].light, 240 | 240 << 8);
++    }
++
++    #[test]
 +    fn shared_sprites_take_ids_by_glow_and_leave_voxels_when_placed_elsewhere() {
 +        // Layer 0 furnace_side (unlit 10, lit 11 glowing), layer 1 furnace_front_on (lit only),
 +        // layer 2 furnace_front (unlit only).
@@ -391,7 +532,7 @@ index 6dd7672bf..26c62d952 100644
      }
  }
 diff --git a/crates/horizon-client-render/src/gfx/pack_entities.rs b/crates/horizon-client-render/src/gfx/pack_entities.rs
-index f4ec2db43..312bf686c 100644
+index f4ec2db43..ff23a2f31 100644
 --- a/crates/horizon-client-render/src/gfx/pack_entities.rs
 +++ b/crates/horizon-client-render/src/gfx/pack_entities.rs
 @@ -328,10 +328,45 @@ impl PackEntities {
@@ -442,9 +583,13 @@ index f4ec2db43..312bf686c 100644
              let casts = program.is_some_and(|p| shadow.cast(&span, p));
              if !pack && !span.hidden {
                  rest.extend_from_slice(run);
-@@ -342,7 +377,7 @@ impl PackEntities {
+@@ -341,8 +376,11 @@ impl PackEntities {
+             };
              let start = self.scratch.len() as u32;
              self.scratch.extend_from_slice(run);
++            if program == crate::gfx::iris::DAMAGED {
++                crate::gfx::iris::crack_uvs(&mut self.scratch[start as usize..]);
++            }
              let (entity_id, block_id) = match program {
 -                BLOCK => (0, span.id),
 +                BLOCK | crate::gfx::iris::DAMAGED => (0, span.id),
@@ -487,10 +632,21 @@ index 25fb917db..b01ca8a47 100644
                          wgpu::TextureDimension::D2
                      },
 diff --git a/crates/horizon-client-render/src/gfx/pack_post.rs b/crates/horizon-client-render/src/gfx/pack_post.rs
-index c6a037b22..e48918f4d 100644
+index c6a037b22..459cc0034 100644
 --- a/crates/horizon-client-render/src/gfx/pack_post.rs
 +++ b/crates/horizon-client-render/src/gfx/pack_post.rs
-@@ -1008,7 +1008,11 @@ fn bindings(
+@@ -797,6 +797,10 @@ fn texture_entry_of(
+ 
+ /// `blend.<program>`'s factors as wgpu's, adding both terms.
+ fn blend_state(b: horizon_shaders::Blend) -> wgpu::BlendState {
++    // A buffer's own blend, when the pack sets one (Iris Features: `gfx::iris`).
++    if let Some(own) = crate::gfx::iris::next_buffer_blend() {
++        return own;
++    }
+     use horizon_shaders::Factor as F;
+     use wgpu::BlendFactor as W;
+     let f = |f| match f {
+@@ -1008,7 +1012,11 @@ fn bindings(
              ));
              return None;
          }
@@ -503,7 +659,7 @@ index c6a037b22..e48918f4d 100644
          let image = pack
              .images
              .iter()
-@@ -1016,7 +1020,7 @@ fn bindings(
+@@ -1016,7 +1024,7 @@ fn bindings(
          let (src, sample_type, dimension) = match custom {
              _ if let Some(k) = image => {
                  let i = &pack.images[k];
@@ -512,7 +668,7 @@ index c6a037b22..e48918f4d 100644
              }
              Some(i) if !fits(&s.ty, textures[i].sample_type) => {
                  notes.push(format!(
-@@ -1177,6 +1181,8 @@ fn bindings(
+@@ -1177,6 +1185,8 @@ fn bindings(
          };
          let dimension = if i.ty.ends_with("3D") {
              wgpu::TextureViewDimension::D3
@@ -521,7 +677,16 @@ index c6a037b22..e48918f4d 100644
          } else {
              wgpu::TextureViewDimension::D2
          };
-@@ -1642,6 +1648,8 @@ impl PackPost {
+@@ -1268,6 +1278,8 @@ fn build_pass(
+     draws: &wgpu::BindGroupLayout,
+     pack: &Resources<'_>,
+ ) -> Option<Pass> {
++    // Iris Features: the outputs' own blends (`blend.<program>.<buffer>`).
++    crate::gfx::iris::queue_buffer_blends(&p, formats, device.features());
+     let features = device.features();
+     // The frame's uniforms, then the pack's custom ones.
+     let index = |name: &str| {
+@@ -1642,6 +1654,8 @@ impl PackPost {
          let shadow_config = post.config.shadow.clone();
          let mut custom = post.custom;
          let custom_names: Vec<String> = custom.uniforms().map(|u| u.0.to_owned()).collect();
@@ -530,7 +695,7 @@ index c6a037b22..e48918f4d 100644
          // A first run finds the names neither the frame nor the pack defines.
          custom.eval(0.0, &|n| pack_uniforms::index(n).map(|_| Val::scalar(0.0)));
          // Its zeros are no start for `smooth`: the first frame's values are, as in Iris.
-@@ -2777,6 +2785,7 @@ impl PackPost {
+@@ -2777,6 +2791,7 @@ impl PackPost {
              self.mips_valid &= !pass.written;
          }
          self.entities = Some(entities);
@@ -538,7 +703,7 @@ index c6a037b22..e48918f4d 100644
      }
  
      /// Entities and block entities into the shadow map, each run with the per-draw uniforms
-@@ -2903,6 +2912,9 @@ impl PackPost {
+@@ -2903,6 +2918,9 @@ impl PackPost {
          size: [u32; 2],
          frame: &super::Frame,
      ) {
@@ -548,7 +713,7 @@ index c6a037b22..e48918f4d 100644
          let Some((mut pass, mut geometry)) = self.hand.take() else {
              return;
          };
-@@ -3006,6 +3018,8 @@ impl PackPost {
+@@ -3006,6 +3024,8 @@ impl PackPost {
          );
          self.draw_entities(device, queue, encoder, size, true);
          self.draw_weather(device, queue, encoder, size);
@@ -557,7 +722,7 @@ index c6a037b22..e48918f4d 100644
      }
  
      /// The rain, then the snow, `set_weather` gave for this frame, with `gbuffers_weather`.
-@@ -3016,6 +3030,13 @@ impl PackPost {
+@@ -3016,6 +3036,13 @@ impl PackPost {
          encoder: &mut wgpu::CommandEncoder,
          size: [u32; 2],
      ) {
@@ -571,7 +736,7 @@ index c6a037b22..e48918f4d 100644
          let (Some(mut passes), Some(weather)) = (self.weather.take(), self.weather_draw.take())
          else {
              return;
-@@ -3051,6 +3072,7 @@ impl PackPost {
+@@ -3051,6 +3078,7 @@ impl PackPost {
              self.mips_valid &= !pass.written;
          }
          self.weather = Some(passes);
@@ -579,7 +744,7 @@ index c6a037b22..e48918f4d 100644
      }
  
      /// Whether the pack draws rain and snow itself.
-@@ -3214,6 +3236,9 @@ impl PackPost {
+@@ -3214,6 +3242,9 @@ impl PackPost {
                  let mipped = self.mipped & 1 << i != 0;
                  let levels = if mipped { full_chain(sizes[i]) } else { 1 };
                  let mut attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
@@ -589,7 +754,7 @@ index c6a037b22..e48918f4d 100644
                  if self.storage & 1 << i != 0 {
                      attachment |= wgpu::TextureUsages::STORAGE_BINDING;
                      // Atomics on a texture need it made for them (Metal ignores them otherwise).
-@@ -3415,6 +3440,7 @@ impl PackPost {
+@@ -3415,6 +3446,7 @@ impl PackPost {
          pages: &[(u32, wgpu::Buffer)],
          terrain: &mut TerrainDraw<'_>,
      ) {
@@ -597,7 +762,7 @@ index c6a037b22..e48918f4d 100644
          self.resize(device, size);
          if let Some((layout, ids)) = &self.block_ids {
              // A page that grew has a new buffer.
-@@ -3831,3 +3857,1407 @@ mod tests {
+@@ -3831,3 +3863,1411 @@ mod tests {
          assert!(source("shadowtex1HW", false, true, false) == Source::ShadowDepth(1, true));
      }
  }
@@ -1042,7 +1207,11 @@ index c6a037b22..e48918f4d 100644
 +                let all = (1 << GLOW_CODES) - 1;
 +                set(0, [-1; GLOW_CODES], false, all);
 +                set(1, [-1; GLOW_CODES], false, all);
-+                set(2, [8; GLOW_CODES], true, all);
++                // `IRIS_TEST_GLASS=<id>`: the water quads as a translucent block of that id.
++                match std::env::var("IRIS_TEST_GLASS").ok().and_then(|g| g.parse().ok()) {
++                    Some(id) => set(2, [id; GLOW_CODES], false, all),
++                    None => set(2, [8; GLOW_CODES], true, all),
++                }
 +                match std::env::var("IRIS_TEST_GLOW").as_deref() {
 +                    Ok("tier") => set(1, [-1, -1, 196, -1, -1, -1, -1, -1, -1], false, 1 << 2),
 +                    Ok(_) => set(1, [196; GLOW_CODES], false, all),
@@ -1362,7 +1531,7 @@ index c6a037b22..e48918f4d 100644
 +                    game_time: 0.0,
 +                    shader_game_time: 0.0,
 +                    end_portal_sprites: [[0.0; 4]; 2],
-+                    crumbling_sprite: [0.0; 4],
++                    crumbling_sprite: [0.0, 0.0, 0.0625, 0.0625],
 +                    ticks: 0,
 +                    darkness: (0.0, 0.0),
 +                    night_vision: 0.0,
@@ -2007,10 +2176,10 @@ index c6a037b22..e48918f4d 100644
 +}
 diff --git a/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs b/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs
 new file mode 100644
-index 000000000..909fa8124
+index 000000000..dccc41f44
 --- /dev/null
 +++ b/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,571 @@
 +// Iris Features: the block outline while a pack runs. Iris draws it after the pack's deferred
 +// programs, into what translucent terrain writes, so the pack neither lights nor reflects it and
 +// it follows the pack's own camera; Horizon's own outline goes into its world pass instead.
@@ -2021,6 +2190,7 @@ index 000000000..909fa8124
 +
 +/// Notes the frame's outline (before the pack runs).
 +pub fn set_outline(frame: &crate::gfx::Frame) {
++    crate::gfx::iris::set_crumbling(frame.crumbling_sprite);
 +    let edges = crate::gfx::outline_vertices(&frame.outline, frame.camera);
 +    *OUTLINE.lock().unwrap_or_else(|e| e.into_inner()) = edges;
 +}
@@ -2033,12 +2203,15 @@ index 000000000..909fa8124
 +}
 +
 +static LINES: std::sync::Mutex<Option<Lines>> = std::sync::Mutex::new(None);
++static OUTLINE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 +
 +const SHADER: &str = "
 +struct U { m: mat4x4<f32> };
 +@group(0) @binding(0) var<uniform> u: U;
 +@vertex fn vs(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> {
-+    return u.m * vec4<f32>(p, 1.0);
++    // Pulled toward the camera as vanilla's lines are (`rendertype_lines`' view shrink and
++    // perspective layering): drawn on the block's own faces, they lost the depth test.
++    return u.m * vec4<f32>(p * (1.0 - 1.0 / 256.0) * (1.0 - 1.0 / 4096.0), 1.0);
 +}
 +@fragment fn fs() -> @location(0) vec4<f32> {
 +    return vec4<f32>(0.0, 0.0, 0.0, 0.4);
@@ -2052,18 +2225,36 @@ index 000000000..909fa8124
 +    if edges.is_empty() {
 +        return;
 +    }
++    let skip = |why: &str| {
++        if !OUTLINE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
++            log::info!("shader pack: no block outline: {why}");
++        }
++    };
 +    let (Some(water), Some(targets)) = (&pp.water, &pp.targets) else {
-+        return;
++        return skip("the pack has no translucent terrain pass");
 +    };
 +    let Some(&(_, buffer)) = water.writes.iter().find(|w| w.0 == 0) else {
-+        return;
++        return skip("its translucent terrain writes no colour");
 +    };
 +    let Some(sides) = &targets.color[buffer] else {
-+        return;
++        return skip("no buffer behind its translucent colour");
 +    };
 +    let view = &sides[usize::from(pp.main & 1 << buffer != 0)];
 +    let format = view.texture().format();
 +    let depth_format = targets.depth_texture.format();
++    // Once per pack, what the outline draws into, for reports (Iris Features).
++    if !OUTLINE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
++        log::info!(
++            "shader pack: block outline drawn after translucent terrain into colortex{buffer} \
++             ({format:?}, depth {depth_format:?}), {} edges",
++            edges.len()
++        );
++    }
++    // Blending needs a blendable format; else the lines are written as they are.
++    let blendable = format
++        .guaranteed_format_features(device.features())
++        .flags
++        .contains(wgpu::TextureFormatFeatureFlags::BLENDABLE);
 +    // The pack's camera: its projection (GL depth, -1 to 1, made wgpu's 0 to 1) and view.
 +    let matrix = |name: &str| {
 +        let i = pack_uniforms::index(name)?;
@@ -2073,7 +2264,7 @@ index 000000000..909fa8124
 +        }
 +    };
 +    let (Some(projection), Some(model_view)) = (matrix("gbufferProjection"), matrix("gbufferModelView")) else {
-+        return;
++        return skip("no camera matrices");
 +    };
 +    // As the translator ends a vertex stage drawing into buffers: y flipped (the buffers are
 +    // stored as GL lays textures out), depth from -1..1 to 0..1.
@@ -2136,7 +2327,7 @@ index 000000000..909fa8124
 +                compilation_options: Default::default(),
 +                targets: &[Some(wgpu::ColorTargetState {
 +                    format,
-+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
++                    blend: blendable.then_some(wgpu::BlendState::ALPHA_BLENDING),
 +                    write_mask: wgpu::ColorWrites::ALL,
 +                })],
 +            }),
@@ -2191,6 +2382,9 @@ index 000000000..909fa8124
 +
 +/// A pack was built: its extra passes are built again.
 +pub fn new_pack() {
++    OUTLINE_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
++    // A new pack may come with a new device: the outline's pipeline is made again.
++    *LINES.lock().unwrap_or_else(|e| e.into_inner()) = None;
 +    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +}
 +
@@ -2252,7 +2446,13 @@ index 000000000..909fa8124
 +        &resources,
 +    );
 +    for n in notes {
++        if cfg!(test) {
++            println!("  note: {n}");
++        }
 +        log::info!("shader pack: {n}");
++    }
++    if cfg!(test) {
++        println!("  note: {name} built: {}", pass.is_some());
 +    }
 +    if pass.is_none() {
 +        log::warn!("shader pack: {name} could not be built (Iris Features)");
@@ -2274,7 +2474,9 @@ index 000000000..909fa8124
 +                    depth_write: true,
 +                    atlas: pp.hand.as_ref().and_then(|h| h.0.atlas.clone()),
 +                    ids: None,
-+                    cull: false,
++                    // Back faces culled, as vanilla draws items: drawn both ways, held glass
++                    // stacked its far faces under its near ones and turned near opaque.
++                    cull: true,
 +                };
 +                build_extra(pp, device, p, &g).map(|pass| (pass, geometry))
 +            });
@@ -2345,6 +2547,9 @@ index 000000000..909fa8124
 +    size: [u32; 2],
 +    frame: &crate::gfx::Frame,
 +) {
++    // Built while the hand's pass is in place: `gbuffers_hand_water` takes its atlas (built
++    // without it, held glass sampled no texture).
++    let split = with_extra(pp, device, |e| e.hand_water.is_some());
 +    let Some((mut pass, mut geometry)) = pp.hand.take() else {
 +        return;
 +    };
@@ -2354,7 +2559,6 @@ index 000000000..909fa8124
 +        size[0] as f32 / size[1].max(1) as f32,
 +        frame.depth_far,
 +    ) * unspin;
-+    let split = with_extra(pp, device, |e| e.hand_water.is_some());
 +    let (solid, translucent): (Vec<crate::mesher::Vertex>, Vec<crate::mesher::Vertex>) = if split {
 +        let mut solid = Vec::new();
 +        let mut translucent = Vec::new();
@@ -2724,10 +2928,10 @@ index d0fe7a991..8c6c1c4b7 100644
  
 diff --git a/crates/horizon-shaders/src/iris.rs b/crates/horizon-shaders/src/iris.rs
 new file mode 100644
-index 000000000..2faa1882d
+index 000000000..7022806d8
 --- /dev/null
 +++ b/crates/horizon-shaders/src/iris.rs
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,95 @@
 +//! Iris Features: state the mod's copies of Horizon's functions share.
 +use std::sync::atomic::{AtomicBool, Ordering};
 +
@@ -2806,6 +3010,23 @@ index 000000000..2faa1882d
 +pub fn rain_depth() -> bool {
 +    RAIN_DEPTH.load(Ordering::Relaxed)
 +}
++
++static BUFFER_BLENDS: std::sync::Mutex<Vec<(String, u8, Option<crate::Blend>)>> =
++    std::sync::Mutex::new(Vec::new());
++/// The pack's `blend.<program>.<buffer>` keys: (program, buffer, its blend or `None` for off).
++pub fn set_buffer_blends(table: Vec<(String, u8, Option<crate::Blend>)>) {
++    *BUFFER_BLENDS.lock().unwrap_or_else(|e| e.into_inner()) = table;
++}
++/// Buffer `buffer`'s own blend in program `program`: `None` when the pack sets none, else the
++/// blend (`Some(None)`: off).
++pub fn buffer_blend(program: &str, buffer: u8) -> Option<Option<crate::Blend>> {
++    BUFFER_BLENDS
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .iter()
++        .find(|(p, b, _)| p == program && *b == buffer)
++        .map(|e| e.2)
++}
 diff --git a/crates/horizon-shaders/src/lib.rs b/crates/horizon-shaders/src/lib.rs
 index 31ecded76..aac547311 100644
 --- a/crates/horizon-shaders/src/lib.rs
@@ -2838,7 +3059,7 @@ index 2c0f69d8b..7f890f2ba 100644
      }
  
 diff --git a/crates/horizon-shaders/src/post.rs b/crates/horizon-shaders/src/post.rs
-index cef9e4654..17d199066 100644
+index cef9e4654..7058ef58e 100644
 --- a/crates/horizon-shaders/src/post.rs
 +++ b/crates/horizon-shaders/src/post.rs
 @@ -319,9 +319,12 @@ impl CustomImage {
@@ -2930,7 +3151,7 @@ index cef9e4654..17d199066 100644
      for (group, base) in GROUPS {
          let names: Vec<String> = if group == Group::Final {
              vec![base.to_owned()]
-@@ -564,6 +615,18 @@ pub fn load_post(
+@@ -564,6 +615,36 @@ pub fn load_post(
              }
          }
      }
@@ -2946,10 +3167,28 @@ index cef9e4654..17d199066 100644
 +        })
 +        .collect();
 +    crate::iris::set_written_before(table);
++    // `blend.<program>.<buffer>`: one buffer's blend apart from the program's (Iris), as packs
++    // keep their data buffers unblended under translucent geometry (Eclipse's colortex11,
++    // Pegasus's colortex1); Horizon blended them all alike.
++    let mut buffer_blends = Vec::new();
++    for e in &properties.entries {
++        let Some(rest) = e.key.strip_prefix("blend.") else {
++            continue;
++        };
++        let Some((program, buffer)) = rest.rsplit_once('.') else {
++            continue;
++        };
++        if let Some(b) = config::buffer_index(buffer)
++            && let Some(value) = blend(properties, rest)
++        {
++            buffer_blends.push((program.to_owned(), b as u8, value));
++        }
++    }
++    crate::iris::set_buffer_blends(buffer_blends);
      let mut gbuffers = |names: &[&str], group, inputs: &GbuffersInputs| {
          names.iter().find_map(|name| {
              // `alphaTest.<program>` replaces the geometry's default test (OQ-23).
-@@ -655,6 +718,53 @@ pub fn load_post(
+@@ -655,6 +736,53 @@ pub fn load_post(
              p.blend = blend(properties, &p.name).flatten();
              p
          });
@@ -3003,7 +3242,7 @@ index cef9e4654..17d199066 100644
      if let Some(inputs) = &inputs.terrain {
          // Solid and cutout terrain draw together: the cutout test, unless `alphaTest.*` says
          // otherwise (3.2).
-@@ -879,7 +989,18 @@ impl Loader<'_> {
+@@ -879,7 +1007,18 @@ impl Loader<'_> {
          ) {
              return None;
          }
@@ -3023,7 +3262,7 @@ index cef9e4654..17d199066 100644
              let Some(inputs) = self.geometry.clone() else {
                  self.post.notes.push(format!(
                      "{name}: uses a geometry stage (supported for terrain's shadow only); skipped"
-@@ -1120,6 +1241,39 @@ fn located(pp: &Preprocessed, list: &[crate::preprocess::Diagnostic]) -> Vec<Str
+@@ -1120,6 +1259,44 @@ fn located(pp: &Preprocessed, list: &[crate::preprocess::Diagnostic]) -> Vec<Str
          .collect()
  }
  
@@ -3034,7 +3273,12 @@ index cef9e4654..17d199066 100644
 +        .iter()
 +        .map(|e| {
 +            let mut e = e.clone();
-+            if e.key.starts_with("uniform.") || e.key.starts_with("variable.") {
++            // Sizes too: Complementary sizes its voxel images by an option
++            // (`image.wsr_img = ... COLORED_LIGHTING 64 COLORED_LIGHTING`).
++            if ["uniform.", "variable.", "image.", "bufferObject.", "size.buffer."]
++                .iter()
++                .any(|p| e.key.starts_with(p))
++            {
 +                e.value = macros.expand(&e.value).trim().to_owned();
 +            }
 +            e
@@ -15500,7 +15744,7 @@ index 000000000..7adb50971
 +    crate::iris::image_atomics()
 +}
 diff --git a/crates/horizon-shaders/src/translate/mod.rs b/crates/horizon-shaders/src/translate/mod.rs
-index 51fa8c7a3..f8d933d79 100644
+index 51fa8c7a3..0b170f673 100644
 --- a/crates/horizon-shaders/src/translate/mod.rs
 +++ b/crates/horizon-shaders/src/translate/mod.rs
 @@ -22,7 +22,10 @@ use std::collections::BTreeMap;
@@ -15527,7 +15771,7 @@ index 51fa8c7a3..f8d933d79 100644
      let header = |stage: &Stage| {
          let mut h = resources(&uniforms, &samplers, &images);
          if let Some(reference) = alpha_test_ref {
-@@ -458,19 +466,30 @@ fn translate(
+@@ -458,19 +466,36 @@ fn translate(
          writeln!(fragment_main, "    {name} = hz_init_{name}();").unwrap();
      }
      fragment_main.push_str("    hz_main();\n");
@@ -15544,8 +15788,14 @@ index 51fa8c7a3..f8d933d79 100644
 +        Some((_, d)) if d.contains("hz_fo0") => Some("hz_fo0".to_owned()),
 +        Some((_, d)) => d
 +            .split_once(" out vec4 ")
-+            .map(|(_, r)| r.trim_end_matches(';').split('[').next().unwrap_or("").trim().to_owned())
-+            .filter(|n| !n.is_empty() && !d.contains('[')),
++            // The name alone: a narrowed output's declaration goes on (`out vec4 hz_out0;
++            // vec3 shadowcolor0_out`, Photon's shadow), and an array isn't tested.
++            .and_then(|(_, r)| {
++                let r = r.trim_start();
++                let n: String =
++                    r.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
++                (!n.is_empty() && !r[n.len()..].trim_start().starts_with('[')).then_some(n)
++            }),
 +    };
      if let Some(t) = gbuffers.and_then(|g| g.alpha_test)
 -        && f.outputs.contains(&0)
@@ -15561,7 +15811,7 @@ index 51fa8c7a3..f8d933d79 100644
                  t.reference
              )
              .unwrap(),
-@@ -598,7 +617,7 @@ fn resources(
+@@ -598,7 +623,7 @@ fn resources(
          writeln!(
              h,
              "layout(set = 0, binding = {}) uniform {texture} {}; layout(set = 0, binding = {}) uniform {sampler} hz_s_{};",
@@ -15570,7 +15820,7 @@ index 51fa8c7a3..f8d933d79 100644
          )
          .unwrap();
      }
-@@ -1005,23 +1024,97 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
+@@ -1005,23 +1030,97 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
      // matrix column's component written to (`m[1].y =`) and `min`/`max`/`clamp` of a `uint` and
      // integer literals. Each refusal is rewritten where naga points, and the source parsed again.
      let mut text = std::borrow::Cow::Borrowed(text);
@@ -15671,7 +15921,7 @@ index 51fa8c7a3..f8d933d79 100644
          .map_err(|e| {
              let span = e.spans().next().map_or(naga::Span::default(), |(s, _)| *s);
              // The validator nests its reasons: say them all.
-@@ -1039,15 +1132,13 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
+@@ -1039,15 +1138,13 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
  
  /// `text` without the scalar swizzle naga's frontend refused (`e`, GLSL 4.20's `f.x`, `f.xx`): one
  /// component dropped, more a vector constructor of the scalar.
@@ -15690,7 +15940,7 @@ index 51fa8c7a3..f8d933d79 100644
      let field = text.get(r.clone())?.strip_prefix('.')?;
      let one = |c: char| field.chars().all(|f| f == c);
      let indexed = text[..r.start].trim_end().ends_with(']');
-@@ -1075,15 +1166,15 @@ fn scalar_swizzle(text: &str, e: &naga::front::glsl::Error) -> Option<String> {
+@@ -1075,15 +1172,15 @@ fn scalar_swizzle(text: &str, e: &naga::front::glsl::Error) -> Option<String> {
  
  /// `text` with the integer literals of the `min`/`max`/`clamp` call naga found ambiguous (`e`)
  /// made unsigned: with a `uint` beside them GL takes the `uint` overload.
@@ -15710,7 +15960,7 @@ index 51fa8c7a3..f8d933d79 100644
      let b = call.as_bytes();
      let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.';
 diff --git a/crates/horizon-shaders/src/translate/rewrite.rs b/crates/horizon-shaders/src/translate/rewrite.rs
-index 62f670815..e1919074b 100644
+index 62f670815..4bdeb5b0f 100644
 --- a/crates/horizon-shaders/src/translate/rewrite.rs
 +++ b/crates/horizon-shaders/src/translate/rewrite.rs
 @@ -57,6 +57,64 @@ impl Stage<'_> {
@@ -15778,11 +16028,19 @@ index 62f670815..e1919074b 100644
          if self.kind == ShaderStage::Vertex {
              p.push_str(
                  "const vec2 hz_quad[6] = vec2[6](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));\n\
-@@ -102,12 +160,26 @@ impl Stage<'_> {
+@@ -102,12 +160,34 @@ impl Stage<'_> {
          let mut skip_until = 0;
          let next = |i: usize| (i + 1..self.tokens.len()).find(|&j| significant(self.tokens[j]));
          let prev = |i: usize| (0..i).rev().find(|&j| significant(self.tokens[j]));
 +        let mut after_token: Option<String> = None;
++        // Struct names: a variable may take its struct's name (`faceData faceData = ...;`,
++        // Complementary), which GLSL allows and naga's parser reads as the type. Such a
++        // variable is renamed wherever the name isn't used as a type.
++        let structs: std::collections::HashSet<&str> = (0..self.tokens.len())
++            .filter(|&i| self.tokens[i] == "struct")
++            .filter_map(|i| next(i).map(|n| self.tokens[n]))
++            .filter(|t| is_ident(t))
++            .collect();
          for (i, &t) in self.tokens.iter().enumerate() {
 +            if let Some(a) = after_token.take() {
 +                out.push_str(&a);
@@ -15805,7 +16063,7 @@ index 62f670815..e1919074b 100644
                  continue;
              }
              if removed(i) {
-@@ -151,8 +223,18 @@ impl Stage<'_> {
+@@ -151,8 +231,18 @@ impl Stage<'_> {
                  }
                  "(" => {
                      let callee = prev(i).map_or("", |j| self.tokens[j]);
@@ -15825,7 +16083,7 @@ index 62f670815..e1919074b 100644
                      } else {
                          ""
                      };
-@@ -188,12 +270,17 @@ impl Stage<'_> {
+@@ -188,12 +278,17 @@ impl Stage<'_> {
              if t == "const" && depth > 0 && self.calls_not_constant(i) {
                  continue;
              }
@@ -15844,7 +16102,7 @@ index 62f670815..e1919074b 100644
                      params.insert(name.to_owned(), t.to_owned());
                      skip_until = n + 1;
                      continue;
-@@ -215,6 +302,10 @@ impl Stage<'_> {
+@@ -215,6 +310,10 @@ impl Stage<'_> {
                  out.push_str(t);
                  continue;
              }
@@ -15855,7 +16113,7 @@ index 62f670815..e1919074b 100644
              let sampler = params
                  .get(t)
                  .map(String::as_str)
-@@ -227,9 +318,11 @@ impl Stage<'_> {
+@@ -227,9 +326,11 @@ impl Stage<'_> {
                  }) && prev(i)
                      .is_some_and(|j| matches!(self.tokens[j], "(" | ","));
                  if as_argument {
@@ -15869,7 +16127,7 @@ index 62f670815..e1919074b 100644
                  }
                  continue;
              }
-@@ -250,6 +343,7 @@ impl Stage<'_> {
+@@ -250,6 +351,7 @@ impl Stage<'_> {
                  "modf" if called => Some("hz_modf".into()),
                  // Matrix inverse, which naga writes for neither Metal nor WGSL.
                  "inverse" if called && self.inverse => Some("hz_inverse".into()),
@@ -15877,7 +16135,7 @@ index 62f670815..e1919074b 100644
                  "texture2D" | "texture1D" | "texture3D" | "textureCube" if called => {
                      Some("texture".into())
                  }
-@@ -263,6 +357,17 @@ impl Stage<'_> {
+@@ -263,6 +365,17 @@ impl Stage<'_> {
                      Some("texelFetch".into())
                  }
                  "texture2DProj" if called => Some("textureProj".into()),
@@ -15895,7 +16153,7 @@ index 62f670815..e1919074b 100644
                  "texture2DGrad" | "texture2DGradARB" if called => Some("textureGrad".into()),
                  "shadow2D" if called => Some("vec4(texture".into()),
                  "shadow2DLod" if called => Some("vec4(textureLod".into()),
-@@ -273,6 +378,8 @@ impl Stage<'_> {
+@@ -273,6 +386,8 @@ impl Stage<'_> {
                      skip_until = close.map_or(i + 1, |c| c + 1);
                      Some("(hz_ModelViewProjectionMatrix * hz_Vertex)".into())
                  }
@@ -15904,7 +16162,7 @@ index 62f670815..e1919074b 100644
                  "gl_FragColor" => Some("hz_out0".into()),
                  "gl_FragData" | "gl_TexCoord" => match self.index_after(i) {
                      Some((n, close)) => {
-@@ -290,7 +397,6 @@ impl Stage<'_> {
+@@ -290,7 +405,6 @@ impl Stage<'_> {
                  "gl_FrontColor" => Some("hz_FrontColor".into()),
                  "gl_Fog" => Some("hz_Fog".into()),
                  // Before the compatibility inputs, of which `gl_Vertex` is a prefix.
@@ -15912,11 +16170,30 @@ index 62f670815..e1919074b 100644
                  "gl_InstanceID" => Some("gl_InstanceIndex".into()),
                  "gl_VertexIndex" | "gl_InstanceIndex" => None,
                  _ if UNIFORM_STATE.iter().any(|b| t.starts_with(b)) => {
-@@ -299,11 +405,15 @@ impl Stage<'_> {
+@@ -299,11 +413,34 @@ impl Stage<'_> {
                  _ if !fragment && VERTEX_INPUTS.iter().any(|b| t.starts_with(b)) => {
                      Some(format!("hz_{}", &t[3..]))
                  }
++                _ if structs.contains(t)
++                    && prev(i).is_none_or(|p| self.tokens[p] != "struct")
++                    && next(i).is_none_or(|n| {
++                        let n = self.tokens[n];
++                        !(is_ident(n) || matches!(n, "(" | "[" | "{"))
++                    }) =>
++                {
++                    Some(format!("hz_sv_{t}"))
++                }
 +                "sampler" | "image" => Some(keyword_name(t).into()),
++                // A storage block (`buffer Name {`, through `GL_ARB_shader_storage_buffer_object`
++                // in an older version) keeps its keyword (Complementary's voxel reflections).
++                "buffer"
++                    if next(i).is_some_and(|n| is_ident(self.tokens[n]))
++                        && next(i)
++                            .and_then(next)
++                            .is_some_and(|b| self.tokens[b] == "{") =>
++                {
++                    None
++                }
                  _ if old && LATER_KEYWORDS.contains(&t) => Some(format!("hz_kw_{t}")),
                  _ => None,
              };
@@ -15928,7 +16205,7 @@ index 62f670815..e1919074b 100644
          out
      }
  }
-@@ -369,3 +479,17 @@ pub(super) fn attribute_value(name: &str, ty: &str) -> String {
+@@ -369,3 +506,17 @@ pub(super) fn attribute_value(name: &str, ty: &str) -> String {
          _ => format!("{ty}(0)"),
      }
  }
@@ -15947,7 +16224,7 @@ index 62f670815..e1919074b 100644
 +/// Sampling functions with an implicit level of detail (a fragment shader's derivatives).
 +const IMPLICIT_LOD: [&str; 5] = ["texture", "texture2D", "texture1D", "texture3D", "textureCube"];
 diff --git a/crates/horizon-shaders/src/translate/scan.rs b/crates/horizon-shaders/src/translate/scan.rs
-index 716c58f43..e407c1cc5 100644
+index 716c58f43..176103c2e 100644
 --- a/crates/horizon-shaders/src/translate/scan.rs
 +++ b/crates/horizon-shaders/src/translate/scan.rs
 @@ -53,6 +53,9 @@ pub(super) struct Stage<'p> {
@@ -16078,10 +16355,11 @@ index 716c58f43..e407c1cc5 100644
                  "gl_Color" if kind == ShaderStage::Fragment => {
                      s.builtin_varying("hz_FrontColor".into())
                  }
-@@ -322,6 +407,14 @@ impl<'p> Stage<'p> {
+@@ -322,9 +407,52 @@ impl<'p> Stage<'p> {
              }
          }
          s.inverse &= !own_inverse;
++        s.undeclared_builtins();
 +        s.bool_member_accesses();
 +        s.instance_prefixes();
 +        s.returns();
@@ -16093,7 +16371,44 @@ index 716c58f43..e407c1cc5 100644
          s
      }
  
-@@ -387,7 +480,6 @@ impl<'p> Stage<'p> {
++    /// Iris's fog and sky colours used without a declaration (Luster's nether fog, in every
++    /// dimension's shading pass): declared as the uniforms Iris gives, as Iris runs them.
++    /// A name the program declares (a global, a local, a parameter) is left alone.
++    fn undeclared_builtins(&mut self) {
++        const BUILTINS: [(&str, &str); 2] = [("fogColor", "vec3"), ("skyColor", "vec3")];
++        for (name, ty) in BUILTINS {
++            if self.uniforms.iter().any(|u| u.0 == name) {
++                continue;
++            }
++            let sig: Vec<usize> =
++                (0..self.tokens.len()).filter(|&i| significant(self.tokens[i])).collect();
++            let mut used = None;
++            let mut declared = false;
++            for (k, &i) in sig.iter().enumerate() {
++                if self.tokens[i] != name {
++                    continue;
++                }
++                used.get_or_insert(i);
++                // After a vector or scalar type (`vec3 fogColor`).
++                if k > 0
++                    && matches!(
++                        self.tokens[sig[k - 1]].trim_end_matches(char::is_numeric),
++                        "float" | "int" | "uint" | "bool" | "vec" | "ivec" | "uvec" | "bvec" | "dvec" | "double"
++                    )
++                {
++                    declared = true;
++                }
++            }
++            if let Some(at) = used.filter(|_| !declared) {
++                self.uniforms.push((name.to_owned(), ty.to_owned(), at));
++            }
++        }
++    }
++
+     /// Names that desktop GLSL leaves free but Vulkan GLSL takes for its separate texture and
+     /// sampler types (`sampler2D sampler`): renamed, unless called (`texture2D(...)`).
+     fn rename_vulkan_types(&mut self) {
+@@ -387,7 +515,6 @@ impl<'p> Stage<'p> {
          }
      }
  
@@ -16101,7 +16416,7 @@ index 716c58f43..e407c1cc5 100644
      pub(super) fn global(&mut self, from: usize, to: usize, body: bool) {
          let words: Vec<usize> = (from..to)
              .filter(|&i| significant(self.tokens[i]))
-@@ -399,8 +491,20 @@ impl<'p> Stage<'p> {
+@@ -399,8 +526,20 @@ impl<'p> Stage<'p> {
          let prototype = paren.is_some_and(|p| self.tokens[words[p]] == "(")
              && !words.iter().any(|&i| STORAGE.contains(&self.tokens[i]));
          if body && words.iter().any(|&i| self.tokens[i] == "buffer") {
@@ -16122,7 +16437,7 @@ index 716c58f43..e407c1cc5 100644
          if body || prototype {
              return self.function(&words);
          }
-@@ -460,6 +564,16 @@ impl<'p> Stage<'p> {
+@@ -460,6 +599,16 @@ impl<'p> Stage<'p> {
          // Declarators: name [array] [= init], separated by commas.
          let mut declarators: Vec<(String, String)> = Vec::new();
          let mut j = k + 1;
@@ -16139,7 +16454,7 @@ index 716c58f43..e407c1cc5 100644
          while let Some(&n) = words.get(j) {
              let name = self.tokens[n].to_owned();
              let mut array = String::new();
-@@ -483,13 +597,25 @@ impl<'p> Stage<'p> {
+@@ -483,13 +632,25 @@ impl<'p> Stage<'p> {
                  j += 1;
              }
              j += 1;
@@ -16167,7 +16482,7 @@ index 716c58f43..e407c1cc5 100644
              match storage {
                  "uniform" if is_sampler_type(&ty) => self.samplers.push((name, ty.clone())),
                  "uniform" if ty.contains("image") => match format {
-@@ -714,6 +840,476 @@ impl<'p> Stage<'p> {
+@@ -714,6 +875,476 @@ impl<'p> Stage<'p> {
          }
      }
  

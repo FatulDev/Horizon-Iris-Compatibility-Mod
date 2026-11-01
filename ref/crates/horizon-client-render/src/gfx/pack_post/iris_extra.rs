@@ -8,6 +8,7 @@ static OUTLINE: std::sync::Mutex<Vec<[f32; 6]>> = std::sync::Mutex::new(Vec::new
 
 /// Notes the frame's outline (before the pack runs).
 pub fn set_outline(frame: &crate::gfx::Frame) {
+    crate::gfx::iris::set_crumbling(frame.crumbling_sprite);
     let edges = crate::gfx::outline_vertices(&frame.outline, frame.camera);
     *OUTLINE.lock().unwrap_or_else(|e| e.into_inner()) = edges;
 }
@@ -20,12 +21,15 @@ struct Lines {
 }
 
 static LINES: std::sync::Mutex<Option<Lines>> = std::sync::Mutex::new(None);
+static OUTLINE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const SHADER: &str = "
 struct U { m: mat4x4<f32> };
 @group(0) @binding(0) var<uniform> u: U;
 @vertex fn vs(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> {
-    return u.m * vec4<f32>(p, 1.0);
+    // Pulled toward the camera as vanilla's lines are (`rendertype_lines`' view shrink and
+    // perspective layering): drawn on the block's own faces, they lost the depth test.
+    return u.m * vec4<f32>(p * (1.0 - 1.0 / 256.0) * (1.0 - 1.0 / 4096.0), 1.0);
 }
 @fragment fn fs() -> @location(0) vec4<f32> {
     return vec4<f32>(0.0, 0.0, 0.0, 0.4);
@@ -39,18 +43,36 @@ pub fn draw_outline(pp: &PackPost, device: &wgpu::Device, encoder: &mut wgpu::Co
     if edges.is_empty() {
         return;
     }
+    let skip = |why: &str| {
+        if !OUTLINE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!("shader pack: no block outline: {why}");
+        }
+    };
     let (Some(water), Some(targets)) = (&pp.water, &pp.targets) else {
-        return;
+        return skip("the pack has no translucent terrain pass");
     };
     let Some(&(_, buffer)) = water.writes.iter().find(|w| w.0 == 0) else {
-        return;
+        return skip("its translucent terrain writes no colour");
     };
     let Some(sides) = &targets.color[buffer] else {
-        return;
+        return skip("no buffer behind its translucent colour");
     };
     let view = &sides[usize::from(pp.main & 1 << buffer != 0)];
     let format = view.texture().format();
     let depth_format = targets.depth_texture.format();
+    // Once per pack, what the outline draws into, for reports (Iris Features).
+    if !OUTLINE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::info!(
+            "shader pack: block outline drawn after translucent terrain into colortex{buffer} \
+             ({format:?}, depth {depth_format:?}), {} edges",
+            edges.len()
+        );
+    }
+    // Blending needs a blendable format; else the lines are written as they are.
+    let blendable = format
+        .guaranteed_format_features(device.features())
+        .flags
+        .contains(wgpu::TextureFormatFeatureFlags::BLENDABLE);
     // The pack's camera: its projection (GL depth, -1 to 1, made wgpu's 0 to 1) and view.
     let matrix = |name: &str| {
         let i = pack_uniforms::index(name)?;
@@ -60,7 +82,7 @@ pub fn draw_outline(pp: &PackPost, device: &wgpu::Device, encoder: &mut wgpu::Co
         }
     };
     let (Some(projection), Some(model_view)) = (matrix("gbufferProjection"), matrix("gbufferModelView")) else {
-        return;
+        return skip("no camera matrices");
     };
     // As the translator ends a vertex stage drawing into buffers: y flipped (the buffers are
     // stored as GL lays textures out), depth from -1..1 to 0..1.
@@ -123,7 +145,7 @@ pub fn draw_outline(pp: &PackPost, device: &wgpu::Device, encoder: &mut wgpu::Co
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: blendable.then_some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -178,6 +200,9 @@ static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 /// A pack was built: its extra passes are built again.
 pub fn new_pack() {
+    OUTLINE_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
+    // A new pack may come with a new device: the outline's pipeline is made again.
+    *LINES.lock().unwrap_or_else(|e| e.into_inner()) = None;
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -239,7 +264,13 @@ fn build_extra(
         &resources,
     );
     for n in notes {
+        if cfg!(test) {
+            println!("  note: {n}");
+        }
         log::info!("shader pack: {n}");
+    }
+    if cfg!(test) {
+        println!("  note: {name} built: {}", pass.is_some());
     }
     if pass.is_none() {
         log::warn!("shader pack: {name} could not be built (Iris Features)");
@@ -261,7 +292,9 @@ fn with_extra<R>(pp: &PackPost, device: &wgpu::Device, f: impl FnOnce(&mut Extra
                     depth_write: true,
                     atlas: pp.hand.as_ref().and_then(|h| h.0.atlas.clone()),
                     ids: None,
-                    cull: false,
+                    // Back faces culled, as vanilla draws items: drawn both ways, held glass
+                    // stacked its far faces under its near ones and turned near opaque.
+                    cull: true,
                 };
                 build_extra(pp, device, p, &g).map(|pass| (pass, geometry))
             });
@@ -332,6 +365,9 @@ pub fn draw_hand(
     size: [u32; 2],
     frame: &crate::gfx::Frame,
 ) {
+    // Built while the hand's pass is in place: `gbuffers_hand_water` takes its atlas (built
+    // without it, held glass sampled no texture).
+    let split = with_extra(pp, device, |e| e.hand_water.is_some());
     let Some((mut pass, mut geometry)) = pp.hand.take() else {
         return;
     };
@@ -341,7 +377,6 @@ pub fn draw_hand(
         size[0] as f32 / size[1].max(1) as f32,
         frame.depth_far,
     ) * unspin;
-    let split = with_extra(pp, device, |e| e.hand_water.is_some());
     let (solid, translucent): (Vec<crate::mesher::Vertex>, Vec<crate::mesher::Vertex>) = if split {
         let mut solid = Vec::new();
         let mut translucent = Vec::new();

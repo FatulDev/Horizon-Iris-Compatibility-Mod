@@ -161,6 +161,14 @@ impl Stage<'_> {
         let next = |i: usize| (i + 1..self.tokens.len()).find(|&j| significant(self.tokens[j]));
         let prev = |i: usize| (0..i).rev().find(|&j| significant(self.tokens[j]));
         let mut after_token: Option<String> = None;
+        // Struct names: a variable may take its struct's name (`faceData faceData = ...;`,
+        // Complementary), which GLSL allows and naga's parser reads as the type. Such a
+        // variable is renamed wherever the name isn't used as a type.
+        let structs: std::collections::HashSet<&str> = (0..self.tokens.len())
+            .filter(|&i| self.tokens[i] == "struct")
+            .filter_map(|i| next(i).map(|n| self.tokens[n]))
+            .filter(|t| is_ident(t))
+            .collect();
         for (i, &t) in self.tokens.iter().enumerate() {
             if let Some(a) = after_token.take() {
                 out.push_str(&a);
@@ -405,7 +413,26 @@ impl Stage<'_> {
                 _ if !fragment && VERTEX_INPUTS.iter().any(|b| t.starts_with(b)) => {
                     Some(format!("hz_{}", &t[3..]))
                 }
+                _ if structs.contains(t)
+                    && prev(i).is_none_or(|p| self.tokens[p] != "struct")
+                    && next(i).is_none_or(|n| {
+                        let n = self.tokens[n];
+                        !(is_ident(n) || matches!(n, "(" | "[" | "{"))
+                    }) =>
+                {
+                    Some(format!("hz_sv_{t}"))
+                }
                 "sampler" | "image" => Some(keyword_name(t).into()),
+                // A storage block (`buffer Name {`, through `GL_ARB_shader_storage_buffer_object`
+                // in an older version) keeps its keyword (Complementary's voxel reflections).
+                "buffer"
+                    if next(i).is_some_and(|n| is_ident(self.tokens[n]))
+                        && next(i)
+                            .and_then(next)
+                            .is_some_and(|b| self.tokens[b] == "{") =>
+                {
+                    None
+                }
                 _ if old && LATER_KEYWORDS.contains(&t) => Some(format!("hz_kw_{t}")),
                 _ => None,
             };

@@ -407,6 +407,7 @@ impl<'p> Stage<'p> {
             }
         }
         s.inverse &= !own_inverse;
+        s.undeclared_builtins();
         s.bool_member_accesses();
         s.instance_prefixes();
         s.returns();
@@ -416,6 +417,40 @@ impl<'p> Stage<'p> {
         s.relational_conversions(&types);
         s.matrix_swizzle_assignments(&types);
         s
+    }
+
+    /// Iris's fog and sky colours used without a declaration (Luster's nether fog, in every
+    /// dimension's shading pass): declared as the uniforms Iris gives, as Iris runs them.
+    /// A name the program declares (a global, a local, a parameter) is left alone.
+    fn undeclared_builtins(&mut self) {
+        const BUILTINS: [(&str, &str); 2] = [("fogColor", "vec3"), ("skyColor", "vec3")];
+        for (name, ty) in BUILTINS {
+            if self.uniforms.iter().any(|u| u.0 == name) {
+                continue;
+            }
+            let sig: Vec<usize> =
+                (0..self.tokens.len()).filter(|&i| significant(self.tokens[i])).collect();
+            let mut used = None;
+            let mut declared = false;
+            for (k, &i) in sig.iter().enumerate() {
+                if self.tokens[i] != name {
+                    continue;
+                }
+                used.get_or_insert(i);
+                // After a vector or scalar type (`vec3 fogColor`).
+                if k > 0
+                    && matches!(
+                        self.tokens[sig[k - 1]].trim_end_matches(char::is_numeric),
+                        "float" | "int" | "uint" | "bool" | "vec" | "ivec" | "uvec" | "bvec" | "dvec" | "double"
+                    )
+                {
+                    declared = true;
+                }
+            }
+            if let Some(at) = used.filter(|_| !declared) {
+                self.uniforms.push((name.to_owned(), ty.to_owned(), at));
+            }
+        }
     }
 
     /// Names that desktop GLSL leaves free but Vulkan GLSL takes for its separate texture and

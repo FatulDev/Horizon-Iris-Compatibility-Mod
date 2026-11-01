@@ -479,8 +479,14 @@ fn translate(
         Some((_, d)) if d.contains("hz_fo0") => Some("hz_fo0".to_owned()),
         Some((_, d)) => d
             .split_once(" out vec4 ")
-            .map(|(_, r)| r.trim_end_matches(';').split('[').next().unwrap_or("").trim().to_owned())
-            .filter(|n| !n.is_empty() && !d.contains('[')),
+            // The name alone: a narrowed output's declaration goes on (`out vec4 hz_out0;
+            // vec3 shadowcolor0_out`, Photon's shadow), and an array isn't tested.
+            .and_then(|(_, r)| {
+                let r = r.trim_start();
+                let n: String =
+                    r.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                (!n.is_empty() && !r[n.len()..].trim_start().starts_with('[')).then_some(n)
+            }),
     };
     if let Some(t) = gbuffers.and_then(|g| g.alpha_test)
         && let Some(out0) = out0

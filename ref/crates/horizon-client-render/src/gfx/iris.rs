@@ -8,6 +8,109 @@ use super::pack_uniforms::Value;
 pub const DAMAGED: usize = super::pack_entities::PROGRAMS;
 pub const PARTICLE_TRANSLUCENT: usize = super::pack_entities::PROGRAMS + 1;
 
+thread_local! {
+    /// The blends `build_pass` gives its blended outputs, in order, where the pack sets a
+    /// buffer's own (`blend.<program>.<buffer>`); `None` keeps the program's.
+    static BLENDS: std::cell::RefCell<std::collections::VecDeque<Option<wgpu::BlendState>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// At the start of `build_pass`: the per-buffer blends of `p`'s outputs that take its blend
+/// (those `pack_post::blend_state` is asked for, in the same order).
+pub fn queue_buffer_blends(
+    p: &horizon_shaders::PostProgram,
+    formats: &[wgpu::TextureFormat; horizon_shaders::BUFFERS],
+    features: wgpu::Features,
+) {
+    let mut queue = std::collections::VecDeque::new();
+    if p.blend.is_some()
+        && p.group != horizon_shaders::Group::Final
+        && let Some(program) = &p.program
+    {
+        for &location in &program.interface.outputs {
+            let Some(&buffer) = p.buffers.get(location as usize) else {
+                continue;
+            };
+            let blendable = formats[buffer as usize]
+                .guaranteed_format_features(features)
+                .flags
+                .contains(wgpu::TextureFormatFeatureFlags::BLENDABLE);
+            if blendable {
+                queue.push_back(
+                    horizon_shaders::iris::buffer_blend(&p.name, buffer as u8)
+                        .map(|b| b.map_or(wgpu::BlendState::REPLACE, blend_state)),
+                );
+            }
+        }
+    }
+    BLENDS.with(|b| *b.borrow_mut() = queue);
+}
+
+/// In `pack_post::blend_state`: the next output's own blend, when the pack sets one.
+pub fn next_buffer_blend() -> Option<wgpu::BlendState> {
+    BLENDS.with(|b| b.borrow_mut().pop_front().flatten())
+}
+
+/// `pack_post::blend_state`'s mapping (that function hands out the queued blends, so it isn't
+/// called from here).
+fn blend_state(b: horizon_shaders::Blend) -> wgpu::BlendState {
+    use horizon_shaders::Factor as F;
+    use wgpu::BlendFactor as W;
+    let f = |f| match f {
+        F::Zero => W::Zero,
+        F::One => W::One,
+        F::SrcColor => W::Src,
+        F::OneMinusSrcColor => W::OneMinusSrc,
+        F::DstColor => W::Dst,
+        F::OneMinusDstColor => W::OneMinusDst,
+        F::SrcAlpha => W::SrcAlpha,
+        F::OneMinusSrcAlpha => W::OneMinusSrcAlpha,
+        F::DstAlpha => W::DstAlpha,
+        F::OneMinusDstAlpha => W::OneMinusDstAlpha,
+        F::SrcAlphaSaturate => W::SrcAlphaSaturated,
+    };
+    let component = |src, dst| wgpu::BlendComponent {
+        src_factor: f(src),
+        dst_factor: f(dst),
+        operation: wgpu::BlendOperation::Add,
+    };
+    wgpu::BlendState { color: component(b[0], b[1]), alpha: component(b[2], b[3]) }
+}
+
+static CRUMBLING: std::sync::Mutex<[f32; 4]> = std::sync::Mutex::new([0.0; 4]);
+/// The frame's destroy-stage sprite rect (`Frame::crumbling_sprite`): its size, which every
+/// stage's sprite shares.
+pub fn set_crumbling(rect: [f32; 4]) {
+    *CRUMBLING.lock().unwrap_or_else(|e| e.into_inner()) = rect;
+}
+
+/// Crack quads (`breaking::geometry`) as a pack's program reads them: Horizon's carry a decal
+/// UV that repeats over the block and their stage sprite's origin in the light bytes
+/// (`breaking::stage_light`), which entity.wgsl wraps per pixel. A pack samples the atlas at
+/// the UV as given, so each quad's UVs become atlas UVs inside its stage's sprite here (they
+/// read the whole atlas), and the light full: the pass is unlit.
+pub fn crack_uvs(quads: &mut [crate::gfx::Vertex]) {
+    let [_, _, w, h] = *CRUMBLING.lock().unwrap_or_else(|e| e.into_inner());
+    for quad in quads.chunks_exact_mut(4) {
+        let light = quad[0].light;
+        let origin = [
+            (light & 0xffff) as f32 / 65535.0,
+            (light >> 16) as f32 / 65535.0,
+        ];
+        // The tile the quad's corners lie in: the lowest corner's, so a face's 0 and 1 edges
+        // land on the sprite's two sides.
+        let low = |k: usize| (quad.iter().map(|v| v.uv[k]).fold(f32::INFINITY, f32::min) + 1e-4).floor();
+        let base = [low(0), low(1)];
+        for v in quad.iter_mut() {
+            v.uv = [
+                origin[0] + (v.uv[0] - base[0]).clamp(0.0, 1.0) * w,
+                origin[1] + (v.uv[1] - base[1]).clamp(0.0, 1.0) * h,
+            ];
+            v.light = 240 | 240 << 8;
+        }
+    }
+}
+
 /// The local player as Iris's own uniforms describe it.
 #[derive(Clone, Copy, Debug)]
 pub struct IrisPlayer {
@@ -53,7 +156,7 @@ pub fn set_player(player: IrisPlayer) {
 }
 
 /// Iris's own uniforms: after Horizon's and the pack's custom ones.
-pub const NAMES: [&str; 15] = [
+pub const NAMES: [&str; 16] = [
     "currentPlayerHealth",
     "maxPlayerHealth",
     "currentPlayerHunger",
@@ -69,6 +172,7 @@ pub const NAMES: [&str; 15] = [
     "is_on_ground",
     "is_sneaking",
     "is_sprinting",
+    "cloudHeight",
 ];
 
 /// The position of `name` among [`NAMES`].
@@ -108,6 +212,10 @@ pub fn values() -> Vec<Value> {
         flag(p.on_ground),
         flag(p.sneaking),
         flag(p.sprinting),
+        // The clouds' altitude, as Horizon draws them (`clouds.rs`): read as 0, Complementary
+        // and its kin put their clouds at the floor of the world, seen edge-on as a grey band
+        // at the horizon, and none in the sky.
+        f(&[192.33]),
     ]
 }
 
@@ -262,6 +370,39 @@ max(hz_vertices[hz_q + 17u] & 255u, hz_vertices[hz_q + 23u] & 255u));\n        \
 #[cfg(test)]
 mod id_tests {
     use super::*;
+
+    #[test]
+    fn crack_uvs_land_inside_their_stage_sprite() {
+        set_crumbling([0.0, 0.0, 0.25, 0.5]);
+        let v = |u: f32, w: f32| crate::gfx::Vertex {
+            uv: [u, w],
+            light: crate::breaking::stage_light([0.5, 0.25]),
+            ..bytemuck::Zeroable::zeroed()
+        };
+        // A full face's decal UVs, -1 to 0 (`breaking::decal_uv` negates).
+        let mut quad = [v(-1.0, -1.0), v(-1.0, 0.0), v(0.0, 0.0), v(0.0, -1.0)];
+        crack_uvs(&mut quad);
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        assert!(close(quad[0].uv[0], 0.5) && close(quad[0].uv[1], 0.25));
+        assert!(close(quad[2].uv[0], 0.75) && close(quad[2].uv[1], 0.75));
+        set_crumbling([0.0; 4]);
+    }
+
+    #[test]
+    fn cracks_sample_their_stage_sprite() {
+        set_crumbling([0.0, 0.0, 0.25, 0.5]);
+        let v = |uv: [f32; 2]| crate::gfx::Vertex {
+            uv,
+            light: (0.5f32 * 65535.0) as u32 | (0.25f32 * 65535.0).round() as u32 >> 0 << 16,
+            ..bytemuck::Zeroable::zeroed()
+        };
+        let mut q = [v([-1.0, 0.0]), v([0.0, 0.0]), v([0.0, -1.0]), v([-1.0, -1.0])];
+        crack_uvs(&mut q);
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        assert!(near(q[0].uv[0], 0.5) && near(q[0].uv[1], 0.75));
+        assert!(near(q[2].uv[0], 0.75) && near(q[2].uv[1], 0.25));
+        assert_eq!(q[0].light, 240 | 240 << 8);
+    }
 
     #[test]
     fn shared_sprites_take_ids_by_glow_and_leave_voxels_when_placed_elsewhere() {

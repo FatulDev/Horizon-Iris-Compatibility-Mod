@@ -76,3 +76,20 @@ pub fn set_rain_depth(on: bool) {
 pub fn rain_depth() -> bool {
     RAIN_DEPTH.load(Ordering::Relaxed)
 }
+
+static BUFFER_BLENDS: std::sync::Mutex<Vec<(String, u8, Option<crate::Blend>)>> =
+    std::sync::Mutex::new(Vec::new());
+/// The pack's `blend.<program>.<buffer>` keys: (program, buffer, its blend or `None` for off).
+pub fn set_buffer_blends(table: Vec<(String, u8, Option<crate::Blend>)>) {
+    *BUFFER_BLENDS.lock().unwrap_or_else(|e| e.into_inner()) = table;
+}
+/// Buffer `buffer`'s own blend in program `program`: `None` when the pack sets none, else the
+/// blend (`Some(None)`: off).
+pub fn buffer_blend(program: &str, buffer: u8) -> Option<Option<crate::Blend>> {
+    BUFFER_BLENDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(p, b, _)| p == program && *b == buffer)
+        .map(|e| e.2)
+}

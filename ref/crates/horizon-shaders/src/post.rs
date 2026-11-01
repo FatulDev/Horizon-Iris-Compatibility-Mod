@@ -627,6 +627,24 @@ pub fn load_post(
         })
         .collect();
     crate::iris::set_written_before(table);
+    // `blend.<program>.<buffer>`: one buffer's blend apart from the program's (Iris), as packs
+    // keep their data buffers unblended under translucent geometry (Eclipse's colortex11,
+    // Pegasus's colortex1); Horizon blended them all alike.
+    let mut buffer_blends = Vec::new();
+    for e in &properties.entries {
+        let Some(rest) = e.key.strip_prefix("blend.") else {
+            continue;
+        };
+        let Some((program, buffer)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if let Some(b) = config::buffer_index(buffer)
+            && let Some(value) = blend(properties, rest)
+        {
+            buffer_blends.push((program.to_owned(), b as u8, value));
+        }
+    }
+    crate::iris::set_buffer_blends(buffer_blends);
     let mut gbuffers = |names: &[&str], group, inputs: &GbuffersInputs| {
         names.iter().find_map(|name| {
             // `alphaTest.<program>` replaces the geometry's default test (OQ-23).
@@ -1248,7 +1266,12 @@ fn expand_custom(properties: &Properties, macros: &Macros) -> Properties {
         .iter()
         .map(|e| {
             let mut e = e.clone();
-            if e.key.starts_with("uniform.") || e.key.starts_with("variable.") {
+            // Sizes too: Complementary sizes its voxel images by an option
+            // (`image.wsr_img = ... COLORED_LIGHTING 64 COLORED_LIGHTING`).
+            if ["uniform.", "variable.", "image.", "bufferObject.", "size.buffer."]
+                .iter()
+                .any(|p| e.key.starts_with(p))
+            {
                 e.value = macros.expand(&e.value).trim().to_owned();
             }
             e
