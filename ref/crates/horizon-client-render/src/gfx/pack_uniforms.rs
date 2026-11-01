@@ -30,112 +30,11 @@ pub struct PackInputs {
     pub biome_precipitation: i32,
     pub temperature: f32,
     pub rainfall: f32,
+    /// Whether the biome at the camera is known (its chunk is loaded).
+    pub biome_known: bool,
     /// `heldItemId`, `heldItemId2` (item.properties, 5.3) and `heldBlockLightValue(2)`.
     pub held_items: [i32; 2],
     pub held_light: [i32; 2],
-    /// The player, for the uniforms only Iris has (Iris Features).
-    pub iris: IrisPlayer,
-}
-
-/// The local player as Iris's own uniforms describe it (Iris Features).
-#[derive(Clone, Copy, Debug)]
-pub struct IrisPlayer {
-    pub health: f32,
-    pub max_health: f32,
-    pub food: f32,
-    pub air: f32,
-    pub max_air: f32,
-    pub burning: bool,
-    pub hurt: bool,
-    pub invisible: bool,
-    pub on_ground: bool,
-    pub sneaking: bool,
-    pub sprinting: bool,
-    pub spectator: bool,
-    pub first_person: bool,
-    /// Where the player looks (a unit vector).
-    pub look: [f32; 3],
-}
-
-impl Default for IrisPlayer {
-    /// A healthy player in first person, as a world without one reads.
-    fn default() -> Self {
-        Self {
-            health: 20.0,
-            max_health: 20.0,
-            food: 20.0,
-            air: 300.0,
-            max_air: 300.0,
-            burning: false,
-            hurt: false,
-            invisible: false,
-            on_ground: true,
-            sneaking: false,
-            sprinting: false,
-            spectator: false,
-            first_person: true,
-            look: [0.0, 0.0, 1.0],
-        }
-    }
-}
-
-/// Uniforms only Iris provides (its "exclusive" uniforms), after the frame's and the pack's
-/// custom ones: their names and GLSL types (Iris Features).
-pub const IRIS_NAMES: [(&str, &str); 19] = [
-    ("currentPlayerHealth", "float"),
-    ("maxPlayerHealth", "float"),
-    ("currentPlayerHunger", "float"),
-    ("maxPlayerHunger", "float"),
-    ("currentPlayerAir", "float"),
-    ("maxPlayerAir", "float"),
-    ("currentPlayerArmor", "float"),
-    ("firstPersonCamera", "bool"),
-    ("isSpectator", "bool"),
-    ("playerLookVector", "vec3"),
-    ("relativeEyePosition", "vec3"),
-    ("lightningBoltPosition", "vec4"),
-    ("is_burning", "bool"),
-    ("is_hurt", "bool"),
-    ("is_invisible", "bool"),
-    ("is_on_ground", "bool"),
-    ("is_sneaking", "bool"),
-    ("is_sprinting", "bool"),
-    ("isRightHanded", "bool"),
-];
-
-/// The position of `name` in [`IRIS_NAMES`].
-pub fn iris_index(name: &str) -> Option<usize> {
-    IRIS_NAMES.iter().position(|n| n.0 == name)
-}
-
-/// The values of [`IRIS_NAMES`] for `p`, as Iris gives them: health, hunger and air from 0 to 1
-/// with their maximums apart, booleans as 0 or 1.
-pub fn iris_values(p: &IrisPlayer) -> Vec<Value> {
-    let flag = |b: bool| Value::i(&[i32::from(b)]);
-    let part = |v: f32, max: f32| if max > 0.0 { (v / max).clamp(0.0, 1.0) } else { 0.0 };
-    vec![
-        Value::f(&[part(p.health, p.max_health)]),
-        Value::f(&[p.max_health]),
-        Value::f(&[part(p.food, 20.0)]),
-        Value::f(&[20.0]),
-        Value::f(&[part(p.air, p.max_air)]),
-        Value::f(&[p.max_air]),
-        Value::f(&[0.0]),
-        flag(p.first_person),
-        flag(p.spectator),
-        Value::f(&p.look),
-        // The camera is at the eyes in first person.
-        Value::f(&[0.0, 0.0, 0.0]),
-        // No bolt: w is 0.
-        Value::f(&[0.0, 0.0, 0.0, 0.0]),
-        flag(p.burning),
-        flag(p.hurt),
-        flag(p.invisible),
-        flag(p.on_ground),
-        flag(p.sneaking),
-        flag(p.sprinting),
-        flag(true),
-    ]
 }
 
 /// One uniform's value: up to 16 floats or 3 integers.
@@ -263,6 +162,15 @@ pub const NAMES: &[&str] = &[
     "shadowModelViewInverse",
     "shadowProjection",
     "shadowProjectionInverse",
+    "cameraPositionInt",
+    "cameraPositionFract",
+    "previousCameraPositionInt",
+    "previousCameraPositionFract",
+    "eyePosition",
+    "relativeEyePosition",
+    "playerLookVector",
+    "playerBodyVector",
+    "firstPersonCamera",
 ];
 
 /// Values carried from frame to frame.
@@ -273,19 +181,16 @@ pub struct FrameUniforms {
     start: std::time::Instant,
     last: Option<std::time::Instant>,
     frame: u32,
-    previous: Option<(Vec3, Mat4, Mat4)>,
+    previous: Option<(glam::DVec3, Mat4, Mat4)>,
     wetness: f32,
     eye_smooth: [f32; 2],
     /// The pack's shadow settings (7.1).
     pub shadow: Shadow,
-    /// The values of `IRIS_NAMES` this frame (Iris Features).
-    pub iris: Vec<Value>,
 }
 
 impl Default for FrameUniforms {
     fn default() -> Self {
         Self {
-            iris: iris_values(&IrisPlayer::default()),
             values: Vec::new(),
             atlas: [0; 2],
             start: std::time::Instant::now(),
@@ -384,24 +289,37 @@ fn smooth(value: f32, target: f32, half_life: f32, dt: f32) -> f32 {
 impl FrameUniforms {
     /// This frame's values for a render size of `size` pixels.
     pub fn update(&mut self, frame: &Frame, inputs: &PackInputs, size: [u32; 2]) {
-        self.iris = iris_values(&inputs.iris);
         let now = std::time::Instant::now();
         let dt = self.last.map_or(0.0, |l| (now - l).as_secs_f32());
         self.last = Some(now);
         let aspect = size[0] as f32 / size[1].max(1) as f32;
-        let view = crate::camera::view_matrix(frame.yaw, frame.pitch);
+        // Packs take gbufferProjection for a plain perspective (they invert only its perspective
+        // terms): the view bob and the nausea spin belong to the model-view, as GL drew them.
+        let view = frame.bob * frame.spin * crate::camera::view_matrix(frame.yaw, frame.pitch);
         let projection = Mat4::perspective_rh_gl(
             frame.fov_degrees.to_radians(),
             aspect,
             0.05,
             frame.depth_far,
-        ) * frame.bob
-            * frame.spin;
+        );
         let camera = frame.camera.as_vec3();
-        let (previous_camera, previous_view, previous_projection) =
+        let (previous_exact, previous_view, previous_projection) =
             self.previous
-                .unwrap_or((Vec3::ZERO, Mat4::ZERO, Mat4::ZERO));
-        self.previous = Some((camera, view, projection));
+                .unwrap_or((glam::DVec3::ZERO, Mat4::ZERO, Mat4::ZERO));
+        let previous_camera = previous_exact.as_vec3();
+        self.previous = Some((frame.camera, view, projection));
+        // The camera's whole blocks and the rest, exact however far from the origin.
+        let whole = |p: glam::DVec3| p.floor();
+        let int = |p: glam::DVec3| Value::i(&whole(p).as_ivec3().to_array());
+        let fract = |p: glam::DVec3| Value::f(&(p - whole(p)).as_vec3().to_array());
+        // The player's, not the camera's: in a third-person view the camera is behind (or in
+        // front of, turned around) the eye the pack lights from.
+        let [yaw, pitch] = frame.eye_rotation.map(f32::to_radians);
+        let look = Vec3::new(
+            -yaw.sin() * pitch.cos(),
+            -pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        );
 
         let to_view = |v: Vec3| view.transform_vector3(v);
         let sun_angle = (frame.sky.sun_angle / 360.0 + 0.25).rem_euclid(1.0);
@@ -446,6 +364,15 @@ impl FrameUniforms {
             match name {
                 "cameraPosition" => v3(camera),
                 "previousCameraPosition" => v3(previous_camera),
+                "cameraPositionInt" => int(frame.camera),
+                "cameraPositionFract" => fract(frame.camera),
+                "previousCameraPositionInt" => int(previous_exact),
+                "previousCameraPositionFract" => fract(previous_exact),
+                // The camera is the eye in first person.
+                "eyePosition" => v3(frame.eye.as_vec3()),
+                "relativeEyePosition" => v3((frame.camera - frame.eye).as_vec3()),
+                "playerLookVector" | "playerBodyVector" => v3(look),
+                "firstPersonCamera" => Value::i(&[i32::from(frame.first_person)]),
                 "eyeAltitude" => Value::f(&[frame.camera.y as f32]),
                 "upPosition" => v3(to_view(Vec3::new(0.0, 100.0, 0.0))),
                 "sunPosition" => v3(sun),
@@ -534,21 +461,17 @@ impl FrameUniforms {
     pub fn eval_custom(&mut self, custom: &mut horizon_shaders::Custom) {
         self.values.truncate(NAMES.len());
         let values = &self.values;
-        let iris = &self.iris;
+        let iris = crate::gfx::iris::values();
         let builtin = |name: &str| {
-            let (v, n) = match index(name) {
-                Some(i) => (values.get(i)?, components(name)),
-                // Iris's own uniforms (Iris Features).
-                None => {
-                    let k = iris_index(name)?;
-                    let n = match IRIS_NAMES[k].1 {
-                        "vec3" => 3,
-                        "vec4" => 4,
-                        _ => 1,
-                    };
-                    (iris.get(k)?, n)
-                }
-            };
+            if let Some(k) = crate::gfx::iris::index(name) {
+                let n = crate::gfx::iris::components(k);
+                return Some(match iris[k] {
+                    Value::F(f) => horizon_shaders::Val::vector(&f.map(f64::from)[..n]),
+                    Value::I(i) => horizon_shaders::Val::vector(&i.map(f64::from)[..n.min(3)]),
+                });
+            }
+            let v = values.get(index(name)?)?;
+            let n = components(name);
             Some(match *v {
                 Value::F(f) => horizon_shaders::Val::vector(&f.map(f64::from)[..n]),
                 Value::I(i) => horizon_shaders::Val::vector(&i.map(f64::from)[..n.min(3)]),
@@ -561,8 +484,7 @@ impl FrameUniforms {
         let out = custom.eval(dt, &builtin);
         self.values
             .extend(out.iter().map(|v| Value::f(&v.v.map(|x| x as f32)[..v.n])));
-        // Iris's own uniforms, after the custom ones (Iris Features).
-        self.values.extend(self.iris.iter().copied());
+        self.values.extend(iris);
     }
 }
 
@@ -571,6 +493,14 @@ fn components(name: &str) -> usize {
     match name {
         "cameraPosition"
         | "previousCameraPosition"
+        | "cameraPositionInt"
+        | "cameraPositionFract"
+        | "previousCameraPositionInt"
+        | "previousCameraPositionFract"
+        | "eyePosition"
+        | "relativeEyePosition"
+        | "playerLookVector"
+        | "playerBodyVector"
         | "upPosition"
         | "sunPosition"
         | "moonPosition"
@@ -585,6 +515,10 @@ fn components(name: &str) -> usize {
 
 /// The position of `name` in [`NAMES`].
 pub fn index(name: &str) -> Option<usize> {
+    // Iris's own uniforms, after the pack's custom ones (Iris Features).
+    if let Some(k) = crate::gfx::iris::index(name) {
+        return Some(NAMES.len() + crate::gfx::iris::custom_count() + k);
+    }
     NAMES.iter().position(|n| *n == name)
 }
 

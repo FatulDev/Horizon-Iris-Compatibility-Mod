@@ -1,3 +1,7 @@
+// Iris Features: module passes for what packs written for Iris rely on.
+#![allow(dead_code)]
+
+
 
 /// Iris Features: a vertex stage's `imageStore` into a 32-bit integer image takes the largest
 /// value instead of the last. Packs voxelise terrain in the shadow pass this way (Eclipse's
@@ -5,9 +9,9 @@
 /// frame with the order the GPU ran them in, so a voxel was a light one frame and stone the
 /// next. Vertex invocations have no order, so the largest is one of the results a pack can get
 /// anyway, and the same one every frame. Only with the device's image atomics.
-fn atomic_vertex_stores(module: &mut naga::Module) {
+pub(super) fn atomic_vertex_stores(module: &mut naga::Module) {
     use naga::{ImageClass, StorageAccess, StorageFormat, TypeInner};
-    if !crate::iris::image_atomics() {
+    if !image_atomics_on() {
         return;
     }
     let targets: Vec<naga::Handle<naga::GlobalVariable>> = module
@@ -65,7 +69,7 @@ fn atomic_vertex_stores(module: &mut naga::Module) {
     }
 }
 
-fn atomic_stores_in(
+pub(super) fn atomic_stores_in(
     block: &mut naga::Block,
     expressions: &mut naga::Arena<naga::Expression>,
     targets: &[naga::Handle<naga::GlobalVariable>],
@@ -137,7 +141,7 @@ fn atomic_stores_in(
 /// barrier a subgroup execution scope: only 32 invocations waited for each other, the rest of
 /// the workgroup raced on its shared memory (Eclipse's floodfill propagation came out a little
 /// different each frame on NVIDIA, and its light flickered). The workgroup barrier it means.
-fn workgroup_barriers(module: &mut naga::Module) {
+pub(super) fn workgroup_barriers(module: &mut naga::Module) {
     fn fix(block: &mut naga::Block) {
         use naga::Statement;
         for stmt in block.iter_mut() {
@@ -178,7 +182,7 @@ fn workgroup_barriers(module: &mut naga::Module) {
 /// GLSL frontend widens the scalar of every other arithmetic operator to the vector, not the
 /// one of `%`, and the module then fails validation. A literal or constant scalar there becomes
 /// the vector constant it widens to, in place.
-fn vector_modulo(module: &mut naga::Module) {
+pub(super) fn vector_modulo(module: &mut naga::Module) {
     use naga::{BinaryOperator, Expression, TypeInner};
     // (function, entry point index), the scalar operand, the vector's size.
     let mut fixes: Vec<(Option<naga::Handle<naga::Function>>, Option<usize>, naga::Handle<Expression>, naga::VectorSize)> =
@@ -254,7 +258,7 @@ fn vector_modulo(module: &mut naga::Module) {
 /// constructing the struct fails validation (Luster's ACES tables). A struct only the shader
 /// itself holds (no buffer or uniform, no other type containing it) takes its arrays with
 /// their own stride, as the shader's other arrays have.
-fn private_struct_strides(module: &mut naga::Module) {
+pub(super) fn private_struct_strides(module: &mut naga::Module) {
     use naga::{AddressSpace, Expression, Handle, Type, TypeInner};
     use std::collections::HashMap;
     let mut layouter = naga::proc::Layouter::default();
@@ -369,7 +373,7 @@ fn private_struct_strides(module: &mut naga::Module) {
 /// Iris Features: functions in the order they call each other. A pack may call a function
 /// declared further down (after a prototype); naga's GLSL frontend keeps the file's order and
 /// its validator wants every callee first ("depends on ... which has not been processed yet").
-fn callees_first(module: &mut naga::Module) {
+pub(super) fn callees_first(module: &mut naga::Module) {
     use naga::{Expression, Function, Handle, Statement};
     fn calls(block: &naga::Block, out: &mut Vec<Handle<Function>>) {
         for s in block.iter() {
@@ -472,9 +476,9 @@ fn callees_first(module: &mut naga::Module) {
 /// Iris Features: the pack's `imageAtomicMax(image, p, v)` and its kin, written
 /// `imageStore(image, p, hz_atomic_max(v))` for naga's GLSL frontend (it has no image atomics):
 /// the store becomes the atomic. Without the device's image atomics it stays a store.
-fn image_atomics(module: &mut naga::Module) {
+pub(super) fn image_atomics(module: &mut naga::Module) {
     use naga::{AtomicFunction, Expression, Statement};
-    if !crate::iris::image_atomics() {
+    if !image_atomics_on() {
         return;
     }
     let funs: Vec<(naga::Handle<naga::Function>, AtomicFunction)> = module
@@ -599,13 +603,13 @@ fn image_atomics(module: &mut naga::Module) {
 
 thread_local! {
     // How many times `compile` has gone round with the text rewritten (`text_fixes`).
-    static REWRITES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    pub(super) static REWRITES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Iris Features: what to write differently in the GLSL text itself for naga to take it, found
 /// from the parsed module's spans: the scalar of `ivec2 % int` becomes `ivec2(int)` (naga's
 /// frontend widens it for every other operator). As (start, end, replacement) byte ranges.
-fn text_fixes(module: &naga::Module, text: &str) -> Vec<(usize, usize, String)> {
+pub(super) fn text_fixes(module: &naga::Module, text: &str) -> Vec<(usize, usize, String)> {
     use naga::{BinaryOperator, Expression, ScalarKind, TypeInner};
     let mut fixes = Vec::new();
     let mut scan = |f: &naga::Function| {
@@ -653,7 +657,7 @@ fn text_fixes(module: &naga::Module, text: &str) -> Vec<(usize, usize, String)> 
 }
 
 /// `text` with `fixes` (from the end, as `text_fixes` orders them) applied.
-fn apply_text_fixes(text: &str, fixes: &[(usize, usize, String)]) -> String {
+pub(super) fn apply_text_fixes(text: &str, fixes: &[(usize, usize, String)]) -> String {
     let mut out = text.to_owned();
     for (start, end, with) in fixes {
         out.replace_range(*start..*end, with);
@@ -665,7 +669,7 @@ fn apply_text_fixes(text: &str, fixes: &[(usize, usize, String)]) -> String {
 /// the frontend) takes an atomic type, as naga wants: the member or element of a buffer, a
 /// shared or private variable. Its other reads and writes stay plain loads and stores, which
 /// naga takes on atomics.
-fn atomic_types(module: &mut naga::Module) {
+pub(super) fn atomic_types(module: &mut naga::Module) {
     use naga::{Expression, Handle, Statement, Type, TypeInner};
     #[derive(Clone, Copy, PartialEq)]
     enum Step {
@@ -838,7 +842,7 @@ fn atomic_types(module: &mut naga::Module) {
 /// Iris Features: a compute program's `texture()` (an implicit level of detail, which needs a
 /// fragment's derivatives; GL drivers take the base level there): the base level, as naga
 /// wants outside fragment stages. Also vertex stages.
-fn base_level_lookups(module: &mut naga::Module) {
+pub(super) fn base_level_lookups(module: &mut naga::Module) {
     if module.entry_points.iter().all(|e| e.stage == naga::ShaderStage::Fragment) {
         return;
     }
@@ -857,4 +861,117 @@ fn base_level_lookups(module: &mut naga::Module) {
     for ep in module.entry_points.iter_mut() {
         fix(&mut ep.function);
     }
+}
+
+/// `f(v.z)` with an `out`/`inout` parameter: a pointer into a vector's component passed to a
+/// function. GLSL allows it; naga's SPIR-V writer can't take one as an argument (it panics), so
+/// the component is copied into a local of its own, passed, and copied back after the call —
+/// GLSL's copy-in/copy-out semantics for these parameters (Iris Features).
+pub(super) fn component_arguments(module: &mut naga::Module, info: &naga::valid::ModuleInfo) {
+    use naga::{Expression, Statement};
+    let types = &mut module.types;
+    let mut fix = |f: &mut naga::Function, finfo: &naga::valid::FunctionInfo| {
+        // The pointer arguments that point into a vector's component, and their scalar type.
+        let mut scalar_of = std::collections::HashMap::new();
+        for (h, e) in f.expressions.iter() {
+            let base = match *e {
+                Expression::AccessIndex { base, .. } | Expression::Access { base, .. } => base,
+                _ => continue,
+            };
+            let into = matches!(
+                finfo[base].ty.inner_with(types),
+                naga::TypeInner::Pointer { .. } | naga::TypeInner::ValuePointer { .. }
+            );
+            if !into {
+                continue;
+            }
+            let inner = match *finfo[h].ty.inner_with(types) {
+                naga::TypeInner::ValuePointer { size: None, scalar, .. } => naga::TypeInner::Scalar(scalar),
+                naga::TypeInner::ValuePointer { size: Some(size), scalar, .. } => {
+                    naga::TypeInner::Vector { size, scalar }
+                }
+                naga::TypeInner::Pointer { base, .. } => {
+                    scalar_of.insert(h, base);
+                    continue;
+                }
+                _ => continue,
+            };
+            let ty = types.insert(naga::Type { name: None, inner }, naga::Span::UNDEFINED);
+            scalar_of.insert(h, ty);
+        }
+        if scalar_of.is_empty() {
+            return;
+        }
+        let mut block = std::mem::take(&mut f.body);
+        rewrite_block(&mut block, f, &scalar_of, types);
+        f.body = block;
+    };
+    fn rewrite_block(
+        block: &mut naga::Block,
+        f: &mut naga::Function,
+        scalar_of: &std::collections::HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Type>>,
+        types: &mut naga::UniqueArena<naga::Type>,
+    ) {
+        let old = std::mem::take(block);
+        for (statement, span) in old.span_into_iter() {
+            match statement {
+                Statement::Call { function, mut arguments, result }
+                    if arguments.iter().any(|a| scalar_of.contains_key(a)) =>
+                {
+                    let mut after = Vec::new();
+                    for a in arguments.iter_mut() {
+                        let Some(&ty) = scalar_of.get(a) else { continue };
+                        let local = f.local_variables.append(
+                            naga::LocalVariable { name: Some("hz_arg".into()), ty, init: None },
+                            span,
+                        );
+                        let pointer = f.expressions.append(Expression::LocalVariable(local), span);
+                        let value = f.expressions.append(Expression::Load { pointer: *a }, span);
+                        block.push(Statement::Emit(naga::Range::new_from_bounds(value, value)), span);
+                        block.push(Statement::Store { pointer, value }, span);
+                        after.push((*a, pointer));
+                        *a = pointer;
+                    }
+                    block.push(Statement::Call { function, arguments, result }, span);
+                    for (component, pointer) in after {
+                        let value = f.expressions.append(Expression::Load { pointer }, span);
+                        block.push(Statement::Emit(naga::Range::new_from_bounds(value, value)), span);
+                        block.push(Statement::Store { pointer: component, value }, span);
+                    }
+                }
+                Statement::Block(mut b) => {
+                    rewrite_block(&mut b, f, scalar_of, types);
+                    block.push(Statement::Block(b), span);
+                }
+                Statement::If { condition, mut accept, mut reject } => {
+                    rewrite_block(&mut accept, f, scalar_of, types);
+                    rewrite_block(&mut reject, f, scalar_of, types);
+                    block.push(Statement::If { condition, accept, reject }, span);
+                }
+                Statement::Loop { mut body, mut continuing, break_if } => {
+                    rewrite_block(&mut body, f, scalar_of, types);
+                    rewrite_block(&mut continuing, f, scalar_of, types);
+                    block.push(Statement::Loop { body, continuing, break_if }, span);
+                }
+                Statement::Switch { selector, mut cases } => {
+                    for c in cases.iter_mut() {
+                        rewrite_block(&mut c.body, f, scalar_of, types);
+                    }
+                    block.push(Statement::Switch { selector, cases }, span);
+                }
+                other => block.push(other, span),
+            }
+        }
+    }
+    let handles: Vec<_> = module.functions.iter().map(|(h, _)| h).collect();
+    for h in handles {
+        fix(&mut module.functions[h], &info[h]);
+    }
+    for (i, ep) in module.entry_points.iter_mut().enumerate() {
+        fix(&mut ep.function, info.get_entry_point(i));
+    }
+}
+
+pub(super) fn image_atomics_on() -> bool {
+    crate::iris::image_atomics()
 }

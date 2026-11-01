@@ -28,97 +28,61 @@ You need the Horizon launcher with native mods (Settings → Game → Native mod
 
 The mod is pinned to these exact commits. The launcher reads them from `horizon-native.json`.
 
-- Horizon `a734600373ed0da15ba6128a62cddc768d0bbc61` (main on 2026-10-31).
-- horizon-mixins `4342a0bfbe71d4d14185528d64e496d6022f16a1` (main on 2026-10-31). The hooks need
-  its support for `format!` and the other standard macros in hooked functions.
+- Horizon `10b16c4b94d6ebdf3234545f53243c6466dfa32c` (main on 2026-11-01).
+- horizon-mixins `4342a0bfbe71d4d14185528d64e496d6022f16a1` (main on 2026-10-31).
 
-A Horizon Nightly with other changes needs the mod rebuilt against it. Run `tools/build.py` with
-`HORIZON` set to the new commit. A hook whose target changed reports a diagnostic naming that
-function.
+## Since 0.1.26: built on Horizon's own Iris support
+
+Horizon now runs much of what this mod used to add itself: compute programs, images, storage
+buffers, custom textures, geometry stages for terrain's shadow, struct varyings and a Shader
+Options page. From 0.1.26 the mod keeps Horizon's implementation and adds only what packs still
+need on top of it.
 
 ## What it adds
 
-| Iris feature | What the mod does |
+| Area | What the mod does |
 |---|---|
-| Macros | Defines `IS_IRIS`, `IRIS_VERSION` (11103), `IRIS_FEATURE_SSBO`, `IRIS_FEATURE_CUSTOM_IMAGES`, `IRIS_FEATURE_COMPUTE_SHADERS`, `IRIS_FEATURE_CUSTOM_TEXTURE_NAME`, and `MC_GL_ARB_shader_image_load_store` (the GL extension Iris reports for images; Eclipse's floodfill coloured lighting is off without it) |
-| Options in `.properties` | `#if` on the pack's options in `shaders.properties`/`block.properties`, and option values inside `uniform.*`/`variable.*` expressions |
-| `smooth()` timing | Custom uniforms' `smooth(x, up, down)` take half-lives in tenths of a second, as in Iris; Horizon alone reads them as seconds, 10x slower |
-| View bobbing | In `gbufferModelView`, not `gbufferProjection`, as Iris has it (packs read the projection as a plain perspective; otherwise clouds and lighting sway with each step) |
-| Matrix components in custom uniforms | `m.i.j` is GLSL's `m[i][j]` (column, row), as in Iris; Horizon alone reads row, column (so the sun's world direction turned with the camera) |
-| Translucent particles | `gbuffers_particles_translucent` draws the particles on the translucent layer (campfire smoke, splashes...) with its own blend, the others draw with `gbuffers_particles`. `particles.ordering=mixed` draws the opaque ones before deferred and the translucent ones after, as Iris does (Horizon alone drew every particle with `gbuffers_particles` after deferred, so Eclipse's particles came out as raw G-buffer data) |
-| Rain and snow depth | Weather writes depth only with `rain.depth=true`, as in Iris (Horizon alone always wrote it, so Eclipse took each whole rain quad for a surface in front of the camera: dark boxes, discoloured streaks, and the wrong lighting behind them) |
-| `at_midBlock` | Flat terrain draws give each vertex its offset to the block's centre (in 64ths), as Iris does. Eclipse's floodfill voxelises blocks there; without it each block landed on whichever neighbouring voxel its corners rounded to, and that changed as the camera moved |
-| Rain, snow and clouds that start later | Horizon dropped a pack's rain, snow and `gbuffers_clouds` passes on the first frame without them (a world loaded in clear weather), then drew its own rain into the pack's image: drops that showed block textures and an unlit scene behind them. The passes now stay |
-| Shader options | Options → Mods → Iris Features lists the running pack's own options as Iris's shader pack screen has them: its screens and sub-screens, profiles, and the names its `lang/` files give options and values. A click moves an option to its next value (Shift+click: the one before); **Apply** writes Iris's own `shaderpacks/<pack>.txt` (only values that differ from the pack's defaults, so the file moves between Iris and Horizon) and loads the pack again. The page's last switch, **Floodfill diagnostics in the log**, writes the floodfill voxels and light totals of four frames in a row to the game log every few seconds, and the voxels near the camera whose light kept changing (with the block ids around them), for reporting flickering lights. Switches (`#define X` / `//#define X`), value options (`#define X 2 // [1 2 3]`, the list anywhere in the comment) and `const` options (`shadowMapResolution`, `sunPathRotation`) all work, in the programs and in `.properties` conditions |
-| Block ids for floodfill | Flat draws know a face's sprite, not its block, and Horizon gave each sprite the id most of its blocks have: an unlit furnace's sides were the lit furnace's (194), pumpkins were jack o'lanterns, and one block's faces could carry two ids, so Eclipse's voxels held whichever face the GPU drew last (lights that flickered). The mod picks the id by sprite **and** by how brightly the face's block glows (the HDR tier Horizon puts in each vertex colour), counts blocks without an id, and leaves a shared sprite's faces out of the voxels when the block's other faces place it. Redstone dust gets its power's id from its tint |
-| Translucent held items | Held items with translucent texels (stained glass, ice, slime) draw with the pack's `gbuffers_hand_water` after translucent terrain, as in Iris; the rest with `gbuffers_hand`. Horizon drew all of them with `gbuffers_hand`, which Eclipse dithers (grainy) |
-| Block outline | Drawn by the mod after the pack's deferred programs, into the buffer translucent terrain draws to, black at 40% (Horizon drew it before them, where packs lit and reflected it as the block behind it) |
-| GPU errors | Logged once each instead of ending the game while a pack runs |
-| `layer.*` in block.properties | Held blocks the pack moves to its translucent layer (Eclipse's and Complementary's `layer.translucent = glass glass_pane`) draw translucent, with `gbuffers_hand_water` |
-| Terrain alpha test | Terrain's cutout faces (leaves, plants, campfires) shed texels below alpha 0.1, as Iris tests its cutout layers, also for packs that declare their outputs; solid faces aren't tested |
-| Distant terrain | While a pack runs, distant terrain meshes each block's face on its own: merged runs repeat their texture through Horizon's sampler, which a pack's atlas lookups can't (grass sides stretched across far hills) |
-| `mc_midTexCoord` | The middle of the quad's own texture coordinates, as Iris gives it, not of its sprite (packs that rebuild the tile from it stretched grass sides) |
-| `bufferObject.N` | Storage buffers (fixed or screen-relative), at set 0 binding 1000 + N |
-| `image.*` | Images, cleared per frame when asked, sized by the screen or fixed, readable through their sampler name |
-| `customTexture.*`, `texture.noise`, `texture.<stage>.<sampler>` | PNG and raw (`RGBA8`) textures, 1D/2D/3D. As in Iris, `texture.<stage>.colortexN` replaces buffer N in that stage's programs until one of them has written the buffer (Eclipse's blue noise in `colortex6`) |
-| Compute programs | `setup`, `begin`, `shadowcomp`, `prepare`, `deferred` and `composite` `.csh` files (with `_a`..`_z` suffixes), with `workGroups`/`workGroupsRender`. Each runs before the program of its own stage and number |
-| Iris uniforms | `currentPlayerHealth/Hunger/Air` (0 to 1) and their maximums, `firstPersonCamera`, `isSpectator`, `playerLookVector`, `is_burning/hurt/invisible/on_ground/sneaking/sprinting`, `isRightHanded`, `alphaTestRef` (0.1: cutout textures like plants and leaves) |
-| `normals`/`specular` | Without a PBR resource pack: a flat normal, and zeros |
-| Geometry stages | A `.gsh` that emits one triangle per triangle (Eclipse's terrain and beacon ones, with shader grass off) is skipped and the program runs without it |
-| GLSL that Iris's drivers accept | `const` initialised with function calls, interface blocks, bool members of storage buffers, `ivec % int`, swizzles of shadow lookups, functions that end without a `return`, matrix-column swizzle assignments, `sampler`/`image` used as names, mixed `ivec`/`uvec` comparisons, and vector components passed to `out`/`inout` parameters; also `dot` of two floats, `vec % int` with a constant, struct varyings, `float[6] name` struct members, functions called before they are defined, unmatched `#endif` (ignored, as Iris's preprocessor does), `texture.<stage>.<sampler>.N` keys, and SNORM raw textures |
+| GLSL that Iris's drivers accept | naga's GLSL frontend, vendored with fixes (`vendor/naga-glsl`), tried first, with Horizon's own frontend as the fallback: `const in` parameters, interface blocks (`out DATA { ... } data_out;`), `bool` members of storage buffers, functions that end without `return`, `ivec % int`, swizzles of shadow lookups, relational comparisons of mixed types, matrix-column swizzle assignments, `dot` of two floats, `textureGather`/`textureGatherOffset(s)`/`textureQueryLod`, `texelFetch2D`/`textureSize2D`, memory barriers, `texture` and `sampler`/`image` used as names, integer varyings made flat, `type[N] name` declarations, implicit-LOD lookups outside fragment stages, and passes over the parsed module (workgroup barriers, vector modulo, struct strides, callees before callers, atomics, vertex-stage voxel stores) |
+| `setup.csh`, `begin.csh` | Run before the frame's prepare programs (Eclipse's block table and sun/moon data). Setup runs every frame here |
+| 1D images | `image.<name>` with a single size (Eclipse's `imgBlockData`) |
+| Geometry stages | One that emits one triangle per triangle (Eclipse's terrain stage with shader grass off) is skipped and the program runs without it |
+| Macros | `IRIS_VERSION` 11103, `MC_NORMAL_MAP`, `MC_SPECULAR_MAP`, `MC_GL_ARB_shader_image_load_store`, `MC_GL_ARB_texture_gather`, `MC_GL_EXT_gpu_shader4` (Eclipse's "Install Iris Extension" warning, Bliss's normals) |
+| Options in custom uniforms | `uniform.*`/`variable.*` expressions read the pack's options as their values |
+| Iris's player uniforms | `currentPlayerHealth/Hunger/Air/Armor` and maximums, `isSpectator`, `is_burning/hurt/invisible/on_ground/sneaking/sprinting`, `lightningBoltPosition` (no bolt) |
+| `normals`/`specular` | Without a PBR resource pack: a flat normal and zeros (Horizon's white stand-in made every surface metal, smooth and glowing) |
+| `texture.<stage>.colortexN` | Stands in for buffer N only until a program has written it, as in Iris (Eclipse's blue noise in colortex6, before its bloom) |
+| Terrain alpha test | Cutout faces (leaves, plants, campfires) shed texels below alpha 0.1, as Iris tests its cutout layers, also with declared outputs; solid faces aren't tested |
+| `mc_midTexCoord` | The middle of the quad's own texture coordinates, not of its sprite (stretched grass sides) |
+| Distant terrain | While a pack runs, distant faces are meshed a block each (grass sides stretched across far hills) |
+
+## Not carried over from 0.1.25 yet
+
+These worked on the old Horizon and still need porting onto Horizon's new pack renderer:
+
+- Translucent held items with `gbuffers_hand_water` (stained glass in hand grainy on Eclipse).
+- The block outline drawn after the pack's deferred programs (it can look reflective).
+- Block ids by sprite and glow for floodfill (lights that flicker with some blocks).
+- `gbuffers_particles_translucent`, rain depth with `rain.depth`, GPU errors logged instead of
+  ending the game.
 
 ## Limits
 
-- **Geometry and tessellation shaders that add geometry are impossible on wgpu.** Eclipse's shader
-  grass (`SHADER_GRASS_SETTING`, off by default) can't run. Turning it on makes the terrain
-  program skip with a note in the log.
-- Image atomics are translated only as statements (`imageAtomicMax(img, p, v);`); their return
-  value isn't available. Buffer atomics (`atomicAdd` on buffers) are not translated.
-- Other Iris packs, in the software-Vulkan harness: Bliss, Pegasus, Sildur's Vibrant and Just
-  Colored Lighting render; Luster and Reverie build but come out black, Noble white. Buffer
-  atomics (`atomicAdd`) aren't translated yet.
-- The mod carries its own copy of naga's GLSL frontend (`vendor/naga-glsl`, MIT or Apache-2.0,
-  changes listed in its README): naga's own refuses GLSL that Iris packs rely on (array
-  members of plain structs, `ivec2 % int`, `f().x`, `float a[4], b[4]`).
-- `lightningBoltPosition` always reads "no bolt", so lightning doesn't cast Eclipse's lightning
-  shadows.
-- The options page is a list of buttons (what Horizon gives native mods): an option with many
-  values (sliders in Iris) is stepped through a click at a time, and the pack's descriptions of
-  its options (Iris's tooltips) aren't shown.
-- Flat draws carry a face's sprite and glow, not its block: two blocks that share every sprite
-  and glow alike but have different ids in `block.properties` still look alike to the pack.
-- Writing images or buffers from a vertex stage needs the GPU's `VERTEX_WRITABLE_STORAGE`. Most
-  Vulkan, DX12 and Metal GPUs have it; without it, those programs are skipped with a note.
-- Testing so far: the bundle was applied with `horizon-mixins apply` to pristine Horizon
-  `a734600` and the whole game compiled with `--locked` (Cargo.lock unchanged, no warnings).
-  Horizon's 752 renderer tests pass; the two `crash::` tests fail without the mod too.
-- Unmodified Eclipse ran on that build under Mesa's software Vulkan driver (lavapipe) in all
-  three dimensions. All 15 post passes and 8 compute programs ran with no GPU errors, and the
-  sky, clouds and textured moon rendered. That was over an empty world: it has not been tested
-  on a real GPU, in the game itself, or with terrain in view. Later tests drew terrain, water, particles
-  and rain; floodfill voxelises terrain in the shadow pass and spreads light from glowstone, steadily
-  frame to frame with the camera walking and turning, and only from the faces whose glow says so.
-- The options are read from unmodified Eclipse as Iris reads them (762 options, 83 screens, 11
-  profiles; the default profile shows as "High"), and values written back reach both the programs
-  and `shaders.properties`. The page itself was tested on its own (cycling, profiles, screens,
-  Apply), not in the running game.
+- Geometry and tessellation stages that add geometry can't run on wgpu (Eclipse's shader grass).
+- Testing: applied with `horizon-mixins apply` to pristine Horizon `10b16c4`, the whole game
+  compiled with `--locked` and no warnings; Horizon's 810 renderer tests pass (the two `crash::`
+  tests fail without the mod too); of the shader crate's 93 tests, one fails by design
+  (`the_alpha_test_discards_below_its_reference`: Iris tests alpha with declared outputs too).
+- Under Mesa's software Vulkan driver, over a test scene: Eclipse, Bliss, BSL, Complementary,
+  Solas, Sildur's, Pegasus, Rethinking Voxels and Just Colored Lighting render; Reverie renders
+  dark; Noble comes out white; Luster, Nostalgia and Photon black.
 
 ## How it is built
 
-`tools/build.py` assembles the bundle from the reference implementation (Horizon branch
-`iris-features`) and the pinned pristine source. Support modules carry the new code. Cancellable
-HEAD hooks replace a handful of entry points: `load_post`, the translator,
-`Pack::read_text` (the player's option values), `FrameUniforms::eval_custom`,
-`PackPost::{bind, run, run_shadow, prepare_entities, draw_entities, draw_weather, draw_clouds}`,
-`PackAtlas::terrain_inputs` and the game's `shader_pack_inputs`; the options page uses Horizon's
-native-mod hook points (`native_mods`, `native_settings`, `native_settings_click`). RETURN hooks
-add the device features. horizon-mixins can't add struct
-fields to functions that use closures, so a pack's GPU resources are kept beside its `PackPost`,
-keyed by one of its textures.
-
-To rebuild the bundle, apply `reference.patch` to Horizon `a734600`, then copy the changed files into
-`ref/` (same paths) and run `tools/build.py` and `tools/package.py`. `tools/stage.sh` applies the bundle to a pristine
-export for checking.
+The mod's changes are made in place on Horizon's branch `iris-dev` (`reference.patch`; the
+changed and translator files in `ref/`). `tools/build.py` copies each changed function into a
+module of the mod beside the original and hooks the original to call the copy;
+`tools/build_tests.py` writes the test harness as a bundle of its own; `tools/stage.sh` applies
+the bundles to a pristine export; `tools/package.py` writes `dist/`.
 
 ## Licence
 

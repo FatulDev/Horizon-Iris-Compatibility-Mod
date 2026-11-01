@@ -168,7 +168,6 @@ impl Error {
 
 /// A collection of errors returned during shader parsing.
 #[derive(Clone, Debug)]
-#[cfg_attr(test, derive(PartialEq))]
 pub struct ParseErrors {
     pub errors: Vec<Error>,
 }

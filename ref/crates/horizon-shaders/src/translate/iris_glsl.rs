@@ -1,0 +1,11422 @@
+#[allow(dead_code, unused_imports, unused_variables, unused_mut, unused_assignments, clippy::all)]
+pub mod frontend {
+/*!
+Frontend for [GLSL][glsl] (OpenGL Shading Language).
+
+To begin, take a look at the documentation for the [`Frontend`].
+
+# Supported versions
+## Vulkan
+- 440 (partial)
+- 450
+- 460
+
+[glsl]: https://www.khronos.org/registry/OpenGL/index_gl.php
+*/
+
+pub use ast::{Precision, Profile};
+pub use error::{Error, ErrorKind, ExpectedToken, ParseErrors};
+pub use token::TokenValue;
+
+use std::{string::String, vec::Vec};
+
+use naga::{proc::Layouter, FastHashMap, FastHashSet, Handle, Module, ShaderStage, Span, Type};
+use ast::{EntryArg, FunctionDeclaration, GlobalLookup};
+use parser::ParsingContext;
+
+/// Logging is left out (the frontend's own `log` calls).
+macro_rules! no_log {
+    ($($t:tt)*) => {};
+}
+pub(crate) use no_log;
+
+/// A set of flags (what the frontend's two `bitflags` types need of the crate).
+macro_rules! flags {
+    ($(#[$m:meta])* $vis:vis struct $name:ident: u32 { $($(#[$cm:meta])* const $flag:ident = $value:expr;)* }) => {
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+        $vis struct $name(u32);
+        #[allow(dead_code)]
+        impl $name {
+            $(pub const $flag: Self = Self($value);)*
+            pub const fn empty() -> Self { Self(0) }
+            pub const fn bits(&self) -> u32 { self.0 }
+            pub const fn contains(&self, other: Self) -> bool { self.0 & other.0 == other.0 }
+            pub const fn intersects(&self, other: Self) -> bool { self.0 & other.0 != 0 }
+            pub fn insert(&mut self, other: Self) { self.0 |= other.0; }
+            pub fn remove(&mut self, other: Self) { self.0 &= !other.0; }
+            pub const fn is_empty(&self) -> bool { self.0 == 0 }
+        }
+        impl core::ops::BitOr for $name { type Output = Self; fn bitor(self, o: Self) -> Self { Self(self.0 | o.0) } }
+        impl core::ops::BitOrAssign for $name { fn bitor_assign(&mut self, o: Self) { self.0 |= o.0; } }
+        impl core::ops::BitAnd for $name { type Output = Self; fn bitand(self, o: Self) -> Self { Self(self.0 & o.0) } }
+        impl core::ops::Sub for $name { type Output = Self; fn sub(self, o: Self) -> Self { Self(self.0 & !o.0) } }
+    };
+}
+pub(crate) use flags;
+
+/// The literal a constant expression comes to: a literal, a scalar's zero, or a constant's.
+pub(crate) fn const_val<T, E>(
+    module: &naga::Module,
+    handle: naga::Handle<naga::Expression>,
+    arena: &naga::Arena<naga::Expression>,
+) -> core::result::Result<T, naga::proc::ConstValueError>
+where
+    T: TryFrom<naga::Literal, Error = E>,
+    E: Into<naga::proc::ConstValueError>,
+{
+    let get = |handle: naga::Handle<naga::Expression>, arena: &naga::Arena<naga::Expression>| match arena[handle] {
+        naga::Expression::Literal(literal) => Some(literal),
+        naga::Expression::ZeroValue(ty) => match module.types[ty].inner {
+            naga::TypeInner::Scalar(scalar) => naga::Literal::zero(scalar),
+            _ => None,
+        },
+        _ => None,
+    };
+    let value = match arena[handle] {
+        naga::Expression::Constant(c) => get(module.constants[c].init, &module.global_expressions),
+        _ => get(handle, arena),
+    };
+    match value {
+        Some(v) => v.try_into().map_err(Into::into),
+        None => Err(naga::proc::ConstValueError::NonConst),
+    }
+}
+
+mod ast {
+use std::{borrow::Cow, string::String, vec::Vec};
+use core::fmt;
+
+use super::{builtins::MacroCall, Span};
+use naga::{
+    AddressSpace, BinaryOperator, Binding, Constant, Expression, Function, GlobalVariable, Handle,
+    Interpolation, Literal, Override, Sampling, StorageAccess, Type, UnaryOperator,
+};
+
+#[derive(Debug, Clone, Copy)]
+pub enum GlobalLookupKind {
+    Variable(Handle<GlobalVariable>),
+    Constant(Handle<Constant>, Handle<Type>),
+    Override(Handle<Override>, Handle<Type>),
+    BlockSelect(Handle<GlobalVariable>, u32),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GlobalLookup {
+    pub kind: GlobalLookupKind,
+    pub entry_arg: Option<usize>,
+    pub mutable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParameterInfo {
+    pub qualifier: ParameterQualifier,
+    /// Whether the parameter should be treated as a depth image instead of a
+    /// sampled image.
+    pub depth: bool,
+}
+
+/// How the function is implemented
+#[derive(Clone, Copy)]
+pub enum FunctionKind {
+    /// The function is user defined
+    Call(Handle<Function>),
+    /// The function is a builtin
+    Macro(MacroCall),
+}
+
+impl fmt::Debug for FunctionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Call(_) => write!(f, "Call"),
+            Self::Macro(_) => write!(f, "Macro"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Overload {
+    /// Normalized function parameters, modifiers are not applied
+    pub parameters: Vec<Handle<Type>>,
+    pub parameters_info: Vec<ParameterInfo>,
+    /// How the function is implemented
+    pub kind: FunctionKind,
+    /// Whether this function was already defined or is just a prototype
+    pub defined: bool,
+    /// Whether this overload is the one provided by the language or has
+    /// been redeclared by the user (builtins only)
+    pub internal: bool,
+    /// Whether or not this function returns void (nothing)
+    pub void: bool,
+}
+
+crate::translate::iris_glsl::frontend::flags! {
+    /// Tracks the variations of the builtin already generated, this is needed because some
+    /// builtins overloads can't be generated unless explicitly used, since they might cause
+    /// unneeded capabilities to be requested
+    pub struct BuiltinVariations: u32 {
+        /// Request the standard overloads
+        const STANDARD = 1 << 0;
+        /// Request overloads that use the double type
+        const DOUBLE = 1 << 1;
+        /// Request overloads that use `samplerCubeArray(Shadow)`
+        const CUBE_TEXTURES_ARRAY = 1 << 2;
+        /// Request overloads that use `sampler2DMSArray`
+        const D2_MULTI_TEXTURES_ARRAY = 1 << 3;
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct FunctionDeclaration {
+    pub overloads: Vec<Overload>,
+    /// Tracks the builtin overload variations that were already generated
+    pub variations: BuiltinVariations,
+}
+
+#[derive(Debug)]
+pub struct EntryArg {
+    pub name: Option<String>,
+    pub binding: Binding,
+    pub handle: Handle<GlobalVariable>,
+    pub storage: StorageQualifier,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariableReference {
+    pub expr: Handle<Expression>,
+    /// Whether the variable is of a pointer type (and needs loading) or not
+    pub load: bool,
+    /// Whether the value of the variable can be changed or not
+    pub mutable: bool,
+    pub constant: Option<(Handle<Constant>, Handle<Type>)>,
+    pub entry_arg: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HirExpr {
+    pub kind: HirExprKind,
+    pub meta: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum HirExprKind {
+    /// Represents a sequence of expressions. It returns the type and value of the last (i.e. right-most) expression.
+    Sequence {
+        exprs: Vec<Handle<HirExpr>>,
+    },
+    Access {
+        base: Handle<HirExpr>,
+        index: Handle<HirExpr>,
+    },
+    Select {
+        base: Handle<HirExpr>,
+        field: String,
+    },
+    Literal(Literal),
+    Binary {
+        left: Handle<HirExpr>,
+        op: BinaryOperator,
+        right: Handle<HirExpr>,
+    },
+    Unary {
+        op: UnaryOperator,
+        expr: Handle<HirExpr>,
+    },
+    Variable(VariableReference),
+    Call(FunctionCall),
+    /// Represents the ternary operator in glsl (`:?`)
+    Conditional {
+        /// The expression that will decide which branch to take, must evaluate to a boolean
+        condition: Handle<HirExpr>,
+        /// The expression that will be evaluated if [`condition`] returns `true`
+        ///
+        /// [`condition`]: Self::Conditional::condition
+        accept: Handle<HirExpr>,
+        /// The expression that will be evaluated if [`condition`] returns `false`
+        ///
+        /// [`condition`]: Self::Conditional::condition
+        reject: Handle<HirExpr>,
+    },
+    Assign {
+        tgt: Handle<HirExpr>,
+        value: Handle<HirExpr>,
+    },
+    /// A prefix/postfix operator like `++`
+    PrePostfix {
+        /// The operation to be performed
+        op: BinaryOperator,
+        /// Whether this is a postfix or a prefix
+        postfix: bool,
+        /// The target expression
+        expr: Handle<HirExpr>,
+    },
+    /// A method call like `what.something(a, b, c)`
+    Method {
+        /// expression the method call applies to (`what` in the example)
+        expr: Handle<HirExpr>,
+        /// the method name (`something` in the example)
+        name: String,
+        /// the arguments to the method (`a`, `b`, and `c` in the example)
+        args: Vec<Handle<HirExpr>>,
+    },
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub enum QualifierKey<'a> {
+    String(Cow<'a, str>),
+    /// Used for `std140` and `std430` layout qualifiers
+    Layout,
+    /// Used for image formats
+    Format,
+    /// Used for `index` layout qualifiers
+    Index,
+}
+
+#[derive(Debug)]
+pub enum QualifierValue {
+    None,
+    Uint(u32),
+    Layout(StructLayout),
+    Format(naga::StorageFormat),
+}
+
+#[derive(Debug, Default)]
+pub struct TypeQualifiers<'a> {
+    pub span: Span,
+    pub storage: (StorageQualifier, Span),
+    pub invariant: Option<Span>,
+    pub interpolation: Option<(Interpolation, Span)>,
+    pub precision: Option<(Precision, Span)>,
+    pub sampling: Option<(Sampling, Span)>,
+    /// Memory qualifiers used in the declaration to set the storage access to be used
+    /// in declarations that support it (storage images and buffers)
+    pub storage_access: Option<(StorageAccess, Span)>,
+    pub layout_qualifiers: naga::FastHashMap<QualifierKey<'a>, (QualifierValue, Span)>,
+}
+
+impl<'a> TypeQualifiers<'a> {
+    /// Appends `errors` with errors for all unused qualifiers
+    pub fn unused_errors(&self, errors: &mut Vec<super::Error>) {
+        if let Some(meta) = self.invariant {
+            errors.push(super::Error {
+                kind: super::ErrorKind::SemanticError(
+                    "Invariant qualifier can only be used in in/out variables".into(),
+                ),
+                meta,
+            });
+        }
+
+        if let Some((_, meta)) = self.interpolation {
+            errors.push(super::Error {
+                kind: super::ErrorKind::SemanticError(
+                    "Interpolation qualifiers can only be used in in/out variables".into(),
+                ),
+                meta,
+            });
+        }
+
+        if let Some((_, meta)) = self.sampling {
+            errors.push(super::Error {
+                kind: super::ErrorKind::SemanticError(
+                    "Sampling qualifiers can only be used in in/out variables".into(),
+                ),
+                meta,
+            });
+        }
+
+        if let Some((_, meta)) = self.storage_access {
+            errors.push(super::Error {
+                kind: super::ErrorKind::SemanticError(
+                    "Memory qualifiers can only be used in storage variables".into(),
+                ),
+                meta,
+            });
+        }
+
+        for &(_, meta) in self.layout_qualifiers.values() {
+            errors.push(super::Error {
+                kind: super::ErrorKind::SemanticError("Unexpected qualifier".into()),
+                meta,
+            });
+        }
+    }
+
+    /// Removes the layout qualifier with `name`, if it exists and adds an error if it isn't
+    /// a [`QualifierValue::Uint`]
+    pub fn uint_layout_qualifier(
+        &mut self,
+        name: &'a str,
+        errors: &mut Vec<super::Error>,
+    ) -> Option<u32> {
+        match self
+            .layout_qualifiers
+            .remove(&QualifierKey::String(name.into()))
+        {
+            Some((QualifierValue::Uint(v), _)) => Some(v),
+            Some((_, meta)) => {
+                errors.push(super::Error {
+                    kind: super::ErrorKind::SemanticError("Qualifier expects a uint value".into()),
+                    meta,
+                });
+                // Return a dummy value instead of `None` to differentiate from
+                // the qualifier not existing, since some parts might require the
+                // qualifier to exist and throwing another error that it doesn't
+                // exist would be unhelpful
+                Some(0)
+            }
+            _ => None,
+        }
+    }
+
+    /// Removes the layout qualifier with `name`, if it exists and adds an error if it isn't
+    /// a [`QualifierValue::None`]
+    pub fn none_layout_qualifier(&mut self, name: &'a str, errors: &mut Vec<super::Error>) -> bool {
+        match self
+            .layout_qualifiers
+            .remove(&QualifierKey::String(name.into()))
+        {
+            Some((QualifierValue::None, _)) => true,
+            Some((_, meta)) => {
+                errors.push(super::Error {
+                    kind: super::ErrorKind::SemanticError(
+                        "Qualifier doesn't expect a value".into(),
+                    ),
+                    meta,
+                });
+                // Return a `true` to since the qualifier is defined and adding
+                // another error for it not being defined would be unhelpful
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum FunctionCallKind {
+    TypeConstructor(Handle<Type>),
+    Function(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionCall {
+    pub kind: FunctionCallKind,
+    pub args: Vec<Handle<HirExpr>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StorageQualifier {
+    AddressSpace(AddressSpace),
+    Input,
+    Output,
+    Const,
+}
+
+impl Default for StorageQualifier {
+    fn default() -> Self {
+        StorageQualifier::AddressSpace(AddressSpace::Function)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructLayout {
+    Std140,
+    Std430,
+}
+
+// TODO: Encode precision hints in the IR
+/// A precision hint used in GLSL declarations.
+///
+/// Precision hints can be used to either speed up shader execution or control
+/// the precision of arithmetic operations.
+///
+/// To use a precision hint simply add it before the type in the declaration.
+/// ```glsl
+/// mediump float a;
+/// ```
+///
+/// The default when no precision is declared is `highp` which means that all
+/// operations operate with the type defined width.
+///
+/// For `mediump` and `lowp` operations follow the spir-v
+/// [`RelaxedPrecision`][RelaxedPrecision] decoration semantics.
+///
+/// [RelaxedPrecision]: https://www.khronos.org/registry/SPIR-V/specs/unified1/SPIRV.html#_a_id_relaxedprecisionsection_a_relaxed_precision
+#[derive(Debug, Clone, PartialEq, Copy)]
+pub enum Precision {
+    /// `lowp` precision
+    Low,
+    /// `mediump` precision
+    Medium,
+    /// `highp` precision
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Copy)]
+pub enum ParameterQualifier {
+    In,
+    Out,
+    InOut,
+    Const,
+}
+
+impl ParameterQualifier {
+    /// Returns true if the argument should be passed as a lhs expression
+    pub const fn is_lhs(&self) -> bool {
+        match *self {
+            ParameterQualifier::Out | ParameterQualifier::InOut => true,
+            _ => false,
+        }
+    }
+}
+
+/// The GLSL profile used by a shader.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Profile {
+    /// The `core` profile, default when no profile is specified.
+    Core,
+}
+
+}
+mod builtins {
+use std::{vec, vec::Vec};
+
+use super::{
+    ast::{
+        BuiltinVariations, FunctionDeclaration, FunctionKind, Overload, ParameterInfo,
+        ParameterQualifier,
+    },
+    context::Context,
+    Error, ErrorKind, Frontend, Result,
+};
+use naga::{
+    BinaryOperator, DerivativeAxis as Axis, DerivativeControl as Ctrl, Expression, Handle,
+    ImageClass, ImageDimension as Dim, ImageQuery, MathFunction, Module, RelationalFunction,
+    SampleLevel, Scalar, ScalarKind as Sk, Span, Type, TypeInner, UnaryOperator, VectorSize,
+};
+
+const fn dummy_storage_format(kind: naga::ScalarKind) -> naga::StorageFormat {
+    {
+        match kind {
+            Sk::Sint => naga::StorageFormat::R16Sint,
+            Sk::Uint => naga::StorageFormat::R16Uint,
+            _ => naga::StorageFormat::R16Float,
+        }
+    }
+}
+
+/// Helper function, to create a function prototype for a builtin
+fn add_builtin(this: &mut Module, args: Vec<TypeInner>, builtin: MacroCall) -> Overload {
+    {
+        let mut parameters = Vec::with_capacity(args.len());
+        let mut parameters_info = Vec::with_capacity(args.len());
+
+        for arg in args {
+            parameters.push(this.types.insert(
+                Type {
+                    name: None,
+                    inner: arg,
+                },
+                Span::default(),
+            ));
+            parameters_info.push(ParameterInfo {
+                qualifier: ParameterQualifier::In,
+                depth: false,
+            });
+        }
+
+        Overload {
+            parameters,
+            parameters_info,
+            kind: FunctionKind::Macro(builtin),
+            defined: false,
+            internal: true,
+            void: false,
+        }
+    }
+}
+
+const fn make_coords_arg(number_of_components: usize, kind: Sk) -> TypeInner {
+    let scalar = Scalar { kind, width: 4 };
+
+    match number_of_components {
+        1 => TypeInner::Scalar(scalar),
+        _ => TypeInner::Vector {
+            size: match number_of_components {
+                2 => VectorSize::Bi,
+                3 => VectorSize::Tri,
+                _ => VectorSize::Quad,
+            },
+            scalar,
+        },
+    }
+}
+
+/// Inject builtins into the declaration
+///
+/// This is done to not add a large startup cost and not increase memory
+/// usage if it isn't needed.
+pub fn inject_builtin(
+    declaration: &mut FunctionDeclaration,
+    module: &mut Module,
+    name: &str,
+    mut variations: BuiltinVariations,
+) {
+    crate::translate::iris_glsl::frontend::no_log!(
+        "{} variations: {:?} {:?}",
+        name,
+        variations,
+        declaration.variations
+    );
+    // Don't regeneate variations
+    variations.remove(declaration.variations);
+    declaration.variations |= variations;
+
+    if variations.contains(BuiltinVariations::STANDARD) {
+        inject_standard_builtins(declaration, module, name)
+    }
+
+    if variations.contains(BuiltinVariations::DOUBLE) {
+        inject_double_builtin(declaration, module, name)
+    }
+
+    match name {
+        "texture"
+        | "textureGrad"
+        | "textureGradOffset"
+        | "textureLod"
+        | "textureLodOffset"
+        | "textureOffset"
+        | "textureProj"
+        | "textureProjGrad"
+        | "textureProjGradOffset"
+        | "textureProjLod"
+        | "textureProjLodOffset"
+        | "textureProjOffset" => {
+            let f = |kind, dim, arrayed, multi, shadow| {
+                for bits in 0..=0b11 {
+                    let variant = bits & 0b1 != 0;
+                    let bias = bits & 0b10 != 0;
+
+                    let (proj, offset, level_type) = match name {
+                        // texture(gsampler, gvec P, [float bias]);
+                        "texture" => (false, false, TextureLevelType::None),
+                        // textureGrad(gsampler, gvec P, gvec dPdx, gvec dPdy);
+                        "textureGrad" => (false, false, TextureLevelType::Grad),
+                        // textureGradOffset(gsampler, gvec P, gvec dPdx, gvec dPdy, ivec offset);
+                        "textureGradOffset" => (false, true, TextureLevelType::Grad),
+                        // textureLod(gsampler, gvec P, float lod);
+                        "textureLod" => (false, false, TextureLevelType::Lod),
+                        // textureLodOffset(gsampler, gvec P, float lod, ivec offset);
+                        "textureLodOffset" => (false, true, TextureLevelType::Lod),
+                        // textureOffset(gsampler, gvec+1 P, ivec offset, [float bias]);
+                        "textureOffset" => (false, true, TextureLevelType::None),
+                        // textureProj(gsampler, gvec+1 P, [float bias]);
+                        "textureProj" => (true, false, TextureLevelType::None),
+                        // textureProjGrad(gsampler, gvec+1 P, gvec dPdx, gvec dPdy);
+                        "textureProjGrad" => (true, false, TextureLevelType::Grad),
+                        // textureProjGradOffset(gsampler, gvec+1 P, gvec dPdx, gvec dPdy, ivec offset);
+                        "textureProjGradOffset" => (true, true, TextureLevelType::Grad),
+                        // textureProjLod(gsampler, gvec+1 P, float lod);
+                        "textureProjLod" => (true, false, TextureLevelType::Lod),
+                        // textureProjLodOffset(gsampler, gvec+1 P, gvec dPdx, gvec dPdy, ivec offset);
+                        "textureProjLodOffset" => (true, true, TextureLevelType::Lod),
+                        // textureProjOffset(gsampler, gvec+1 P, ivec offset, [float bias]);
+                        "textureProjOffset" => (true, true, TextureLevelType::None),
+                        _ => unreachable!(),
+                    };
+
+                    let builtin = MacroCall::Texture {
+                        proj,
+                        offset,
+                        shadow,
+                        level_type,
+                    };
+
+                    // Parse out the variant settings.
+                    let grad = level_type == TextureLevelType::Grad;
+                    let lod = level_type == TextureLevelType::Lod;
+
+                    let supports_variant = proj && !shadow;
+                    if variant && !supports_variant {
+                        continue;
+                    }
+
+                    if bias && !matches!(level_type, TextureLevelType::None) {
+                        continue;
+                    }
+
+                    // Proj doesn't work with arrayed or Cube
+                    if proj && (arrayed || dim == Dim::Cube) {
+                        continue;
+                    }
+
+                    // texture operations with offset are not supported for cube maps
+                    if dim == Dim::Cube && offset {
+                        continue;
+                    }
+
+                    // sampler2DArrayShadow can't be used in textureLod or in texture with bias
+                    if (lod || bias) && arrayed && shadow && dim == Dim::D2 {
+                        continue;
+                    }
+
+                    // TODO: glsl supports using bias with depth samplers but naga doesn't
+                    if bias && shadow {
+                        continue;
+                    }
+
+                    let class = match shadow {
+                        true => ImageClass::Depth { multi },
+                        false => ImageClass::Sampled { kind, multi },
+                    };
+
+                    let image = TypeInner::Image {
+                        dim,
+                        arrayed,
+                        class,
+                    };
+
+                    let num_coords_from_dim = image_dims_to_coords_size(dim).min(3);
+                    let mut num_coords = num_coords_from_dim;
+
+                    if shadow && proj {
+                        num_coords = 4;
+                    } else if dim == Dim::D1 && shadow {
+                        num_coords = 3;
+                    } else if shadow {
+                        num_coords += 1;
+                    } else if proj {
+                        if variant && num_coords == 4 {
+                            // Normal form already has 4 components, no need to have a variant form.
+                            continue;
+                        } else if variant {
+                            num_coords = 4;
+                        } else {
+                            num_coords += 1;
+                        }
+                    }
+
+                    if !(dim == Dim::D1 && shadow) {
+                        num_coords += arrayed as usize;
+                    }
+
+                    // Special case: texture(gsamplerCubeArrayShadow) kicks the shadow compare ref to a separate argument,
+                    // since it would otherwise take five arguments. It also can't take a bias, nor can it be proj/grad/lod/offset
+                    // (presumably because nobody asked for it, and implementation complexity?)
+                    if num_coords >= 5 {
+                        if lod || grad || offset || proj || bias {
+                            continue;
+                        }
+                        debug_assert!(dim == Dim::Cube && shadow && arrayed);
+                    }
+                    debug_assert!(num_coords <= 5);
+
+                    let vector = make_coords_arg(num_coords, Sk::Float);
+                    let mut args = vec![image, vector];
+
+                    if num_coords == 5 {
+                        args.push(TypeInner::Scalar(Scalar::F32));
+                    }
+
+                    match level_type {
+                        TextureLevelType::Lod => {
+                            args.push(TypeInner::Scalar(Scalar::F32));
+                        }
+                        TextureLevelType::Grad => {
+                            args.push(make_coords_arg(num_coords_from_dim, Sk::Float));
+                            args.push(make_coords_arg(num_coords_from_dim, Sk::Float));
+                        }
+                        TextureLevelType::None => {}
+                    };
+
+                    if offset {
+                        args.push(make_coords_arg(num_coords_from_dim, Sk::Sint));
+                    }
+
+                    if bias {
+                        args.push(TypeInner::Scalar(Scalar::F32));
+                    }
+
+                    declaration
+                        .overloads
+                        .push(add_builtin(module, args, builtin));
+                }
+            };
+
+            texture_args_generator(TextureArgsOptions::SHADOW | variations.into(), f)
+        }
+        "textureSize" => {
+            let f = |kind, dim, arrayed, multi, shadow| {
+                let class = match shadow {
+                    true => ImageClass::Depth { multi },
+                    false => ImageClass::Sampled { kind, multi },
+                };
+
+                let image = TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class,
+                };
+
+                let mut args = vec![image];
+
+                if !multi {
+                    args.push(TypeInner::Scalar(Scalar::I32))
+                }
+
+                declaration
+                    .overloads
+                    .push(add_builtin(module, args, MacroCall::TextureSize { arrayed }))
+            };
+
+            texture_args_generator(
+                TextureArgsOptions::SHADOW | TextureArgsOptions::MULTI | variations.into(),
+                f,
+            )
+        }
+        "textureQueryLevels" => {
+            let f = |kind, dim, arrayed, multi, shadow| {
+                let class = match shadow {
+                    true => ImageClass::Depth { multi },
+                    false => ImageClass::Sampled { kind, multi },
+                };
+
+                let image = TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class,
+                };
+
+                declaration
+                    .overloads
+                    .push(add_builtin(module, vec![image], MacroCall::TextureQueryLevels))
+            };
+
+            texture_args_generator(TextureArgsOptions::SHADOW | variations.into(), f)
+        }
+        "texelFetch" | "texelFetchOffset" => {
+            let offset = "texelFetchOffset" == name;
+            let f = |kind, dim, arrayed, multi, _shadow| {
+                // Cube images aren't supported
+                if let Dim::Cube = dim {
+                    return;
+                }
+
+                let image = TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class: ImageClass::Sampled { kind, multi },
+                };
+
+                let dim_value = image_dims_to_coords_size(dim);
+                let coordinates = make_coords_arg(dim_value + arrayed as usize, Sk::Sint);
+
+                let mut args = vec![image, coordinates, TypeInner::Scalar(Scalar::I32)];
+
+                if offset {
+                    args.push(make_coords_arg(dim_value, Sk::Sint));
+                }
+
+                declaration
+                    .overloads
+                    .push(add_builtin(module, args, MacroCall::ImageLoad { multi }))
+            };
+
+            // Don't generate shadow images since they aren't supported
+            texture_args_generator(TextureArgsOptions::MULTI | variations.into(), f)
+        }
+        "imageSize" => {
+            let f = |kind: Sk, dim, arrayed, _, _| {
+                // Naga doesn't support cube images and it's usefulness
+                // is questionable, so they won't be supported for now
+                if dim == Dim::Cube {
+                    return;
+                }
+
+                let image = TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class: ImageClass::Storage {
+                        format: dummy_storage_format(kind),
+                        access: naga::StorageAccess::empty(),
+                    },
+                };
+
+                declaration
+                    .overloads
+                    .push(add_builtin(module, vec![image], MacroCall::TextureSize { arrayed }))
+            };
+
+            texture_args_generator(variations.into(), f)
+        }
+        "imageLoad" => {
+            let f = |kind: Sk, dim, arrayed, _, _| {
+                // Naga doesn't support cube images and it's usefulness
+                // is questionable, so they won't be supported for now
+                if dim == Dim::Cube {
+                    return;
+                }
+
+                let image = TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class: ImageClass::Storage {
+                        format: dummy_storage_format(kind),
+                        access: naga::StorageAccess::LOAD,
+                    },
+                };
+
+                let dim_value = image_dims_to_coords_size(dim);
+                let mut coord_size = dim_value + arrayed as usize;
+                // > Every OpenGL API call that operates on cubemap array
+                // > textures takes layer-faces, not array layers
+                //
+                // So this means that imageCubeArray only takes a three component
+                // vector coordinate and the third component is a layer index.
+                if Dim::Cube == dim && arrayed {
+                    coord_size = 3
+                }
+                let coordinates = make_coords_arg(coord_size, Sk::Sint);
+
+                let args = vec![image, coordinates];
+
+                declaration
+                    .overloads
+                    .push(add_builtin(module, args, MacroCall::ImageLoad { multi: false }))
+            };
+
+            // Don't generate shadow nor multisampled images since they aren't supported
+            texture_args_generator(variations.into(), f)
+        }
+        "imageStore" => {
+            let f = |kind: Sk, dim, arrayed, _, _| {
+                // Naga doesn't support cube images and it's usefulness
+                // is questionable, so they won't be supported for now
+                if dim == Dim::Cube {
+                    return;
+                }
+
+                let image = TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class: ImageClass::Storage {
+                        format: dummy_storage_format(kind),
+                        access: naga::StorageAccess::STORE,
+                    },
+                };
+
+                let dim_value = image_dims_to_coords_size(dim);
+                let mut coord_size = dim_value + arrayed as usize;
+                // > Every OpenGL API call that operates on cubemap array
+                // > textures takes layer-faces, not array layers
+                //
+                // So this means that imageCubeArray only takes a three component
+                // vector coordinate and the third component is a layer index.
+                if Dim::Cube == dim && arrayed {
+                    coord_size = 3
+                }
+                let coordinates = make_coords_arg(coord_size, Sk::Sint);
+
+                let args = vec![
+                    image,
+                    coordinates,
+                    TypeInner::Vector {
+                        size: VectorSize::Quad,
+                        scalar: Scalar { kind, width: 4 },
+                    },
+                ];
+
+                let mut overload = add_builtin(module, args, MacroCall::ImageStore);
+                overload.void = true;
+                declaration.overloads.push(overload)
+            };
+
+            // Don't generate shadow nor multisampled images since they aren't supported
+            texture_args_generator(variations.into(), f)
+        }
+        _ => {}
+    }
+}
+
+/// Injects the builtins into declaration that don't need any special variations
+fn inject_standard_builtins(
+    declaration: &mut FunctionDeclaration,
+    module: &mut Module,
+    name: &str,
+) {
+    // Some samplers (sampler1D, etc...) can be float, int, or uint
+    let anykind_sampler = if name.starts_with("sampler") {
+        Some((name, Sk::Float))
+    } else if name.starts_with("usampler") {
+        Some((&name[1..], Sk::Uint))
+    } else if name.starts_with("isampler") {
+        Some((&name[1..], Sk::Sint))
+    } else {
+        None
+    };
+    if let Some((sampler, kind)) = anykind_sampler {
+        match sampler {
+            "sampler1D" | "sampler1DArray" | "sampler2D" | "sampler2DArray" | "sampler2DMS"
+            | "sampler2DMSArray" | "sampler3D" | "samplerCube" | "samplerCubeArray" => {
+                declaration.overloads.push(add_builtin(module, 
+                    vec![
+                        TypeInner::Image {
+                            dim: match sampler {
+                                "sampler1D" | "sampler1DArray" => Dim::D1,
+                                "sampler2D" | "sampler2DArray" | "sampler2DMS"
+                                | "sampler2DMSArray" => Dim::D2,
+                                "sampler3D" => Dim::D3,
+                                _ => Dim::Cube,
+                            },
+                            arrayed: matches!(
+                                sampler,
+                                "sampler1DArray"
+                                    | "sampler2DArray"
+                                    | "sampler2DMSArray"
+                                    | "samplerCubeArray"
+                            ),
+                            class: ImageClass::Sampled {
+                                kind,
+                                multi: matches!(sampler, "sampler2DMS" | "sampler2DMSArray"),
+                            },
+                        },
+                        TypeInner::Sampler { comparison: false },
+                    ],
+                    MacroCall::Sampler,
+                ));
+                return;
+            }
+            _ => (),
+        }
+    }
+
+    match name {
+        // Shadow sampler can only be of kind `Sk::Float`
+        "sampler1DShadow"
+        | "sampler1DArrayShadow"
+        | "sampler2DShadow"
+        | "sampler2DArrayShadow"
+        | "samplerCubeShadow"
+        | "samplerCubeArrayShadow" => {
+            let dim = match name {
+                "sampler1DShadow" | "sampler1DArrayShadow" => Dim::D1,
+                "sampler2DShadow" | "sampler2DArrayShadow" => Dim::D2,
+                _ => Dim::Cube,
+            };
+            let arrayed = matches!(
+                name,
+                "sampler1DArrayShadow" | "sampler2DArrayShadow" | "samplerCubeArrayShadow"
+            );
+
+            for i in 0..2 {
+                let ty = TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class: match i {
+                        0 => ImageClass::Sampled {
+                            kind: Sk::Float,
+                            multi: false,
+                        },
+                        _ => ImageClass::Depth { multi: false },
+                    },
+                };
+
+                declaration.overloads.push(add_builtin(module, 
+                    vec![ty, TypeInner::Sampler { comparison: true }],
+                    MacroCall::SamplerShadow,
+                ))
+            }
+        }
+        "sin" | "exp" | "exp2" | "sinh" | "cos" | "cosh" | "tan" | "tanh" | "acos" | "asin"
+        | "log" | "log2" | "radians" | "degrees" | "asinh" | "acosh" | "atanh"
+        | "floatBitsToInt" | "floatBitsToUint" | "dFdx" | "dFdxFine" | "dFdxCoarse" | "dFdy"
+        | "dFdyFine" | "dFdyCoarse" | "fwidth" | "fwidthFine" | "fwidthCoarse" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            for bits in 0..0b100 {
+                let size = match bits {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+                let scalar = Scalar::F32;
+
+                declaration.overloads.push(add_builtin(module, 
+                    vec![match size {
+                        Some(size) => TypeInner::Vector { size, scalar },
+                        None => TypeInner::Scalar(scalar),
+                    }],
+                    match name {
+                        "sin" => MacroCall::MathFunction(MathFunction::Sin),
+                        "exp" => MacroCall::MathFunction(MathFunction::Exp),
+                        "exp2" => MacroCall::MathFunction(MathFunction::Exp2),
+                        "sinh" => MacroCall::MathFunction(MathFunction::Sinh),
+                        "cos" => MacroCall::MathFunction(MathFunction::Cos),
+                        "cosh" => MacroCall::MathFunction(MathFunction::Cosh),
+                        "tan" => MacroCall::MathFunction(MathFunction::Tan),
+                        "tanh" => MacroCall::MathFunction(MathFunction::Tanh),
+                        "acos" => MacroCall::MathFunction(MathFunction::Acos),
+                        "asin" => MacroCall::MathFunction(MathFunction::Asin),
+                        "log" => MacroCall::MathFunction(MathFunction::Log),
+                        "log2" => MacroCall::MathFunction(MathFunction::Log2),
+                        "asinh" => MacroCall::MathFunction(MathFunction::Asinh),
+                        "acosh" => MacroCall::MathFunction(MathFunction::Acosh),
+                        "atanh" => MacroCall::MathFunction(MathFunction::Atanh),
+                        "radians" => MacroCall::MathFunction(MathFunction::Radians),
+                        "degrees" => MacroCall::MathFunction(MathFunction::Degrees),
+                        "floatBitsToInt" => MacroCall::BitCast(Sk::Sint),
+                        "floatBitsToUint" => MacroCall::BitCast(Sk::Uint),
+                        "dFdxCoarse" => MacroCall::Derivate(Axis::X, Ctrl::Coarse),
+                        "dFdyCoarse" => MacroCall::Derivate(Axis::Y, Ctrl::Coarse),
+                        "fwidthCoarse" => MacroCall::Derivate(Axis::Width, Ctrl::Coarse),
+                        "dFdxFine" => MacroCall::Derivate(Axis::X, Ctrl::Fine),
+                        "dFdyFine" => MacroCall::Derivate(Axis::Y, Ctrl::Fine),
+                        "fwidthFine" => MacroCall::Derivate(Axis::Width, Ctrl::Fine),
+                        "dFdx" => MacroCall::Derivate(Axis::X, Ctrl::None),
+                        "dFdy" => MacroCall::Derivate(Axis::Y, Ctrl::None),
+                        "fwidth" => MacroCall::Derivate(Axis::Width, Ctrl::None),
+                        _ => unreachable!(),
+                    },
+                ))
+            }
+        }
+        "intBitsToFloat" | "uintBitsToFloat" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            for bits in 0..0b100 {
+                let size = match bits {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+                let scalar = match name {
+                    "intBitsToFloat" => Scalar::I32,
+                    _ => Scalar::U32,
+                };
+
+                declaration.overloads.push(add_builtin(module, 
+                    vec![match size {
+                        Some(size) => TypeInner::Vector { size, scalar },
+                        None => TypeInner::Scalar(scalar),
+                    }],
+                    MacroCall::BitCast(Sk::Float),
+                ))
+            }
+        }
+        "pow" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            for bits in 0..0b100 {
+                let size = match bits {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+                let scalar = Scalar::F32;
+                let ty = || match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                };
+
+                declaration.overloads.push(
+                    add_builtin(module, vec![ty(), ty()], MacroCall::MathFunction(MathFunction::Pow)),
+                )
+            }
+        }
+        "abs" | "sign" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            // bit 2 - float/sint
+            for bits in 0..0b1000 {
+                let size = match bits & 0b11 {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+                let scalar = match bits >> 2 {
+                    0b0 => Scalar::F32,
+                    _ => Scalar::I32,
+                };
+
+                let args = vec![match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                }];
+
+                declaration.overloads.push(add_builtin(module, 
+                    args,
+                    MacroCall::MathFunction(match name {
+                        "abs" => MathFunction::Abs,
+                        "sign" => MathFunction::Sign,
+                        _ => unreachable!(),
+                    }),
+                ))
+            }
+        }
+        "bitCount" | "bitfieldReverse" | "bitfieldExtract" | "bitfieldInsert" | "findLSB"
+        | "findMSB" => {
+            let fun = match name {
+                "bitCount" => MathFunction::CountOneBits,
+                "bitfieldReverse" => MathFunction::ReverseBits,
+                "bitfieldExtract" => MathFunction::ExtractBits,
+                "bitfieldInsert" => MathFunction::InsertBits,
+                "findLSB" => MathFunction::FirstTrailingBit,
+                "findMSB" => MathFunction::FirstLeadingBit,
+                _ => unreachable!(),
+            };
+
+            let mc = match fun {
+                MathFunction::ExtractBits => MacroCall::BitfieldExtract,
+                MathFunction::InsertBits => MacroCall::BitfieldInsert,
+                _ => MacroCall::MathFunction(fun),
+            };
+
+            // bits layout
+            // bit 0 - int/uint
+            // bit 1 through 2 - dims
+            for bits in 0..0b1000 {
+                let scalar = match bits & 0b1 {
+                    0b0 => Scalar::I32,
+                    _ => Scalar::U32,
+                };
+                let size = match bits >> 1 {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+
+                let ty = || match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                };
+
+                let mut args = vec![ty()];
+
+                match fun {
+                    MathFunction::ExtractBits => {
+                        args.push(TypeInner::Scalar(Scalar::I32));
+                        args.push(TypeInner::Scalar(Scalar::I32));
+                    }
+                    MathFunction::InsertBits => {
+                        args.push(ty());
+                        args.push(TypeInner::Scalar(Scalar::I32));
+                        args.push(TypeInner::Scalar(Scalar::I32));
+                    }
+                    _ => {}
+                }
+
+                // we need to cast the return type of findLsb / findMsb
+                let mc = if scalar.kind == Sk::Uint {
+                    match mc {
+                        MacroCall::MathFunction(MathFunction::FirstTrailingBit) => {
+                            MacroCall::FindLsbUint
+                        }
+                        MacroCall::MathFunction(MathFunction::FirstLeadingBit) => {
+                            MacroCall::FindMsbUint
+                        }
+                        mc => mc,
+                    }
+                } else {
+                    mc
+                };
+
+                declaration.overloads.push(add_builtin(module, args, mc))
+            }
+        }
+        "packSnorm4x8" | "packUnorm4x8" | "packSnorm2x16" | "packUnorm2x16" | "packHalf2x16" => {
+            let fun = match name {
+                "packSnorm4x8" => MathFunction::Pack4x8snorm,
+                "packUnorm4x8" => MathFunction::Pack4x8unorm,
+                "packSnorm2x16" => MathFunction::Pack2x16snorm,
+                "packUnorm2x16" => MathFunction::Pack2x16unorm,
+                "packHalf2x16" => MathFunction::Pack2x16float,
+                _ => unreachable!(),
+            };
+
+            let ty = match fun {
+                MathFunction::Pack4x8snorm | MathFunction::Pack4x8unorm => TypeInner::Vector {
+                    size: VectorSize::Quad,
+                    scalar: Scalar::F32,
+                },
+                MathFunction::Pack2x16unorm
+                | MathFunction::Pack2x16snorm
+                | MathFunction::Pack2x16float => TypeInner::Vector {
+                    size: VectorSize::Bi,
+                    scalar: Scalar::F32,
+                },
+                _ => unreachable!(),
+            };
+
+            let args = vec![ty];
+
+            declaration
+                .overloads
+                .push(add_builtin(module, args, MacroCall::MathFunction(fun)));
+        }
+        "unpackSnorm4x8" | "unpackUnorm4x8" | "unpackSnorm2x16" | "unpackUnorm2x16"
+        | "unpackHalf2x16" => {
+            let fun = match name {
+                "unpackSnorm4x8" => MathFunction::Unpack4x8snorm,
+                "unpackUnorm4x8" => MathFunction::Unpack4x8unorm,
+                "unpackSnorm2x16" => MathFunction::Unpack2x16snorm,
+                "unpackUnorm2x16" => MathFunction::Unpack2x16unorm,
+                "unpackHalf2x16" => MathFunction::Unpack2x16float,
+                _ => unreachable!(),
+            };
+
+            let args = vec![TypeInner::Scalar(Scalar::U32)];
+
+            declaration
+                .overloads
+                .push(add_builtin(module, args, MacroCall::MathFunction(fun)));
+        }
+        "atan" => {
+            // bits layout
+            // bit 0 - atan/atan2
+            // bit 1 through 2 - dims
+            for bits in 0..0b1000 {
+                let fun = match bits & 0b1 {
+                    0b0 => MathFunction::Atan,
+                    _ => MathFunction::Atan2,
+                };
+                let size = match bits >> 1 {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+                let scalar = Scalar::F32;
+                let ty = || match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                };
+
+                let mut args = vec![ty()];
+
+                if fun == MathFunction::Atan2 {
+                    args.push(ty())
+                }
+
+                declaration
+                    .overloads
+                    .push(add_builtin(module, args, MacroCall::MathFunction(fun)))
+            }
+        }
+        "all" | "any" | "not" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            for bits in 0..0b11 {
+                let size = match bits {
+                    0b00 => VectorSize::Bi,
+                    0b01 => VectorSize::Tri,
+                    _ => VectorSize::Quad,
+                };
+
+                let args = vec![TypeInner::Vector {
+                    size,
+                    scalar: Scalar::BOOL,
+                }];
+
+                let fun = match name {
+                    "all" => MacroCall::Relational(RelationalFunction::All),
+                    "any" => MacroCall::Relational(RelationalFunction::Any),
+                    "not" => MacroCall::Unary(UnaryOperator::LogicalNot),
+                    _ => unreachable!(),
+                };
+
+                declaration.overloads.push(add_builtin(module, args, fun))
+            }
+        }
+        "lessThan" | "greaterThan" | "lessThanEqual" | "greaterThanEqual" => {
+            for bits in 0..0b1001 {
+                let (size, scalar) = match bits {
+                    0b0000 => (VectorSize::Bi, Scalar::F32),
+                    0b0001 => (VectorSize::Tri, Scalar::F32),
+                    0b0010 => (VectorSize::Quad, Scalar::F32),
+                    0b0011 => (VectorSize::Bi, Scalar::I32),
+                    0b0100 => (VectorSize::Tri, Scalar::I32),
+                    0b0101 => (VectorSize::Quad, Scalar::I32),
+                    0b0110 => (VectorSize::Bi, Scalar::U32),
+                    0b0111 => (VectorSize::Tri, Scalar::U32),
+                    _ => (VectorSize::Quad, Scalar::U32),
+                };
+
+                let ty = || TypeInner::Vector { size, scalar };
+                let args = vec![ty(), ty()];
+
+                let fun = MacroCall::Binary(match name {
+                    "lessThan" => BinaryOperator::Less,
+                    "greaterThan" => BinaryOperator::Greater,
+                    "lessThanEqual" => BinaryOperator::LessEqual,
+                    "greaterThanEqual" => BinaryOperator::GreaterEqual,
+                    _ => unreachable!(),
+                });
+
+                declaration.overloads.push(add_builtin(module, args, fun))
+            }
+        }
+        "equal" | "notEqual" => {
+            for bits in 0..0b1100 {
+                let (size, scalar) = match bits {
+                    0b0000 => (VectorSize::Bi, Scalar::F32),
+                    0b0001 => (VectorSize::Tri, Scalar::F32),
+                    0b0010 => (VectorSize::Quad, Scalar::F32),
+                    0b0011 => (VectorSize::Bi, Scalar::I32),
+                    0b0100 => (VectorSize::Tri, Scalar::I32),
+                    0b0101 => (VectorSize::Quad, Scalar::I32),
+                    0b0110 => (VectorSize::Bi, Scalar::U32),
+                    0b0111 => (VectorSize::Tri, Scalar::U32),
+                    0b1000 => (VectorSize::Quad, Scalar::U32),
+                    0b1001 => (VectorSize::Bi, Scalar::BOOL),
+                    0b1010 => (VectorSize::Tri, Scalar::BOOL),
+                    _ => (VectorSize::Quad, Scalar::BOOL),
+                };
+
+                let ty = || TypeInner::Vector { size, scalar };
+                let args = vec![ty(), ty()];
+
+                let fun = MacroCall::Binary(match name {
+                    "equal" => BinaryOperator::Equal,
+                    "notEqual" => BinaryOperator::NotEqual,
+                    _ => unreachable!(),
+                });
+
+                declaration.overloads.push(add_builtin(module, args, fun))
+            }
+        }
+        "min" | "max" => {
+            // bits layout
+            // bit 0 through 1 - scalar kind
+            // bit 2 through 4 - dims
+            for bits in 0..0b11100 {
+                let scalar = match bits & 0b11 {
+                    0b00 => Scalar::F32,
+                    0b01 => Scalar::I32,
+                    0b10 => Scalar::U32,
+                    _ => continue,
+                };
+                let (size, second_size) = match bits >> 2 {
+                    0b000 => (None, None),
+                    0b001 => (Some(VectorSize::Bi), None),
+                    0b010 => (Some(VectorSize::Tri), None),
+                    0b011 => (Some(VectorSize::Quad), None),
+                    0b100 => (Some(VectorSize::Bi), Some(VectorSize::Bi)),
+                    0b101 => (Some(VectorSize::Tri), Some(VectorSize::Tri)),
+                    _ => (Some(VectorSize::Quad), Some(VectorSize::Quad)),
+                };
+
+                let args = vec![
+                    match size {
+                        Some(size) => TypeInner::Vector { size, scalar },
+                        None => TypeInner::Scalar(scalar),
+                    },
+                    match second_size {
+                        Some(size) => TypeInner::Vector { size, scalar },
+                        None => TypeInner::Scalar(scalar),
+                    },
+                ];
+
+                let fun = match name {
+                    "max" => MacroCall::Splatted(MathFunction::Max, size, 1),
+                    "min" => MacroCall::Splatted(MathFunction::Min, size, 1),
+                    _ => unreachable!(),
+                };
+
+                declaration.overloads.push(add_builtin(module, args, fun))
+            }
+        }
+        "mix" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            // bit 2 through 4 - types
+            //
+            // 0b10011 is the last element since splatted single elements
+            // were already added
+            for bits in 0..0b10011 {
+                let size = match bits & 0b11 {
+                    0b00 => Some(VectorSize::Bi),
+                    0b01 => Some(VectorSize::Tri),
+                    0b10 => Some(VectorSize::Quad),
+                    _ => None,
+                };
+                let (scalar, splatted, boolean) = match bits >> 2 {
+                    0b000 => (Scalar::I32, false, true),
+                    0b001 => (Scalar::U32, false, true),
+                    0b010 => (Scalar::F32, false, true),
+                    0b011 => (Scalar::F32, false, false),
+                    _ => (Scalar::F32, true, false),
+                };
+
+                let ty = |scalar| match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                };
+                let args = vec![
+                    ty(scalar),
+                    ty(scalar),
+                    match (boolean, splatted) {
+                        (true, _) => ty(Scalar::BOOL),
+                        (_, false) => TypeInner::Scalar(scalar),
+                        _ => ty(scalar),
+                    },
+                ];
+
+                declaration.overloads.push(add_builtin(module, 
+                    args,
+                    match boolean {
+                        true => MacroCall::MixBoolean,
+                        false => MacroCall::Splatted(MathFunction::Mix, size, 2),
+                    },
+                ))
+            }
+        }
+        "clamp" => {
+            // bits layout
+            // bit 0 through 1 - float/int/uint
+            // bit 2 through 3 - dims
+            // bit 4 - splatted
+            //
+            // 0b11010 is the last element since splatted single elements
+            // were already added
+            for bits in 0..0b11011 {
+                let scalar = match bits & 0b11 {
+                    0b00 => Scalar::F32,
+                    0b01 => Scalar::I32,
+                    0b10 => Scalar::U32,
+                    _ => continue,
+                };
+                let size = match (bits >> 2) & 0b11 {
+                    0b00 => Some(VectorSize::Bi),
+                    0b01 => Some(VectorSize::Tri),
+                    0b10 => Some(VectorSize::Quad),
+                    _ => None,
+                };
+                let splatted = bits & 0b10000 == 0b10000;
+
+                let base_ty = || match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                };
+                let limit_ty = || match splatted {
+                    true => TypeInner::Scalar(scalar),
+                    false => base_ty(),
+                };
+
+                let args = vec![base_ty(), limit_ty(), limit_ty()];
+
+                declaration
+                    .overloads
+                    .push(add_builtin(module, args, MacroCall::Clamp(size)))
+            }
+        }
+        "barrier" => declaration
+            .overloads
+            .push(add_builtin(module, Vec::new(), MacroCall::Barrier)),
+        // Add common builtins with floats
+        _ => inject_common_builtin(declaration, module, name, 4),
+    }
+}
+
+/// Injects the builtins into declaration that need doubles
+fn inject_double_builtin(declaration: &mut FunctionDeclaration, module: &mut Module, name: &str) {
+    match name {
+        "abs" | "sign" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            for bits in 0..0b100 {
+                let size = match bits {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+                let scalar = Scalar::F64;
+
+                let args = vec![match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                }];
+
+                declaration.overloads.push(add_builtin(module, 
+                    args,
+                    MacroCall::MathFunction(match name {
+                        "abs" => MathFunction::Abs,
+                        "sign" => MathFunction::Sign,
+                        _ => unreachable!(),
+                    }),
+                ))
+            }
+        }
+        "min" | "max" => {
+            // bits layout
+            // bit 0 through 2 - dims
+            for bits in 0..0b111 {
+                let (size, second_size) = match bits {
+                    0b000 => (None, None),
+                    0b001 => (Some(VectorSize::Bi), None),
+                    0b010 => (Some(VectorSize::Tri), None),
+                    0b011 => (Some(VectorSize::Quad), None),
+                    0b100 => (Some(VectorSize::Bi), Some(VectorSize::Bi)),
+                    0b101 => (Some(VectorSize::Tri), Some(VectorSize::Tri)),
+                    _ => (Some(VectorSize::Quad), Some(VectorSize::Quad)),
+                };
+                let scalar = Scalar::F64;
+
+                let args = vec![
+                    match size {
+                        Some(size) => TypeInner::Vector { size, scalar },
+                        None => TypeInner::Scalar(scalar),
+                    },
+                    match second_size {
+                        Some(size) => TypeInner::Vector { size, scalar },
+                        None => TypeInner::Scalar(scalar),
+                    },
+                ];
+
+                let fun = match name {
+                    "max" => MacroCall::Splatted(MathFunction::Max, size, 1),
+                    "min" => MacroCall::Splatted(MathFunction::Min, size, 1),
+                    _ => unreachable!(),
+                };
+
+                declaration.overloads.push(add_builtin(module, args, fun))
+            }
+        }
+        "mix" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            // bit 2 through 3 - splatted/boolean
+            //
+            // 0b1010 is the last element since splatted with single elements
+            // is equal to normal single elements
+            for bits in 0..0b1011 {
+                let size = match bits & 0b11 {
+                    0b00 => Some(VectorSize::Quad),
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => None,
+                };
+                let scalar = Scalar::F64;
+                let (splatted, boolean) = match bits >> 2 {
+                    0b00 => (false, false),
+                    0b01 => (false, true),
+                    _ => (true, false),
+                };
+
+                let ty = |scalar| match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                };
+                let args = vec![
+                    ty(scalar),
+                    ty(scalar),
+                    match (boolean, splatted) {
+                        (true, _) => ty(Scalar::BOOL),
+                        (_, false) => TypeInner::Scalar(scalar),
+                        _ => ty(scalar),
+                    },
+                ];
+
+                declaration.overloads.push(add_builtin(module, 
+                    args,
+                    match boolean {
+                        true => MacroCall::MixBoolean,
+                        false => MacroCall::Splatted(MathFunction::Mix, size, 2),
+                    },
+                ))
+            }
+        }
+        "clamp" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            // bit 2 - splatted
+            //
+            // 0b110 is the last element since splatted with single elements
+            // is equal to normal single elements
+            for bits in 0..0b111 {
+                let scalar = Scalar::F64;
+                let size = match bits & 0b11 {
+                    0b00 => Some(VectorSize::Bi),
+                    0b01 => Some(VectorSize::Tri),
+                    0b10 => Some(VectorSize::Quad),
+                    _ => None,
+                };
+                let splatted = bits & 0b100 == 0b100;
+
+                let base_ty = || match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                };
+                let limit_ty = || match splatted {
+                    true => TypeInner::Scalar(scalar),
+                    false => base_ty(),
+                };
+
+                let args = vec![base_ty(), limit_ty(), limit_ty()];
+
+                declaration
+                    .overloads
+                    .push(add_builtin(module, args, MacroCall::Clamp(size)))
+            }
+        }
+        "lessThan" | "greaterThan" | "lessThanEqual" | "greaterThanEqual" | "equal"
+        | "notEqual" => {
+            let scalar = Scalar::F64;
+            for bits in 0..0b11 {
+                let size = match bits {
+                    0b00 => VectorSize::Bi,
+                    0b01 => VectorSize::Tri,
+                    _ => VectorSize::Quad,
+                };
+
+                let ty = || TypeInner::Vector { size, scalar };
+                let args = vec![ty(), ty()];
+
+                let fun = MacroCall::Binary(match name {
+                    "lessThan" => BinaryOperator::Less,
+                    "greaterThan" => BinaryOperator::Greater,
+                    "lessThanEqual" => BinaryOperator::LessEqual,
+                    "greaterThanEqual" => BinaryOperator::GreaterEqual,
+                    "equal" => BinaryOperator::Equal,
+                    "notEqual" => BinaryOperator::NotEqual,
+                    _ => unreachable!(),
+                });
+
+                declaration.overloads.push(add_builtin(module, args, fun))
+            }
+        }
+        // Add common builtins with doubles
+        _ => inject_common_builtin(declaration, module, name, 8),
+    }
+}
+
+/// Injects the builtins into declaration that can used either float or doubles
+fn inject_common_builtin(
+    declaration: &mut FunctionDeclaration,
+    module: &mut Module,
+    name: &str,
+    float_width: naga::Bytes,
+) {
+    let float_scalar = Scalar {
+        kind: Sk::Float,
+        width: float_width,
+    };
+    match name {
+        "ceil" | "round" | "roundEven" | "floor" | "fract" | "trunc" | "sqrt" | "inversesqrt"
+        | "normalize" | "length" | "isinf" | "isnan" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            for bits in 0..0b100 {
+                let size = match bits {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+
+                let args = vec![match size {
+                    Some(size) => TypeInner::Vector {
+                        size,
+                        scalar: float_scalar,
+                    },
+                    None => TypeInner::Scalar(float_scalar),
+                }];
+
+                let fun = match name {
+                    "ceil" => MacroCall::MathFunction(MathFunction::Ceil),
+                    "round" | "roundEven" => MacroCall::MathFunction(MathFunction::Round),
+                    "floor" => MacroCall::MathFunction(MathFunction::Floor),
+                    "fract" => MacroCall::MathFunction(MathFunction::Fract),
+                    "trunc" => MacroCall::MathFunction(MathFunction::Trunc),
+                    "sqrt" => MacroCall::MathFunction(MathFunction::Sqrt),
+                    "inversesqrt" => MacroCall::MathFunction(MathFunction::InverseSqrt),
+                    "normalize" => MacroCall::MathFunction(MathFunction::Normalize),
+                    "length" => MacroCall::MathFunction(MathFunction::Length),
+                    "isinf" => MacroCall::Relational(RelationalFunction::IsInf),
+                    "isnan" => MacroCall::Relational(RelationalFunction::IsNan),
+                    _ => unreachable!(),
+                };
+
+                declaration.overloads.push(add_builtin(module, args, fun))
+            }
+        }
+        "dot" | "reflect" | "distance" | "ldexp" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            for bits in 0..0b100 {
+                let size = match bits {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+                let ty = |scalar| match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                };
+
+                let fun = match name {
+                    "dot" => MacroCall::MathFunction(MathFunction::Dot),
+                    "reflect" => MacroCall::MathFunction(MathFunction::Reflect),
+                    "distance" => MacroCall::MathFunction(MathFunction::Distance),
+                    "ldexp" => MacroCall::MathFunction(MathFunction::Ldexp),
+                    _ => unreachable!(),
+                };
+
+                let second_scalar = match fun {
+                    MacroCall::MathFunction(MathFunction::Ldexp) => Scalar::I32,
+                    _ => float_scalar,
+                };
+
+                declaration
+                    .overloads
+                    .push(add_builtin(module, vec![ty(float_scalar), ty(second_scalar)], fun))
+            }
+        }
+        "transpose" => {
+            // bits layout
+            // bit 0 through 3 - dims
+            for bits in 0..0b1001 {
+                let (rows, columns) = match bits {
+                    0b0000 => (VectorSize::Bi, VectorSize::Bi),
+                    0b0001 => (VectorSize::Bi, VectorSize::Tri),
+                    0b0010 => (VectorSize::Bi, VectorSize::Quad),
+                    0b0011 => (VectorSize::Tri, VectorSize::Bi),
+                    0b0100 => (VectorSize::Tri, VectorSize::Tri),
+                    0b0101 => (VectorSize::Tri, VectorSize::Quad),
+                    0b0110 => (VectorSize::Quad, VectorSize::Bi),
+                    0b0111 => (VectorSize::Quad, VectorSize::Tri),
+                    _ => (VectorSize::Quad, VectorSize::Quad),
+                };
+
+                declaration.overloads.push(add_builtin(module, 
+                    vec![TypeInner::Matrix {
+                        columns,
+                        rows,
+                        scalar: float_scalar,
+                    }],
+                    MacroCall::MathFunction(MathFunction::Transpose),
+                ))
+            }
+        }
+        "inverse" | "determinant" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            for bits in 0..0b11 {
+                let (rows, columns) = match bits {
+                    0b00 => (VectorSize::Bi, VectorSize::Bi),
+                    0b01 => (VectorSize::Tri, VectorSize::Tri),
+                    _ => (VectorSize::Quad, VectorSize::Quad),
+                };
+
+                let args = vec![TypeInner::Matrix {
+                    columns,
+                    rows,
+                    scalar: float_scalar,
+                }];
+
+                declaration.overloads.push(add_builtin(module, 
+                    args,
+                    MacroCall::MathFunction(match name {
+                        "inverse" => MathFunction::Inverse,
+                        "determinant" => MathFunction::Determinant,
+                        _ => unreachable!(),
+                    }),
+                ))
+            }
+        }
+        "mod" | "step" => {
+            // bits layout
+            // bit 0 through 2 - dims
+            for bits in 0..0b111 {
+                let (size, second_size) = match bits {
+                    0b000 => (None, None),
+                    0b001 => (Some(VectorSize::Bi), None),
+                    0b010 => (Some(VectorSize::Tri), None),
+                    0b011 => (Some(VectorSize::Quad), None),
+                    0b100 => (Some(VectorSize::Bi), Some(VectorSize::Bi)),
+                    0b101 => (Some(VectorSize::Tri), Some(VectorSize::Tri)),
+                    _ => (Some(VectorSize::Quad), Some(VectorSize::Quad)),
+                };
+
+                let mut args = Vec::with_capacity(2);
+                let step = name == "step";
+
+                for i in 0..2 {
+                    let maybe_size = match i == step as u32 {
+                        true => size,
+                        false => second_size,
+                    };
+
+                    args.push(match maybe_size {
+                        Some(size) => TypeInner::Vector {
+                            size,
+                            scalar: float_scalar,
+                        },
+                        None => TypeInner::Scalar(float_scalar),
+                    })
+                }
+
+                let fun = match name {
+                    "mod" => MacroCall::Mod(size),
+                    "step" => MacroCall::Splatted(MathFunction::Step, size, 0),
+                    _ => unreachable!(),
+                };
+
+                declaration.overloads.push(add_builtin(module, args, fun))
+            }
+        }
+        // TODO: https://github.com/gfx-rs/naga/issues/2526
+        // "modf" | "frexp" => { ... }
+        "cross" => {
+            let args = vec![
+                TypeInner::Vector {
+                    size: VectorSize::Tri,
+                    scalar: float_scalar,
+                },
+                TypeInner::Vector {
+                    size: VectorSize::Tri,
+                    scalar: float_scalar,
+                },
+            ];
+
+            declaration
+                .overloads
+                .push(add_builtin(module, args, MacroCall::MathFunction(MathFunction::Cross)))
+        }
+        "outerProduct" => {
+            // bits layout
+            // bit 0 through 3 - dims
+            for bits in 0..0b1001 {
+                let (size1, size2) = match bits {
+                    0b0000 => (VectorSize::Bi, VectorSize::Bi),
+                    0b0001 => (VectorSize::Bi, VectorSize::Tri),
+                    0b0010 => (VectorSize::Bi, VectorSize::Quad),
+                    0b0011 => (VectorSize::Tri, VectorSize::Bi),
+                    0b0100 => (VectorSize::Tri, VectorSize::Tri),
+                    0b0101 => (VectorSize::Tri, VectorSize::Quad),
+                    0b0110 => (VectorSize::Quad, VectorSize::Bi),
+                    0b0111 => (VectorSize::Quad, VectorSize::Tri),
+                    _ => (VectorSize::Quad, VectorSize::Quad),
+                };
+
+                let args = vec![
+                    TypeInner::Vector {
+                        size: size1,
+                        scalar: float_scalar,
+                    },
+                    TypeInner::Vector {
+                        size: size2,
+                        scalar: float_scalar,
+                    },
+                ];
+
+                declaration
+                    .overloads
+                    .push(add_builtin(module, args, MacroCall::MathFunction(MathFunction::Outer)))
+            }
+        }
+        "faceforward" | "fma" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            for bits in 0..0b100 {
+                let size = match bits {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+
+                let ty = || match size {
+                    Some(size) => TypeInner::Vector {
+                        size,
+                        scalar: float_scalar,
+                    },
+                    None => TypeInner::Scalar(float_scalar),
+                };
+                let args = vec![ty(), ty(), ty()];
+
+                let fun = match name {
+                    "faceforward" => MacroCall::MathFunction(MathFunction::FaceForward),
+                    "fma" => MacroCall::MathFunction(MathFunction::Fma),
+                    _ => unreachable!(),
+                };
+
+                declaration.overloads.push(add_builtin(module, args, fun))
+            }
+        }
+        "refract" => {
+            // bits layout
+            // bit 0 through 1 - dims
+            for bits in 0..0b100 {
+                let size = match bits {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+
+                let ty = || match size {
+                    Some(size) => TypeInner::Vector {
+                        size,
+                        scalar: float_scalar,
+                    },
+                    None => TypeInner::Scalar(float_scalar),
+                };
+                let args = vec![ty(), ty(), TypeInner::Scalar(Scalar::F32)];
+                declaration
+                    .overloads
+                    .push(add_builtin(module, args, MacroCall::MathFunction(MathFunction::Refract)))
+            }
+        }
+        "smoothstep" => {
+            // bit 0 - splatted
+            // bit 1 through 2 - dims
+            for bits in 0..0b1000 {
+                let splatted = bits & 0b1 == 0b1;
+                let size = match bits >> 1 {
+                    0b00 => None,
+                    0b01 => Some(VectorSize::Bi),
+                    0b10 => Some(VectorSize::Tri),
+                    _ => Some(VectorSize::Quad),
+                };
+
+                if splatted && size.is_none() {
+                    continue;
+                }
+
+                let base_ty = || match size {
+                    Some(size) => TypeInner::Vector {
+                        size,
+                        scalar: float_scalar,
+                    },
+                    None => TypeInner::Scalar(float_scalar),
+                };
+                let ty = || match splatted {
+                    true => TypeInner::Scalar(float_scalar),
+                    false => base_ty(),
+                };
+                declaration.overloads.push(add_builtin(module, 
+                    vec![ty(), ty(), base_ty()],
+                    MacroCall::SmoothStep { splatted: size },
+                ))
+            }
+        }
+        // The function isn't a builtin or we don't yet support it
+        _ => {}
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TextureLevelType {
+    None,
+    Lod,
+    Grad,
+}
+
+/// A compiler defined builtin function
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MacroCall {
+    Sampler,
+    SamplerShadow,
+    Texture {
+        proj: bool,
+        offset: bool,
+        shadow: bool,
+        level_type: TextureLevelType,
+    },
+    TextureSize {
+        arrayed: bool,
+    },
+    TextureQueryLevels,
+    ImageLoad {
+        multi: bool,
+    },
+    ImageStore,
+    MathFunction(MathFunction),
+    FindLsbUint,
+    FindMsbUint,
+    BitfieldExtract,
+    BitfieldInsert,
+    Relational(RelationalFunction),
+    Unary(UnaryOperator),
+    Binary(BinaryOperator),
+    Mod(Option<VectorSize>),
+    Splatted(MathFunction, Option<VectorSize>, usize),
+    MixBoolean,
+    Clamp(Option<VectorSize>),
+    BitCast(Sk),
+    Derivate(Axis, Ctrl),
+    Barrier,
+    /// SmoothStep needs a separate variant because it might need it's inputs
+    /// to be splatted depending on the overload
+    SmoothStep {
+        /// The size of the splat operation if some
+        splatted: Option<VectorSize>,
+    },
+}
+
+impl MacroCall {
+    /// Adds the necessary expressions and statements to the passed body and
+    /// finally returns the final expression with the correct result
+    pub fn call(
+        &self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        args: &mut [Handle<Expression>],
+        meta: Span,
+    ) -> Result<Option<Handle<Expression>>> {
+        Ok(Some(match *self {
+            MacroCall::Sampler => {
+                ctx.samplers.insert(args[0], args[1]);
+                args[0]
+            }
+            MacroCall::SamplerShadow => {
+                sampled_to_depth(ctx, args[0], meta, &mut frontend.errors);
+                ctx.invalidate_expression(args[0], meta)?;
+                ctx.samplers.insert(args[0], args[1]);
+                args[0]
+            }
+            MacroCall::Texture {
+                proj,
+                offset,
+                shadow,
+                level_type,
+            } => {
+                let mut coords = args[1];
+
+                if proj {
+                    let size = match *ctx.resolve_type(coords, meta)? {
+                        TypeInner::Vector { size, .. } => size,
+                        _ => unreachable!(),
+                    };
+                    let mut right = ctx.add_expression(
+                        Expression::AccessIndex {
+                            base: coords,
+                            index: size as u32 - 1,
+                        },
+                        Span::default(),
+                    )?;
+                    let left = if let VectorSize::Bi = size {
+                        ctx.add_expression(
+                            Expression::AccessIndex {
+                                base: coords,
+                                index: 0,
+                            },
+                            Span::default(),
+                        )?
+                    } else {
+                        let size = match size {
+                            VectorSize::Tri => VectorSize::Bi,
+                            _ => VectorSize::Tri,
+                        };
+                        right = ctx.add_expression(
+                            Expression::Splat { size, value: right },
+                            Span::default(),
+                        )?;
+                        ctx.vector_resize(size, coords, Span::default())?
+                    };
+                    coords = ctx.add_expression(
+                        Expression::Binary {
+                            op: BinaryOperator::Divide,
+                            left,
+                            right,
+                        },
+                        Span::default(),
+                    )?;
+                }
+
+                let extra = args.get(2).copied();
+                let comps = frontend.coordinate_components(ctx, args[0], coords, extra, meta)?;
+
+                let mut num_args = 2;
+
+                if comps.used_extra {
+                    num_args += 1;
+                };
+
+                // Parse out explicit texture level.
+                let mut level = match level_type {
+                    TextureLevelType::None => SampleLevel::Auto,
+
+                    TextureLevelType::Lod => {
+                        num_args += 1;
+
+                        if shadow {
+                            crate::translate::iris_glsl::frontend::no_log!("Assuming LOD {:?} is zero", args[2],);
+
+                            SampleLevel::Zero
+                        } else {
+                            SampleLevel::Exact(args[2])
+                        }
+                    }
+
+                    TextureLevelType::Grad => {
+                        num_args += 2;
+
+                        if shadow {
+                            crate::translate::iris_glsl::frontend::no_log!(
+                                "Assuming gradients {:?} and {:?} are not greater than 1",
+                                args[2],
+                                args[3],
+                            );
+                            SampleLevel::Zero
+                        } else {
+                            SampleLevel::Gradient {
+                                x: args[2],
+                                y: args[3],
+                            }
+                        }
+                    }
+                };
+
+                let texture_offset = match offset {
+                    true => {
+                        let offset_arg = args[num_args];
+                        num_args += 1;
+                        Some(offset_arg)
+                    }
+                    false => None,
+                };
+
+                // Now go back and look for optional bias arg (if available)
+                if let TextureLevelType::None = level_type {
+                    level = args
+                        .get(num_args)
+                        .copied()
+                        .map_or(SampleLevel::Auto, SampleLevel::Bias);
+                }
+
+                texture_call(ctx, args[0], level, comps, texture_offset, meta)?
+            }
+
+            MacroCall::TextureSize { arrayed } => {
+                let mut expr = ctx.add_expression(
+                    Expression::ImageQuery {
+                        image: args[0],
+                        query: ImageQuery::Size {
+                            level: args.get(1).copied(),
+                        },
+                    },
+                    Span::default(),
+                )?;
+
+                if arrayed {
+                    let mut components = Vec::with_capacity(4);
+
+                    let size = match *ctx.resolve_type(expr, meta)? {
+                        TypeInner::Vector { size: ori_size, .. } => {
+                            for index in 0..(ori_size as u32) {
+                                components.push(ctx.add_expression(
+                                    Expression::AccessIndex { base: expr, index },
+                                    Span::default(),
+                                )?)
+                            }
+
+                            match ori_size {
+                                VectorSize::Bi => VectorSize::Tri,
+                                _ => VectorSize::Quad,
+                            }
+                        }
+                        _ => {
+                            components.push(expr);
+                            VectorSize::Bi
+                        }
+                    };
+
+                    components.push(ctx.add_expression(
+                        Expression::ImageQuery {
+                            image: args[0],
+                            query: ImageQuery::NumLayers,
+                        },
+                        Span::default(),
+                    )?);
+
+                    let ty = ctx.module.types.insert(
+                        Type {
+                            name: None,
+                            inner: TypeInner::Vector {
+                                size,
+                                scalar: Scalar::U32,
+                            },
+                        },
+                        Span::default(),
+                    );
+
+                    expr = ctx.add_expression(Expression::Compose { components, ty }, meta)?
+                }
+
+                ctx.add_expression(
+                    Expression::As {
+                        expr,
+                        kind: Sk::Sint,
+                        convert: Some(4),
+                    },
+                    Span::default(),
+                )?
+            }
+            MacroCall::TextureQueryLevels => {
+                let expr = ctx.add_expression(
+                    Expression::ImageQuery {
+                        image: args[0],
+                        query: ImageQuery::NumLevels,
+                    },
+                    Span::default(),
+                )?;
+
+                ctx.add_expression(
+                    Expression::As {
+                        expr,
+                        kind: Sk::Sint,
+                        convert: Some(4),
+                    },
+                    Span::default(),
+                )?
+            }
+            MacroCall::ImageLoad { multi } => {
+                let comps = frontend.coordinate_components(ctx, args[0], args[1], None, meta)?;
+                let (sample, level) = match (multi, args.get(2)) {
+                    (_, None) => (None, None),
+                    (true, Some(&arg)) => (Some(arg), None),
+                    (false, Some(&arg)) => (None, Some(arg)),
+                };
+                ctx.add_expression(
+                    Expression::ImageLoad {
+                        image: args[0],
+                        coordinate: comps.coordinate,
+                        array_index: comps.array_index,
+                        sample,
+                        level,
+                    },
+                    Span::default(),
+                )?
+            }
+            MacroCall::ImageStore => {
+                let comps = frontend.coordinate_components(ctx, args[0], args[1], None, meta)?;
+                ctx.emit_restart();
+                ctx.body.push(
+                    naga::Statement::ImageStore {
+                        image: args[0],
+                        coordinate: comps.coordinate,
+                        array_index: comps.array_index,
+                        value: args[2],
+                    },
+                    meta,
+                );
+                return Ok(None);
+            }
+            MacroCall::MathFunction(fun) => ctx.add_expression(
+                Expression::Math {
+                    fun,
+                    arg: args[0],
+                    arg1: args.get(1).copied(),
+                    arg2: args.get(2).copied(),
+                    arg3: args.get(3).copied(),
+                },
+                Span::default(),
+            )?,
+            mc @ (MacroCall::FindLsbUint | MacroCall::FindMsbUint) => {
+                let fun = match mc {
+                    MacroCall::FindLsbUint => MathFunction::FirstTrailingBit,
+                    MacroCall::FindMsbUint => MathFunction::FirstLeadingBit,
+                    _ => unreachable!(),
+                };
+                let res = ctx.add_expression(
+                    Expression::Math {
+                        fun,
+                        arg: args[0],
+                        arg1: None,
+                        arg2: None,
+                        arg3: None,
+                    },
+                    Span::default(),
+                )?;
+                ctx.add_expression(
+                    Expression::As {
+                        expr: res,
+                        kind: Sk::Sint,
+                        convert: Some(4),
+                    },
+                    Span::default(),
+                )?
+            }
+            MacroCall::BitfieldInsert => {
+                let conv_arg_2 = ctx.add_expression(
+                    Expression::As {
+                        expr: args[2],
+                        kind: Sk::Uint,
+                        convert: Some(4),
+                    },
+                    Span::default(),
+                )?;
+                let conv_arg_3 = ctx.add_expression(
+                    Expression::As {
+                        expr: args[3],
+                        kind: Sk::Uint,
+                        convert: Some(4),
+                    },
+                    Span::default(),
+                )?;
+                ctx.add_expression(
+                    Expression::Math {
+                        fun: MathFunction::InsertBits,
+                        arg: args[0],
+                        arg1: Some(args[1]),
+                        arg2: Some(conv_arg_2),
+                        arg3: Some(conv_arg_3),
+                    },
+                    Span::default(),
+                )?
+            }
+            MacroCall::BitfieldExtract => {
+                let conv_arg_1 = ctx.add_expression(
+                    Expression::As {
+                        expr: args[1],
+                        kind: Sk::Uint,
+                        convert: Some(4),
+                    },
+                    Span::default(),
+                )?;
+                let conv_arg_2 = ctx.add_expression(
+                    Expression::As {
+                        expr: args[2],
+                        kind: Sk::Uint,
+                        convert: Some(4),
+                    },
+                    Span::default(),
+                )?;
+                ctx.add_expression(
+                    Expression::Math {
+                        fun: MathFunction::ExtractBits,
+                        arg: args[0],
+                        arg1: Some(conv_arg_1),
+                        arg2: Some(conv_arg_2),
+                        arg3: None,
+                    },
+                    Span::default(),
+                )?
+            }
+            MacroCall::Relational(fun) => ctx.add_expression(
+                Expression::Relational {
+                    fun,
+                    argument: args[0],
+                },
+                Span::default(),
+            )?,
+            MacroCall::Unary(op) => {
+                ctx.add_expression(Expression::Unary { op, expr: args[0] }, Span::default())?
+            }
+            MacroCall::Binary(op) => ctx.add_expression(
+                Expression::Binary {
+                    op,
+                    left: args[0],
+                    right: args[1],
+                },
+                Span::default(),
+            )?,
+            MacroCall::Mod(size) => {
+                ctx.implicit_splat(&mut args[1], meta, size)?;
+
+                // x - y * floor(x / y)
+
+                let div = ctx.add_expression(
+                    Expression::Binary {
+                        op: BinaryOperator::Divide,
+                        left: args[0],
+                        right: args[1],
+                    },
+                    Span::default(),
+                )?;
+                let floor = ctx.add_expression(
+                    Expression::Math {
+                        fun: MathFunction::Floor,
+                        arg: div,
+                        arg1: None,
+                        arg2: None,
+                        arg3: None,
+                    },
+                    Span::default(),
+                )?;
+                let mult = ctx.add_expression(
+                    Expression::Binary {
+                        op: BinaryOperator::Multiply,
+                        left: floor,
+                        right: args[1],
+                    },
+                    Span::default(),
+                )?;
+                ctx.add_expression(
+                    Expression::Binary {
+                        op: BinaryOperator::Subtract,
+                        left: args[0],
+                        right: mult,
+                    },
+                    Span::default(),
+                )?
+            }
+            MacroCall::Splatted(fun, size, i) => {
+                ctx.implicit_splat(&mut args[i], meta, size)?;
+
+                ctx.add_expression(
+                    Expression::Math {
+                        fun,
+                        arg: args[0],
+                        arg1: args.get(1).copied(),
+                        arg2: args.get(2).copied(),
+                        arg3: args.get(3).copied(),
+                    },
+                    Span::default(),
+                )?
+            }
+            MacroCall::MixBoolean => ctx.add_expression(
+                Expression::Select {
+                    condition: args[2],
+                    accept: args[1],
+                    reject: args[0],
+                },
+                Span::default(),
+            )?,
+            MacroCall::Clamp(size) => {
+                ctx.implicit_splat(&mut args[1], meta, size)?;
+                ctx.implicit_splat(&mut args[2], meta, size)?;
+
+                ctx.add_expression(
+                    Expression::Math {
+                        fun: MathFunction::Clamp,
+                        arg: args[0],
+                        arg1: args.get(1).copied(),
+                        arg2: args.get(2).copied(),
+                        arg3: args.get(3).copied(),
+                    },
+                    Span::default(),
+                )?
+            }
+            MacroCall::BitCast(kind) => ctx.add_expression(
+                Expression::As {
+                    expr: args[0],
+                    kind,
+                    convert: None,
+                },
+                Span::default(),
+            )?,
+            MacroCall::Derivate(axis, ctrl) => ctx.add_expression(
+                Expression::Derivative {
+                    axis,
+                    ctrl,
+                    expr: args[0],
+                },
+                Span::default(),
+            )?,
+            MacroCall::Barrier => {
+                ctx.emit_restart();
+                ctx.body.push(
+                    naga::Statement::ControlBarrier(naga::Barrier::all()),
+                    meta,
+                );
+                return Ok(None);
+            }
+            MacroCall::SmoothStep { splatted } => {
+                ctx.implicit_splat(&mut args[0], meta, splatted)?;
+                ctx.implicit_splat(&mut args[1], meta, splatted)?;
+
+                ctx.add_expression(
+                    Expression::Math {
+                        fun: MathFunction::SmoothStep,
+                        arg: args[0],
+                        arg1: args.get(1).copied(),
+                        arg2: args.get(2).copied(),
+                        arg3: None,
+                    },
+                    Span::default(),
+                )?
+            }
+        }))
+    }
+}
+
+fn texture_call(
+    ctx: &mut Context,
+    image: Handle<Expression>,
+    level: SampleLevel,
+    comps: CoordComponents,
+    offset: Option<Handle<Expression>>,
+    meta: Span,
+) -> Result<Handle<Expression>> {
+    if let Some(sampler) = ctx.samplers.get(&image).copied() {
+        let mut array_index = comps.array_index;
+
+        if let Some(ref mut array_index_expr) = array_index {
+            ctx.conversion(array_index_expr, meta, Scalar::I32)?;
+        }
+
+        // Iris Features: `texture()` of an integer texture (`usampler2D`), which GL drivers
+        // answer with the nearest texel and naga refuses: a fetch of the texel the coordinate
+        // falls in.
+        if let TypeInner::Image { class: naga::ImageClass::Sampled { kind: naga::ScalarKind::Sint | naga::ScalarKind::Uint, .. }, .. } =
+            *ctx.resolve_type(image, meta)?
+            && comps.depth_ref.is_none()
+        {
+            let lod = match level {
+                SampleLevel::Exact(e) => {
+                    let mut e = e;
+                    ctx.conversion(&mut e, meta, Scalar::I32)?;
+                    e
+                }
+                _ => ctx.add_expression(Expression::Literal(naga::Literal::I32(0)), meta)?,
+            };
+            let size = ctx.add_expression(Expression::ImageQuery { image, query: ImageQuery::Size { level: Some(lod) } }, meta)?;
+            let size_f = ctx.add_expression(Expression::As { expr: size, kind: Sk::Float, convert: Some(4) }, meta)?;
+            let scaled = ctx.add_expression(Expression::Binary { op: BinaryOperator::Multiply, left: comps.coordinate, right: size_f }, meta)?;
+            let floored = ctx.add_expression(Expression::Math { fun: MathFunction::Floor, arg: scaled, arg1: None, arg2: None, arg3: None }, meta)?;
+            let texel = ctx.add_expression(Expression::As { expr: floored, kind: Sk::Sint, convert: Some(4) }, meta)?;
+            return ctx.add_expression(
+                Expression::ImageLoad { image, coordinate: texel, array_index, sample: None, level: Some(lod) },
+                meta,
+            );
+        }
+
+        Ok(ctx.add_expression(
+            Expression::ImageSample {
+                image,
+                sampler,
+                gather: None, //TODO
+                coordinate: comps.coordinate,
+                array_index,
+                offset,
+                level,
+                depth_ref: comps.depth_ref,
+                clamp_to_edge: false,
+            },
+            meta,
+        )?)
+    } else {
+        Err(Error {
+            kind: ErrorKind::SemanticError("Bad call".into()),
+            meta,
+        })
+    }
+}
+
+/// Helper struct for texture calls with the separate components from the vector argument
+///
+/// Obtained by calling [`coordinate_components`](Frontend::coordinate_components)
+#[derive(Debug)]
+struct CoordComponents {
+    coordinate: Handle<Expression>,
+    depth_ref: Option<Handle<Expression>>,
+    array_index: Option<Handle<Expression>>,
+    used_extra: bool,
+}
+
+impl Frontend {
+    /// Helper function for texture calls, splits the vector argument into it's components
+    fn coordinate_components(
+        &mut self,
+        ctx: &mut Context,
+        image: Handle<Expression>,
+        coord: Handle<Expression>,
+        extra: Option<Handle<Expression>>,
+        meta: Span,
+    ) -> Result<CoordComponents> {
+        if let TypeInner::Image {
+            dim,
+            arrayed,
+            class,
+        } = *ctx.resolve_type(image, meta)?
+        {
+            let image_size = match dim {
+                Dim::D1 => None,
+                Dim::D2 => Some(VectorSize::Bi),
+                Dim::D3 => Some(VectorSize::Tri),
+                Dim::Cube => Some(VectorSize::Tri),
+            };
+            let coord_size = match *ctx.resolve_type(coord, meta)? {
+                TypeInner::Vector { size, .. } => Some(size),
+                _ => None,
+            };
+            let (shadow, storage) = match class {
+                ImageClass::Depth { .. } => (true, false),
+                ImageClass::Storage { .. } => (false, true),
+                ImageClass::Sampled { .. } => (false, false),
+                ImageClass::External => unreachable!(),
+            };
+
+            let coordinate = match (image_size, coord_size) {
+                (Some(size), Some(coord_s)) if size != coord_s => {
+                    ctx.vector_resize(size, coord, Span::default())?
+                }
+                (None, Some(_)) => ctx.add_expression(
+                    Expression::AccessIndex {
+                        base: coord,
+                        index: 0,
+                    },
+                    Span::default(),
+                )?,
+                _ => coord,
+            };
+
+            let mut coord_index = image_size.map_or(1, |s| s as u32);
+
+            let array_index = if arrayed && !(storage && dim == Dim::Cube) {
+                let index = coord_index;
+                coord_index += 1;
+
+                Some(ctx.add_expression(
+                    Expression::AccessIndex { base: coord, index },
+                    Span::default(),
+                )?)
+            } else {
+                None
+            };
+            let mut used_extra = false;
+            let depth_ref = match shadow {
+                true => {
+                    let index = coord_index;
+
+                    if index == 4 {
+                        used_extra = true;
+                        extra
+                    } else {
+                        Some(ctx.add_expression(
+                            Expression::AccessIndex { base: coord, index },
+                            Span::default(),
+                        )?)
+                    }
+                }
+                false => None,
+            };
+
+            Ok(CoordComponents {
+                coordinate,
+                depth_ref,
+                array_index,
+                used_extra,
+            })
+        } else {
+            self.errors.push(Error {
+                kind: ErrorKind::SemanticError("Type is not an image".into()),
+                meta,
+            });
+
+            Ok(CoordComponents {
+                coordinate: coord,
+                depth_ref: None,
+                array_index: None,
+                used_extra: false,
+            })
+        }
+    }
+}
+
+/// Helper function to cast a expression holding a sampled image to a
+/// depth image.
+pub fn sampled_to_depth(
+    ctx: &mut Context,
+    image: Handle<Expression>,
+    meta: Span,
+    errors: &mut Vec<Error>,
+) {
+    // Get the a mutable type handle of the underlying image storage
+    let ty = match ctx[image] {
+        Expression::GlobalVariable(handle) => &mut ctx.module.global_variables.get_mut(handle).ty,
+        Expression::FunctionArgument(i) => {
+            // Mark the function argument as carrying a depth texture
+            ctx.parameters_info[i as usize].depth = true;
+            // NOTE: We need to later also change the parameter type
+            &mut ctx.arguments[i as usize].ty
+        }
+        _ => {
+            // Only globals and function arguments are allowed to carry an image
+            return errors.push(Error {
+                kind: ErrorKind::SemanticError("Not a valid texture expression".into()),
+                meta,
+            });
+        }
+    };
+
+    match ctx.module.types[*ty].inner {
+        // Update the image class to depth in case it already isn't
+        TypeInner::Image {
+            class,
+            dim,
+            arrayed,
+        } => match class {
+            ImageClass::Sampled { multi, .. } => {
+                *ty = ctx.module.types.insert(
+                    Type {
+                        name: None,
+                        inner: TypeInner::Image {
+                            dim,
+                            arrayed,
+                            class: ImageClass::Depth { multi },
+                        },
+                    },
+                    Span::default(),
+                )
+            }
+            ImageClass::Depth { .. } => {}
+            // Other image classes aren't allowed to be transformed to depth
+            ImageClass::Storage { .. } => errors.push(Error {
+                kind: ErrorKind::SemanticError("Not a texture".into()),
+                meta,
+            }),
+            ImageClass::External => unreachable!(),
+        },
+        _ => errors.push(Error {
+            kind: ErrorKind::SemanticError("Not a texture".into()),
+            meta,
+        }),
+    };
+
+    // Copy the handle to allow borrowing the `ctx` again
+    let ty = *ty;
+
+    // If the image was passed through a function argument we also need to change
+    // the corresponding parameter
+    if let Expression::FunctionArgument(i) = ctx[image] {
+        ctx.parameters[i as usize] = ty;
+    }
+}
+
+crate::translate::iris_glsl::frontend::flags! {
+    /// Influences the operation [`texture_args_generator`]
+    struct TextureArgsOptions: u32 {
+        /// Generates multisampled variants of images
+        const MULTI = 1 << 0;
+        /// Generates shadow variants of images
+        const SHADOW = 1 << 1;
+        /// Generates standard images
+        const STANDARD = 1 << 2;
+        /// Generates cube arrayed images
+        const CUBE_ARRAY = 1 << 3;
+        /// Generates cube arrayed images
+        const D2_MULTI_ARRAY = 1 << 4;
+    }
+}
+
+impl From<BuiltinVariations> for TextureArgsOptions {
+    fn from(variations: BuiltinVariations) -> Self {
+        let mut options = TextureArgsOptions::empty();
+        if variations.contains(BuiltinVariations::STANDARD) {
+            options |= TextureArgsOptions::STANDARD
+        }
+        if variations.contains(BuiltinVariations::CUBE_TEXTURES_ARRAY) {
+            options |= TextureArgsOptions::CUBE_ARRAY
+        }
+        if variations.contains(BuiltinVariations::D2_MULTI_TEXTURES_ARRAY) {
+            options |= TextureArgsOptions::D2_MULTI_ARRAY
+        }
+        options
+    }
+}
+
+/// Helper function to generate the image components for texture/image builtins
+///
+/// Calls the passed function `f` with:
+/// ```text
+/// f(ScalarKind, ImageDimension, arrayed, multi, shadow)
+/// ```
+///
+/// `options` controls extra image variants generation like multisampling and depth,
+/// see the struct documentation
+fn texture_args_generator(
+    options: TextureArgsOptions,
+    mut f: impl FnMut(naga::ScalarKind, Dim, bool, bool, bool),
+) {
+    for kind in [Sk::Float, Sk::Uint, Sk::Sint].iter().copied() {
+        for dim in [Dim::D1, Dim::D2, Dim::D3, Dim::Cube].iter().copied() {
+            for arrayed in [false, true].iter().copied() {
+                if dim == Dim::Cube && arrayed {
+                    if !options.contains(TextureArgsOptions::CUBE_ARRAY) {
+                        continue;
+                    }
+                } else if Dim::D2 == dim
+                    && options.contains(TextureArgsOptions::MULTI)
+                    && arrayed
+                    && options.contains(TextureArgsOptions::D2_MULTI_ARRAY)
+                {
+                    // multisampling for sampler2DMSArray
+                    f(kind, dim, arrayed, true, false);
+                } else if !options.contains(TextureArgsOptions::STANDARD) {
+                    continue;
+                }
+
+                f(kind, dim, arrayed, false, false);
+
+                // 3D images can't be neither arrayed nor shadow
+                // so we break out early, this way arrayed will always
+                // be false and we won't hit the shadow branch
+                if let Dim::D3 = dim {
+                    break;
+                }
+
+                if Dim::D2 == dim && options.contains(TextureArgsOptions::MULTI) && !arrayed {
+                    // multisampling
+                    f(kind, dim, arrayed, true, false);
+                }
+
+                if Sk::Float == kind && options.contains(TextureArgsOptions::SHADOW) {
+                    // shadow
+                    f(kind, dim, arrayed, false, true);
+                }
+            }
+        }
+    }
+}
+
+/// Helper functions used to convert from a image dimension into a integer representing the
+/// number of components needed for the coordinates vector (1 means scalar instead of vector)
+const fn image_dims_to_coords_size(dim: Dim) -> usize {
+    match dim {
+        Dim::D1 => 1,
+        Dim::D2 => 2,
+        _ => 3,
+    }
+}
+
+}
+mod context {
+use std::{format, string::String, vec::Vec};
+use core::ops::Index;
+
+use super::{
+    ast::{
+        GlobalLookup, GlobalLookupKind, HirExpr, HirExprKind, ParameterInfo, ParameterQualifier,
+        VariableReference,
+    },
+    error::{Error, ErrorKind},
+    types::{scalar_components, type_power},
+    Frontend, Result,
+};
+use naga::{
+    front::Typifier, proc::Emitter, proc::Layouter, AddressSpace, Arena, BinaryOperator, Block,
+    Expression, FastHashMap, FunctionArgument, Handle, Literal, LocalVariable, RelationalFunction,
+    Scalar, Span, Statement, Type, TypeInner, VectorSize,
+};
+
+/// The position at which an expression is, used while lowering
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExprPos {
+    /// The expression is in the left hand side of an assignment
+    Lhs,
+    /// The expression is in the right hand side of an assignment
+    Rhs,
+    /// The expression is an array being indexed, needed to allow constant
+    /// arrays to be dynamically indexed
+    AccessBase {
+        /// The index is a constant
+        constant_index: bool,
+    },
+}
+
+impl ExprPos {
+    /// Returns an lhs position if the current position is lhs otherwise AccessBase
+    const fn maybe_access_base(&self, constant_index: bool) -> Self {
+        match *self {
+            ExprPos::Lhs
+            | ExprPos::AccessBase {
+                constant_index: false,
+            } => *self,
+            _ => ExprPos::AccessBase { constant_index },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Context<'a> {
+    pub expressions: Arena<Expression>,
+    pub locals: Arena<LocalVariable>,
+
+    /// The [`FunctionArgument`]s for the final [`naga::Function`].
+    ///
+    /// Parameters with the `out` and `inout` qualifiers have [`Pointer`] types
+    /// here. For example, an `inout vec2 a` argument would be a [`Pointer`] to
+    /// a [`Vector`].
+    ///
+    /// [`Pointer`]: naga::TypeInner::Pointer
+    /// [`Vector`]: naga::TypeInner::Vector
+    pub arguments: Vec<FunctionArgument>,
+
+    /// The parameter types given in the source code.
+    ///
+    /// The `out` and `inout` qualifiers don't affect the types that appear
+    /// here. For example, an `inout vec2 a` argument would simply be a
+    /// [`Vector`], not a pointer to one.
+    ///
+    /// [`Vector`]: naga::TypeInner::Vector
+    pub parameters: Vec<Handle<Type>>,
+    pub parameters_info: Vec<ParameterInfo>,
+
+    pub symbol_table: naga::front::SymbolTable<String, VariableReference>,
+    pub samplers: FastHashMap<Handle<Expression>, Handle<Expression>>,
+
+    pub const_typifier: Typifier,
+    pub typifier: Typifier,
+    layouter: Layouter,
+    emitter: Emitter,
+    stmt_ctx: Option<StmtContext>,
+    pub body: Block,
+    pub module: &'a mut naga::Module,
+    pub is_const: bool,
+    /// Tracks the expression kind of `Expression`s residing in `self.expressions`
+    pub local_expression_kind_tracker: naga::proc::ExpressionKindTracker,
+    /// Tracks the expression kind of `Expression`s residing in `self.module.global_expressions`
+    pub global_expression_kind_tracker: &'a mut naga::proc::ExpressionKindTracker,
+}
+
+impl<'a> Context<'a> {
+    pub fn new(
+        frontend: &Frontend,
+        module: &'a mut naga::Module,
+        is_const: bool,
+        global_expression_kind_tracker: &'a mut naga::proc::ExpressionKindTracker,
+    ) -> Result<Self> {
+        let mut this = Context {
+            expressions: Arena::new(),
+            locals: Arena::new(),
+            arguments: Vec::new(),
+
+            parameters: Vec::new(),
+            parameters_info: Vec::new(),
+
+            symbol_table: naga::front::SymbolTable::default(),
+            samplers: FastHashMap::default(),
+
+            const_typifier: Typifier::new(),
+            typifier: Typifier::new(),
+            layouter: Layouter::default(),
+            emitter: Emitter::default(),
+            stmt_ctx: Some(StmtContext::new()),
+            body: Block::new(),
+            module,
+            is_const: false,
+            local_expression_kind_tracker: naga::proc::ExpressionKindTracker::new(),
+            global_expression_kind_tracker,
+        };
+
+        this.emit_start();
+
+        for &(ref name, lookup) in frontend.global_variables.iter() {
+            this.add_global(name, lookup)?
+        }
+        this.is_const = is_const;
+
+        Ok(this)
+    }
+
+    pub fn new_body<F>(&mut self, cb: F) -> Result<Block>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        self.new_body_with_ret(cb).map(|(b, _)| b)
+    }
+
+    pub fn new_body_with_ret<F, R>(&mut self, cb: F) -> Result<(Block, R)>
+    where
+        F: FnOnce(&mut Self) -> Result<R>,
+    {
+        self.emit_restart();
+        let old_body = core::mem::replace(&mut self.body, Block::new());
+        let res = cb(self);
+        self.emit_restart();
+        let new_body = core::mem::replace(&mut self.body, old_body);
+        res.map(|r| (new_body, r))
+    }
+
+    pub fn with_body<F>(&mut self, body: Block, cb: F) -> Result<Block>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        self.emit_restart();
+        let old_body = core::mem::replace(&mut self.body, body);
+        let res = cb(self);
+        self.emit_restart();
+        let body = core::mem::replace(&mut self.body, old_body);
+        res.map(|_| body)
+    }
+
+    pub fn add_global(
+        &mut self,
+        name: &str,
+        GlobalLookup {
+            kind,
+            entry_arg,
+            mutable,
+        }: GlobalLookup,
+    ) -> Result<()> {
+        let (expr, load, constant) = match kind {
+            GlobalLookupKind::Variable(v) => {
+                let span = self.module.global_variables.get_span(v);
+                (
+                    self.add_expression(Expression::GlobalVariable(v), span)?,
+                    self.module.global_variables[v].space != AddressSpace::Handle,
+                    None,
+                )
+            }
+            GlobalLookupKind::BlockSelect(handle, index) => {
+                let span = self.module.global_variables.get_span(handle);
+                let base = self.add_expression(Expression::GlobalVariable(handle), span)?;
+                let expr = self.add_expression(Expression::AccessIndex { base, index }, span)?;
+
+                (
+                    expr,
+                    {
+                        let ty = self.module.global_variables[handle].ty;
+
+                        match self.module.types[ty].inner {
+                            TypeInner::Struct { ref members, .. } => {
+                                if let TypeInner::Array {
+                                    size: naga::ArraySize::Dynamic,
+                                    ..
+                                } = self.module.types[members[index as usize].ty].inner
+                                {
+                                    false
+                                } else {
+                                    true
+                                }
+                            }
+                            _ => true,
+                        }
+                    },
+                    None,
+                )
+            }
+            GlobalLookupKind::Constant(v, ty) => {
+                let span = self.module.constants.get_span(v);
+                (
+                    self.add_expression(Expression::Constant(v), span)?,
+                    false,
+                    Some((v, ty)),
+                )
+            }
+            GlobalLookupKind::Override(v, _ty) => {
+                let span = self.module.overrides.get_span(v);
+                (
+                    self.add_expression(Expression::Override(v), span)?,
+                    false,
+                    None,
+                )
+            }
+        };
+
+        let var = VariableReference {
+            expr,
+            load,
+            mutable,
+            constant,
+            entry_arg,
+        };
+
+        self.symbol_table.add(name.into(), var);
+
+        Ok(())
+    }
+
+    /// Starts the expression emitter
+    ///
+    /// # Panics
+    ///
+    /// - If called twice in a row without calling [`emit_end`][Self::emit_end].
+    #[inline]
+    pub fn emit_start(&mut self) {
+        self.emitter.start(&self.expressions)
+    }
+
+    /// Emits all the expressions captured by the emitter to the current body
+    ///
+    /// # Panics
+    ///
+    /// - If called before calling [`emit_start`].
+    /// - If called twice in a row without calling [`emit_start`].
+    ///
+    /// [`emit_start`]: Self::emit_start
+    pub fn emit_end(&mut self) {
+        self.body.extend(self.emitter.finish(&self.expressions))
+    }
+
+    /// Emits all the expressions captured by the emitter to the current body
+    /// and starts the emitter again
+    ///
+    /// # Panics
+    ///
+    /// - If called before calling [`emit_start`][Self::emit_start].
+    pub fn emit_restart(&mut self) {
+        self.emit_end();
+        self.emit_start()
+    }
+
+    pub fn add_expression(&mut self, expr: Expression, meta: Span) -> Result<Handle<Expression>> {
+        // Iris Features: a shift of integer literals wraps, as GLSL's does (`1 << 31` is
+        // `0x80000000`); naga's constant evaluator calls it an overflow.
+        let expr = match expr {
+            Expression::Binary { op: BinaryOperator::ShiftLeft, left, right } => {
+                let arena = if self.is_const { &self.module.global_expressions } else { &self.expressions };
+                match (&arena[left], &arena[right]) {
+                    (Expression::Literal(naga::Literal::I32(a)), Expression::Literal(naga::Literal::I32(b))) => {
+                        Expression::Literal(naga::Literal::I32(a.wrapping_shl(*b as u32)))
+                    }
+                    (Expression::Literal(naga::Literal::U32(a)), Expression::Literal(naga::Literal::U32(b))) => {
+                        Expression::Literal(naga::Literal::U32(a.wrapping_shl(*b)))
+                    }
+                    (Expression::Literal(naga::Literal::U32(a)), Expression::Literal(naga::Literal::I32(b))) => {
+                        Expression::Literal(naga::Literal::U32(a.wrapping_shl(*b as u32)))
+                    }
+                    (Expression::Literal(naga::Literal::I32(a)), Expression::Literal(naga::Literal::U32(b))) => {
+                        Expression::Literal(naga::Literal::I32(a.wrapping_shl(*b)))
+                    }
+                    _ => Expression::Binary { op: BinaryOperator::ShiftLeft, left, right },
+                }
+            }
+            other => other,
+        };
+        let mut eval = if self.is_const {
+            naga::proc::ConstantEvaluator::for_glsl_module(
+                self.module,
+                self.global_expression_kind_tracker,
+                &mut self.layouter,
+            )
+        } else {
+            naga::proc::ConstantEvaluator::for_glsl_function(
+                self.module,
+                &mut self.expressions,
+                &mut self.local_expression_kind_tracker,
+                &mut self.layouter,
+                &mut self.emitter,
+                &mut self.body,
+            )
+        };
+
+        eval.try_eval_and_append(expr, meta).map_err(|e| Error {
+            kind: e.into(),
+            meta,
+        })
+    }
+
+    /// Add variable to current scope
+    ///
+    /// Returns a variable if a variable with the same name was already defined,
+    /// otherwise returns `None`
+    pub fn add_local_var(
+        &mut self,
+        name: String,
+        expr: Handle<Expression>,
+        mutable: bool,
+    ) -> Option<VariableReference> {
+        let var = VariableReference {
+            expr,
+            load: true,
+            mutable,
+            constant: None,
+            entry_arg: None,
+        };
+
+        self.symbol_table.add(name, var)
+    }
+
+    /// Add function argument to current scope
+    pub fn add_function_arg(
+        &mut self,
+        name_meta: Option<(String, Span)>,
+        ty: Handle<Type>,
+        qualifier: ParameterQualifier,
+    ) -> Result<()> {
+        let index = self.arguments.len();
+        let mut arg = FunctionArgument {
+            name: name_meta.as_ref().map(|&(ref name, _)| name.clone()),
+            ty,
+            binding: None,
+        };
+        self.parameters.push(ty);
+
+        let opaque = match self.module.types[ty].inner {
+            TypeInner::Image { .. } | TypeInner::Sampler { .. } => true,
+            _ => false,
+        };
+
+        if qualifier.is_lhs() {
+            let span = self.module.types.get_span(arg.ty);
+            arg.ty = self.module.types.insert(
+                Type {
+                    name: None,
+                    inner: TypeInner::Pointer {
+                        base: arg.ty,
+                        space: AddressSpace::Function,
+                    },
+                },
+                span,
+            )
+        }
+
+        self.arguments.push(arg);
+
+        self.parameters_info.push(ParameterInfo {
+            qualifier,
+            depth: false,
+        });
+
+        if let Some((name, meta)) = name_meta {
+            let expr = self.add_expression(Expression::FunctionArgument(index as u32), meta)?;
+            let mutable = qualifier != ParameterQualifier::Const && !opaque;
+            let load = qualifier.is_lhs();
+
+            let var = if mutable && !load {
+                let handle = self.locals.append(
+                    LocalVariable {
+                        name: Some(name.clone()),
+                        ty,
+                        init: None,
+                    },
+                    meta,
+                );
+                let local_expr = self.add_expression(Expression::LocalVariable(handle), meta)?;
+
+                self.emit_restart();
+
+                self.body.push(
+                    Statement::Store {
+                        pointer: local_expr,
+                        value: expr,
+                    },
+                    meta,
+                );
+
+                VariableReference {
+                    expr: local_expr,
+                    load: true,
+                    mutable,
+                    constant: None,
+                    entry_arg: None,
+                }
+            } else {
+                VariableReference {
+                    expr,
+                    load,
+                    mutable,
+                    constant: None,
+                    entry_arg: None,
+                }
+            };
+
+            self.symbol_table.add(name, var);
+        }
+
+        Ok(())
+    }
+
+    /// Returns a [`StmtContext`] to be used in parsing and lowering
+    ///
+    /// # Panics
+    ///
+    /// - If more than one [`StmtContext`] are active at the same time or if the
+    ///   previous call didn't use it in lowering.
+    #[must_use]
+    pub const fn stmt_ctx(&mut self) -> StmtContext {
+        self.stmt_ctx.take().unwrap()
+    }
+
+    /// Lowers a [`HirExpr`] which might produce a [`Expression`].
+    ///
+    /// consumes a [`StmtContext`] returning it to the context so that it can be
+    /// used again later.
+    pub fn lower(
+        &mut self,
+        mut stmt: StmtContext,
+        frontend: &mut Frontend,
+        expr: Handle<HirExpr>,
+        pos: ExprPos,
+    ) -> Result<(Option<Handle<Expression>>, Span)> {
+        let res = self.lower_inner(&stmt, frontend, expr, pos);
+
+        stmt.hir_exprs.clear();
+        self.stmt_ctx = Some(stmt);
+
+        res
+    }
+
+    /// Similar to [`lower`](Self::lower) but returns an error if the expression
+    /// returns void (ie. doesn't produce a [`Expression`]).
+    ///
+    /// consumes a [`StmtContext`] returning it to the context so that it can be
+    /// used again later.
+    pub fn lower_expect(
+        &mut self,
+        mut stmt: StmtContext,
+        frontend: &mut Frontend,
+        expr: Handle<HirExpr>,
+        pos: ExprPos,
+    ) -> Result<(Handle<Expression>, Span)> {
+        let res = self.lower_expect_inner(&stmt, frontend, expr, pos);
+
+        stmt.hir_exprs.clear();
+        self.stmt_ctx = Some(stmt);
+
+        res
+    }
+
+    /// internal implementation of [`lower_expect`](Self::lower_expect)
+    ///
+    /// this method is only public because it's used in
+    /// [`function_call`](Frontend::function_call), unless you know what
+    /// you're doing use [`lower_expect`](Self::lower_expect)
+    pub fn lower_expect_inner(
+        &mut self,
+        stmt: &StmtContext,
+        frontend: &mut Frontend,
+        expr: Handle<HirExpr>,
+        pos: ExprPos,
+    ) -> Result<(Handle<Expression>, Span)> {
+        let (maybe_expr, meta) = self.lower_inner(stmt, frontend, expr, pos)?;
+
+        let expr = match maybe_expr {
+            Some(e) => e,
+            None => {
+                return Err(Error {
+                    kind: ErrorKind::SemanticError("Expression returns void".into()),
+                    meta,
+                })
+            }
+        };
+
+        Ok((expr, meta))
+    }
+
+    fn lower_store(
+        &mut self,
+        pointer: Handle<Expression>,
+        value: Handle<Expression>,
+        meta: Span,
+    ) -> Result<()> {
+        if let Expression::Swizzle {
+            size,
+            mut vector,
+            pattern,
+        } = self.expressions[pointer]
+        {
+            // Stores to swizzled values are not directly supported,
+            // lower them as series of per-component stores.
+            let size = match size {
+                VectorSize::Bi => 2,
+                VectorSize::Tri => 3,
+                VectorSize::Quad => 4,
+            };
+
+            if let Expression::Load { pointer } = self.expressions[vector] {
+                vector = pointer;
+            }
+
+            #[allow(clippy::needless_range_loop)]
+            for index in 0..size {
+                let dst = self.add_expression(
+                    Expression::AccessIndex {
+                        base: vector,
+                        index: pattern[index].index(),
+                    },
+                    meta,
+                )?;
+                let src = self.add_expression(
+                    Expression::AccessIndex {
+                        base: value,
+                        index: index as u32,
+                    },
+                    meta,
+                )?;
+
+                self.emit_restart();
+
+                self.body.push(
+                    Statement::Store {
+                        pointer: dst,
+                        value: src,
+                    },
+                    meta,
+                );
+            }
+        } else {
+            self.emit_restart();
+
+            self.body.push(Statement::Store { pointer, value }, meta);
+        }
+
+        Ok(())
+    }
+
+    /// Internal implementation of [`lower`](Self::lower)
+    #[allow(clippy::large_stack_frames)] // TODO(https://github.com/gfx-rs/wgpu/issues/9456)
+    fn lower_inner(
+        &mut self,
+        stmt: &StmtContext,
+        frontend: &mut Frontend,
+        expr: Handle<HirExpr>,
+        pos: ExprPos,
+    ) -> Result<(Option<Handle<Expression>>, Span)> {
+        let HirExpr { ref kind, meta } = stmt.hir_exprs[expr];
+
+        crate::translate::iris_glsl::frontend::no_log!("Lowering {expr:?} (kind {kind:?}, pos {pos:?})");
+
+        let handle = match *kind {
+            HirExprKind::Access { base, index } => {
+                let (index, _) = self.lower_expect_inner(stmt, frontend, index, ExprPos::Rhs)?;
+                let maybe_constant_index = match pos {
+                    // Don't try to generate `AccessIndex` if in a LHS position, since it
+                    // wouldn't produce a pointer.
+                    ExprPos::Lhs => None,
+                    _ => crate::translate::iris_glsl::frontend::const_val(self.module, index, &self.expressions).ok(),
+                };
+
+                let base = self
+                    .lower_expect_inner(
+                        stmt,
+                        frontend,
+                        base,
+                        pos.maybe_access_base(maybe_constant_index.is_some()),
+                    )?
+                    .0;
+
+                let pointer = maybe_constant_index
+                    .map(|index| self.add_expression(Expression::AccessIndex { base, index }, meta))
+                    .unwrap_or_else(|| {
+                        self.add_expression(Expression::Access { base, index }, meta)
+                    })?;
+
+                if ExprPos::Rhs == pos {
+                    let resolved = self.resolve_type(pointer, meta)?;
+                    if resolved.pointer_space().is_some() {
+                        return Ok((
+                            Some(self.add_expression(Expression::Load { pointer }, meta)?),
+                            meta,
+                        ));
+                    }
+                }
+
+                pointer
+            }
+            HirExprKind::Select { base, ref field } => {
+                let base = self.lower_expect_inner(stmt, frontend, base, pos)?.0;
+
+                frontend.field_selection(self, pos, base, field, meta)?
+            }
+            HirExprKind::Literal(literal) if pos != ExprPos::Lhs => {
+                self.add_expression(Expression::Literal(literal), meta)?
+            }
+            HirExprKind::Binary { left, op, right } if pos != ExprPos::Lhs => {
+                let (mut left, left_meta) =
+                    self.lower_expect_inner(stmt, frontend, left, ExprPos::Rhs)?;
+                let (mut right, right_meta) =
+                    self.lower_expect_inner(stmt, frontend, right, ExprPos::Rhs)?;
+
+                match op {
+                    BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => {
+                        self.implicit_conversion(&mut right, right_meta, Scalar::U32)?
+                    }
+                    _ => self
+                        .binary_implicit_conversion(&mut left, left_meta, &mut right, right_meta)?,
+                }
+
+                self.typifier_grow(left, left_meta)?;
+                self.typifier_grow(right, right_meta)?;
+
+                let left_inner = self.get_type(left);
+                let right_inner = self.get_type(right);
+
+                match (left_inner, right_inner) {
+                    (
+                        &TypeInner::Matrix {
+                            columns: left_columns,
+                            rows: left_rows,
+                            scalar: left_scalar,
+                        },
+                        &TypeInner::Matrix {
+                            columns: right_columns,
+                            rows: right_rows,
+                            scalar: right_scalar,
+                        },
+                    ) => {
+                        let dimensions_ok = if op == BinaryOperator::Multiply {
+                            left_columns == right_rows
+                        } else {
+                            left_columns == right_columns && left_rows == right_rows
+                        };
+
+                        // Check that the two arguments have the same dimensions
+                        if !dimensions_ok || left_scalar != right_scalar {
+                            frontend.errors.push(Error {
+                                kind: ErrorKind::SemanticError(
+                                    format!(
+                                        "Cannot apply operation to {left_inner:?} and {right_inner:?}"
+                                    )
+                                    .into(),
+                                ),
+                                meta,
+                            })
+                        }
+
+                        match op {
+                            BinaryOperator::Divide => {
+                                // Naga IR doesn't support matrix division so we need to
+                                // divide the columns individually and reassemble the matrix
+                                let mut components = Vec::with_capacity(left_columns as usize);
+
+                                for index in 0..left_columns as u32 {
+                                    // Get the column vectors
+                                    let left_vector = self.add_expression(
+                                        Expression::AccessIndex { base: left, index },
+                                        meta,
+                                    )?;
+                                    let right_vector = self.add_expression(
+                                        Expression::AccessIndex { base: right, index },
+                                        meta,
+                                    )?;
+
+                                    // Divide the vectors
+                                    let column = self.add_expression(
+                                        Expression::Binary {
+                                            op,
+                                            left: left_vector,
+                                            right: right_vector,
+                                        },
+                                        meta,
+                                    )?;
+
+                                    components.push(column)
+                                }
+
+                                let ty = self.module.types.insert(
+                                    Type {
+                                        name: None,
+                                        inner: TypeInner::Matrix {
+                                            columns: left_columns,
+                                            rows: left_rows,
+                                            scalar: left_scalar,
+                                        },
+                                    },
+                                    Span::default(),
+                                );
+
+                                // Rebuild the matrix from the divided vectors
+                                self.add_expression(Expression::Compose { ty, components }, meta)?
+                            }
+                            BinaryOperator::Equal | BinaryOperator::NotEqual => {
+                                // Naga IR doesn't support matrix comparisons so we need to
+                                // compare the columns individually and then fold them together
+                                //
+                                // The folding is done using a logical and for equality and
+                                // a logical or for inequality
+                                let equals = op == BinaryOperator::Equal;
+
+                                let (op, combine, fun) = match equals {
+                                    true => (
+                                        BinaryOperator::Equal,
+                                        BinaryOperator::LogicalAnd,
+                                        RelationalFunction::All,
+                                    ),
+                                    false => (
+                                        BinaryOperator::NotEqual,
+                                        BinaryOperator::LogicalOr,
+                                        RelationalFunction::Any,
+                                    ),
+                                };
+
+                                let mut root = None;
+
+                                for index in 0..left_columns as u32 {
+                                    // Get the column vectors
+                                    let left_vector = self.add_expression(
+                                        Expression::AccessIndex { base: left, index },
+                                        meta,
+                                    )?;
+                                    let right_vector = self.add_expression(
+                                        Expression::AccessIndex { base: right, index },
+                                        meta,
+                                    )?;
+
+                                    let argument = self.add_expression(
+                                        Expression::Binary {
+                                            op,
+                                            left: left_vector,
+                                            right: right_vector,
+                                        },
+                                        meta,
+                                    )?;
+
+                                    // The result of comparing two vectors is a boolean vector
+                                    // so use a relational function like all to get a single
+                                    // boolean value
+                                    let compare = self.add_expression(
+                                        Expression::Relational { fun, argument },
+                                        meta,
+                                    )?;
+
+                                    // Fold the result
+                                    root = Some(match root {
+                                        Some(right) => self.add_expression(
+                                            Expression::Binary {
+                                                op: combine,
+                                                left: compare,
+                                                right,
+                                            },
+                                            meta,
+                                        )?,
+                                        None => compare,
+                                    });
+                                }
+
+                                root.unwrap()
+                            }
+                            _ => {
+                                self.add_expression(Expression::Binary { left, op, right }, meta)?
+                            }
+                        }
+                    }
+                    (&TypeInner::Vector { .. }, &TypeInner::Vector { .. }) => match op {
+                        BinaryOperator::Equal | BinaryOperator::NotEqual => {
+                            let equals = op == BinaryOperator::Equal;
+
+                            let (op, fun) = match equals {
+                                true => (BinaryOperator::Equal, RelationalFunction::All),
+                                false => (BinaryOperator::NotEqual, RelationalFunction::Any),
+                            };
+
+                            let argument =
+                                self.add_expression(Expression::Binary { op, left, right }, meta)?;
+
+                            self.add_expression(Expression::Relational { fun, argument }, meta)?
+                        }
+                        _ => self.add_expression(Expression::Binary { left, op, right }, meta)?,
+                    },
+                    (&TypeInner::Vector { size, .. }, &TypeInner::Scalar { .. }) => match op {
+                        BinaryOperator::Add
+                        | BinaryOperator::Subtract
+                        | BinaryOperator::Divide
+                        | BinaryOperator::Modulo
+                        | BinaryOperator::And
+                        | BinaryOperator::ExclusiveOr
+                        | BinaryOperator::InclusiveOr
+                        | BinaryOperator::ShiftLeft
+                        | BinaryOperator::ShiftRight => {
+                            let scalar_vector = self
+                                .add_expression(Expression::Splat { size, value: right }, meta)?;
+
+                            self.add_expression(
+                                Expression::Binary {
+                                    op,
+                                    left,
+                                    right: scalar_vector,
+                                },
+                                meta,
+                            )?
+                        }
+                        _ => self.add_expression(Expression::Binary { left, op, right }, meta)?,
+                    },
+                    (&TypeInner::Scalar { .. }, &TypeInner::Vector { size, .. }) => match op {
+                        BinaryOperator::Add
+                        | BinaryOperator::Subtract
+                        | BinaryOperator::Divide
+                        | BinaryOperator::Modulo
+                        | BinaryOperator::And
+                        | BinaryOperator::ExclusiveOr
+                        | BinaryOperator::InclusiveOr => {
+                            let scalar_vector =
+                                self.add_expression(Expression::Splat { size, value: left }, meta)?;
+
+                            self.add_expression(
+                                Expression::Binary {
+                                    op,
+                                    left: scalar_vector,
+                                    right,
+                                },
+                                meta,
+                            )?
+                        }
+                        _ => self.add_expression(Expression::Binary { left, op, right }, meta)?,
+                    },
+                    (
+                        &TypeInner::Scalar(left_scalar),
+                        &TypeInner::Matrix {
+                            rows,
+                            columns,
+                            scalar: right_scalar,
+                        },
+                    ) => {
+                        // Check that the two arguments have the same scalar type
+                        if left_scalar != right_scalar {
+                            frontend.errors.push(Error {
+                                kind: ErrorKind::SemanticError(
+                                    format!(
+                                        "Cannot apply operation to {left_inner:?} and {right_inner:?}"
+                                    )
+                                    .into(),
+                                ),
+                                meta,
+                            })
+                        }
+
+                        match op {
+                            BinaryOperator::Divide
+                            | BinaryOperator::Add
+                            | BinaryOperator::Subtract => {
+                                // Naga IR doesn't support all matrix by scalar operations so
+                                // we need for some to turn the scalar into a vector by
+                                // splatting it and then for each column vector apply the
+                                // operation and finally reconstruct the matrix
+                                let scalar_vector = self.add_expression(
+                                    Expression::Splat {
+                                        size: rows,
+                                        value: left,
+                                    },
+                                    meta,
+                                )?;
+
+                                let mut components = Vec::with_capacity(columns as usize);
+
+                                for index in 0..columns as u32 {
+                                    // Get the column vector
+                                    let matrix_column = self.add_expression(
+                                        Expression::AccessIndex { base: right, index },
+                                        meta,
+                                    )?;
+
+                                    // Apply the operation to the splatted vector and
+                                    // the column vector
+                                    let column = self.add_expression(
+                                        Expression::Binary {
+                                            op,
+                                            left: scalar_vector,
+                                            right: matrix_column,
+                                        },
+                                        meta,
+                                    )?;
+
+                                    components.push(column)
+                                }
+
+                                let ty = self.module.types.insert(
+                                    Type {
+                                        name: None,
+                                        inner: TypeInner::Matrix {
+                                            columns,
+                                            rows,
+                                            scalar: left_scalar,
+                                        },
+                                    },
+                                    Span::default(),
+                                );
+
+                                // Rebuild the matrix from the operation result vectors
+                                self.add_expression(Expression::Compose { ty, components }, meta)?
+                            }
+                            _ => {
+                                self.add_expression(Expression::Binary { left, op, right }, meta)?
+                            }
+                        }
+                    }
+                    (
+                        &TypeInner::Matrix {
+                            rows,
+                            columns,
+                            scalar: left_scalar,
+                        },
+                        &TypeInner::Scalar(right_scalar),
+                    ) => {
+                        // Check that the two arguments have the same scalar type
+                        if left_scalar != right_scalar {
+                            frontend.errors.push(Error {
+                                kind: ErrorKind::SemanticError(
+                                    format!(
+                                        "Cannot apply operation to {left_inner:?} and {right_inner:?}"
+                                    )
+                                    .into(),
+                                ),
+                                meta,
+                            })
+                        }
+
+                        match op {
+                            BinaryOperator::Divide
+                            | BinaryOperator::Add
+                            | BinaryOperator::Subtract => {
+                                // Naga IR doesn't support all matrix by scalar operations so
+                                // we need for some to turn the scalar into a vector by
+                                // splatting it and then for each column vector apply the
+                                // operation and finally reconstruct the matrix
+
+                                let scalar_vector = self.add_expression(
+                                    Expression::Splat {
+                                        size: rows,
+                                        value: right,
+                                    },
+                                    meta,
+                                )?;
+
+                                let mut components = Vec::with_capacity(columns as usize);
+
+                                for index in 0..columns as u32 {
+                                    // Get the column vector
+                                    let matrix_column = self.add_expression(
+                                        Expression::AccessIndex { base: left, index },
+                                        meta,
+                                    )?;
+
+                                    // Apply the operation to the splatted vector and
+                                    // the column vector
+                                    let column = self.add_expression(
+                                        Expression::Binary {
+                                            op,
+                                            left: matrix_column,
+                                            right: scalar_vector,
+                                        },
+                                        meta,
+                                    )?;
+
+                                    components.push(column)
+                                }
+
+                                let ty = self.module.types.insert(
+                                    Type {
+                                        name: None,
+                                        inner: TypeInner::Matrix {
+                                            columns,
+                                            rows,
+                                            scalar: left_scalar,
+                                        },
+                                    },
+                                    Span::default(),
+                                );
+
+                                // Rebuild the matrix from the operation result vectors
+                                self.add_expression(Expression::Compose { ty, components }, meta)?
+                            }
+                            _ => {
+                                self.add_expression(Expression::Binary { left, op, right }, meta)?
+                            }
+                        }
+                    }
+                    _ => self.add_expression(Expression::Binary { left, op, right }, meta)?,
+                }
+            }
+            HirExprKind::Unary { op, expr } if pos != ExprPos::Lhs => {
+                let expr = self
+                    .lower_expect_inner(stmt, frontend, expr, ExprPos::Rhs)?
+                    .0;
+
+                if let TypeInner::Matrix { scalar, .. } = *self.resolve_type(expr, meta)? {
+                    // Naga IR doesn't support matrix negation, so we need to turn it into
+                    // multiplication by scalar -1.
+                    let minus_one = Literal::minus_one(scalar).ok_or_else(|| Error {
+                        kind: ErrorKind::SemanticError(
+                            format!("Cannot apply operator {op:?} to type {scalar:?}").into(),
+                        ),
+                        meta,
+                    })?;
+                    let lhs = self.add_expression(Expression::Literal(minus_one), meta)?;
+                    self.add_expression(
+                        Expression::Binary {
+                            op: BinaryOperator::Multiply,
+                            left: lhs,
+                            right: expr,
+                        },
+                        meta,
+                    )?
+                } else {
+                    self.add_expression(Expression::Unary { op, expr }, meta)?
+                }
+            }
+            HirExprKind::Variable(ref var) => match pos {
+                ExprPos::Lhs => {
+                    if !var.mutable {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Variable cannot be used in LHS position".into(),
+                            ),
+                            meta,
+                        })
+                    }
+
+                    var.expr
+                }
+                ExprPos::AccessBase { constant_index } => {
+                    // If the index isn't constant all accesses backed by a constant base need
+                    // to be done through a proxy local variable, since constants have a non
+                    // pointer type which is required for dynamic indexing
+                    if !constant_index {
+                        if let Some((constant, ty)) = var.constant {
+                            let init = self
+                                .add_expression(Expression::Constant(constant), Span::default())?;
+                            let local = self.locals.append(
+                                LocalVariable {
+                                    name: None,
+                                    ty,
+                                    init: Some(init),
+                                },
+                                Span::default(),
+                            );
+
+                            self.add_expression(Expression::LocalVariable(local), Span::default())?
+                        } else {
+                            var.expr
+                        }
+                    } else {
+                        var.expr
+                    }
+                }
+                _ if var.load => {
+                    self.add_expression(Expression::Load { pointer: var.expr }, meta)?
+                }
+                ExprPos::Rhs => {
+                    if let Some((constant, _)) = self.is_const.then_some(var.constant).flatten() {
+                        self.add_expression(Expression::Constant(constant), meta)?
+                    } else {
+                        // Check if this is an Override expression in const context
+                        if self.is_const {
+                            if let Expression::Override(o) = self.expressions[var.expr] {
+                                // Need to add the Override expression to the global arena
+                                self.add_expression(Expression::Override(o), meta)?
+                            } else {
+                                var.expr
+                            }
+                        } else {
+                            var.expr
+                        }
+                    }
+                }
+            },
+            HirExprKind::Call(ref call) if pos != ExprPos::Lhs => {
+                let maybe_expr = frontend.function_or_constructor_call(
+                    self,
+                    stmt,
+                    call.kind.clone(),
+                    &call.args,
+                    meta,
+                )?;
+                return Ok((maybe_expr, meta));
+            }
+            // `HirExprKind::Conditional` represents the ternary operator in glsl (`:?`)
+            //
+            // The ternary operator is defined to only evaluate one of the two possible
+            // expressions which means that it's behavior is that of an `if` statement,
+            // and it's merely syntactic sugar for it.
+            HirExprKind::Conditional {
+                condition,
+                accept,
+                reject,
+            } if ExprPos::Lhs != pos => {
+                // Given an expression `a ? b : c`, we need to produce a Naga
+                // statement roughly like:
+                //
+                //     var temp;
+                //     if a {
+                //         temp = convert(b);
+                //     } else  {
+                //         temp = convert(c);
+                //     }
+                //
+                // where `convert` stands for type conversions to bring `b` and `c` to
+                // the same type, and then use `temp` to represent the value of the whole
+                // conditional expression in subsequent code.
+
+                // Lower the condition first to the current bodyy
+                let condition = self
+                    .lower_expect_inner(stmt, frontend, condition, ExprPos::Rhs)?
+                    .0;
+
+                let (mut accept_body, (mut accept, accept_meta)) =
+                    self.new_body_with_ret(|ctx| {
+                        // Lower the `true` branch
+                        ctx.lower_expect_inner(stmt, frontend, accept, pos)
+                    })?;
+
+                let (mut reject_body, (mut reject, reject_meta)) =
+                    self.new_body_with_ret(|ctx| {
+                        // Lower the `false` branch
+                        ctx.lower_expect_inner(stmt, frontend, reject, pos)
+                    })?;
+
+                // We need to do some custom implicit conversions since the two target expressions
+                // are in different bodies
+                if let (Some((accept_power, accept_scalar)), Some((reject_power, reject_scalar))) = (
+                    // Get the components of both branches and calculate the type power
+                    self.expr_scalar_components(accept, accept_meta)?
+                        .and_then(|scalar| Some((type_power(scalar)?, scalar))),
+                    self.expr_scalar_components(reject, reject_meta)?
+                        .and_then(|scalar| Some((type_power(scalar)?, scalar))),
+                ) {
+                    match accept_power.cmp(&reject_power) {
+                        core::cmp::Ordering::Less => {
+                            accept_body = self.with_body(accept_body, |ctx| {
+                                ctx.conversion(&mut accept, accept_meta, reject_scalar)?;
+                                Ok(())
+                            })?;
+                        }
+                        core::cmp::Ordering::Equal => {}
+                        core::cmp::Ordering::Greater => {
+                            reject_body = self.with_body(reject_body, |ctx| {
+                                ctx.conversion(&mut reject, reject_meta, accept_scalar)?;
+                                Ok(())
+                            })?;
+                        }
+                    }
+                }
+
+                // We need to get the type of the resulting expression to create the local,
+                // this must be done after implicit conversions to ensure both branches have
+                // the same type.
+                let ty = self.resolve_type_handle(accept, accept_meta)?;
+
+                // Add the local that will hold the result of our conditional
+                let local = self.locals.append(
+                    LocalVariable {
+                        name: None,
+                        ty,
+                        init: None,
+                    },
+                    meta,
+                );
+
+                let local_expr = self.add_expression(Expression::LocalVariable(local), meta)?;
+
+                // Add to each  the store to the result variable
+                accept_body.push(
+                    Statement::Store {
+                        pointer: local_expr,
+                        value: accept,
+                    },
+                    accept_meta,
+                );
+                reject_body.push(
+                    Statement::Store {
+                        pointer: local_expr,
+                        value: reject,
+                    },
+                    reject_meta,
+                );
+
+                // Finally add the `If` to the main body with the `condition` we lowered
+                // earlier and the branches we prepared.
+                self.body.push(
+                    Statement::If {
+                        condition,
+                        accept: accept_body,
+                        reject: reject_body,
+                    },
+                    meta,
+                );
+
+                // Note: `Expression::Load` must be emitted before it's used so make
+                // sure the emitter is active here.
+                self.add_expression(
+                    Expression::Load {
+                        pointer: local_expr,
+                    },
+                    meta,
+                )?
+            }
+            HirExprKind::Assign { tgt, value } if ExprPos::Lhs != pos => {
+                let (pointer, ptr_meta) =
+                    self.lower_expect_inner(stmt, frontend, tgt, ExprPos::Lhs)?;
+                let (mut value, value_meta) =
+                    self.lower_expect_inner(stmt, frontend, value, ExprPos::Rhs)?;
+
+                let ty = match *self.resolve_type(pointer, ptr_meta)? {
+                    TypeInner::Pointer { base, .. } => &self.module.types[base].inner,
+                    ref ty => ty,
+                };
+
+                if let Some(scalar) = scalar_components(ty) {
+                    self.implicit_conversion(&mut value, value_meta, scalar)?;
+                }
+
+                self.lower_store(pointer, value, meta)?;
+
+                value
+            }
+            HirExprKind::PrePostfix { op, postfix, expr } if ExprPos::Lhs != pos => {
+                let (pointer, _) = self.lower_expect_inner(stmt, frontend, expr, ExprPos::Lhs)?;
+                let left = if let Expression::Swizzle { .. } = self.expressions[pointer] {
+                    pointer
+                } else {
+                    self.add_expression(Expression::Load { pointer }, meta)?
+                };
+
+                let res = match *self.resolve_type(left, meta)? {
+                    TypeInner::Scalar(scalar) => {
+                        let ty = TypeInner::Scalar(scalar);
+                        Literal::one(scalar).map(|i| (ty, i, None, None))
+                    }
+                    TypeInner::Vector { size, scalar } => {
+                        let ty = TypeInner::Vector { size, scalar };
+                        Literal::one(scalar).map(|i| (ty, i, Some(size), None))
+                    }
+                    TypeInner::Matrix {
+                        columns,
+                        rows,
+                        scalar,
+                    } => {
+                        let ty = TypeInner::Matrix {
+                            columns,
+                            rows,
+                            scalar,
+                        };
+                        Literal::one(scalar).map(|i| (ty, i, Some(rows), Some(columns)))
+                    }
+                    _ => None,
+                };
+                let (ty_inner, literal, rows, columns) = match res {
+                    Some(res) => res,
+                    None => {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Increment/decrement only works on scalar/vector/matrix".into(),
+                            ),
+                            meta,
+                        });
+                        return Ok((Some(left), meta));
+                    }
+                };
+
+                let mut right = self.add_expression(Expression::Literal(literal), meta)?;
+
+                // Glsl allows pre/postfixes operations on vectors and matrices, so if the
+                // target is either of them change the right side of the addition to be splatted
+                // to the same size as the target, furthermore if the target is a matrix
+                // use a composed matrix using the splatted value.
+                if let Some(size) = rows {
+                    right = self.add_expression(Expression::Splat { size, value: right }, meta)?;
+
+                    if let Some(cols) = columns {
+                        let ty = self.module.types.insert(
+                            Type {
+                                name: None,
+                                inner: ty_inner,
+                            },
+                            meta,
+                        );
+
+                        right = self.add_expression(
+                            Expression::Compose {
+                                ty,
+                                components: core::iter::repeat_n(right, cols as usize).collect(),
+                            },
+                            meta,
+                        )?;
+                    }
+                }
+
+                let value = self.add_expression(Expression::Binary { op, left, right }, meta)?;
+
+                self.lower_store(pointer, value, meta)?;
+
+                if postfix {
+                    left
+                } else {
+                    value
+                }
+            }
+            HirExprKind::Method {
+                expr: object,
+                ref name,
+                ref args,
+            } if ExprPos::Lhs != pos => {
+                let args = args
+                    .iter()
+                    .map(|e| self.lower_expect_inner(stmt, frontend, *e, ExprPos::Rhs))
+                    .collect::<Result<Vec<_>>>()?;
+                match name.as_ref() {
+                    "length" => {
+                        if !args.is_empty() {
+                            frontend.errors.push(Error {
+                                kind: ErrorKind::SemanticError(
+                                    ".length() doesn't take any arguments".into(),
+                                ),
+                                meta,
+                            });
+                        }
+                        let lowered_array = self.lower_expect_inner(stmt, frontend, object, pos)?.0;
+                        let array_type = self.resolve_type(lowered_array, meta)?;
+
+                        match *array_type {
+                            TypeInner::Array {
+                                size: naga::ArraySize::Constant(size),
+                                ..
+                            } => {
+                                let mut array_length = self.add_expression(
+                                    Expression::Literal(Literal::U32(size.get())),
+                                    meta,
+                                )?;
+                                self.forced_conversion(&mut array_length, meta, Scalar::I32)?;
+                                array_length
+                            }
+                            // let the error be handled in type checking if it's not a dynamic array
+                            _ => {
+                                let mut array_length = self
+                                    .add_expression(Expression::ArrayLength(lowered_array), meta)?;
+                                self.conversion(&mut array_length, meta, Scalar::I32)?;
+                                array_length
+                            }
+                        }
+                    }
+
+                    _ => {
+                        return Err(Error {
+                            kind: ErrorKind::SemanticError(
+                                format!("unknown method '{name}'").into(),
+                            ),
+                            meta,
+                        });
+                    }
+                }
+            }
+            HirExprKind::Sequence { ref exprs } if pos != ExprPos::Lhs => {
+                let mut last_handle = None;
+                for expr in exprs.iter() {
+                    let (handle, _) =
+                        self.lower_expect_inner(stmt, frontend, *expr, ExprPos::Rhs)?;
+                    last_handle = Some(handle);
+                }
+                match last_handle {
+                    Some(handle) => handle,
+                    None => unreachable!(),
+                }
+            }
+            _ => {
+                return Err(Error {
+                    kind: ErrorKind::SemanticError(
+                        format!("{:?} cannot be in the left hand side", stmt.hir_exprs[expr])
+                            .into(),
+                    ),
+                    meta,
+                })
+            }
+        };
+
+        crate::translate::iris_glsl::frontend::no_log!("Lowered {expr:?}\n\tKind = {kind:?}\n\tPos = {pos:?}\n\tResult = {handle:?}");
+
+        Ok((Some(handle), meta))
+    }
+
+    pub fn expr_scalar_components(
+        &mut self,
+        expr: Handle<Expression>,
+        meta: Span,
+    ) -> Result<Option<Scalar>> {
+        let ty = self.resolve_type(expr, meta)?;
+        Ok(scalar_components(ty))
+    }
+
+    pub fn expr_power(&mut self, expr: Handle<Expression>, meta: Span) -> Result<Option<u32>> {
+        Ok(self
+            .expr_scalar_components(expr, meta)?
+            .and_then(type_power))
+    }
+
+    pub fn conversion(
+        &mut self,
+        expr: &mut Handle<Expression>,
+        meta: Span,
+        scalar: Scalar,
+    ) -> Result<()> {
+        *expr = self.add_expression(
+            Expression::As {
+                expr: *expr,
+                kind: scalar.kind,
+                convert: Some(scalar.width),
+            },
+            meta,
+        )?;
+
+        Ok(())
+    }
+
+    pub fn implicit_conversion(
+        &mut self,
+        expr: &mut Handle<Expression>,
+        meta: Span,
+        scalar: Scalar,
+    ) -> Result<()> {
+        if let (Some(tgt_power), Some(expr_power)) =
+            (type_power(scalar), self.expr_power(*expr, meta)?)
+        {
+            if tgt_power > expr_power {
+                self.conversion(expr, meta, scalar)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn forced_conversion(
+        &mut self,
+        expr: &mut Handle<Expression>,
+        meta: Span,
+        scalar: Scalar,
+    ) -> Result<()> {
+        if let Some(expr_scalar) = self.expr_scalar_components(*expr, meta)? {
+            if expr_scalar != scalar {
+                self.conversion(expr, meta, scalar)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn binary_implicit_conversion(
+        &mut self,
+        left: &mut Handle<Expression>,
+        left_meta: Span,
+        right: &mut Handle<Expression>,
+        right_meta: Span,
+    ) -> Result<()> {
+        let left_components = self.expr_scalar_components(*left, left_meta)?;
+        let right_components = self.expr_scalar_components(*right, right_meta)?;
+
+        if let (Some((left_power, left_scalar)), Some((right_power, right_scalar))) = (
+            left_components.and_then(|scalar| Some((type_power(scalar)?, scalar))),
+            right_components.and_then(|scalar| Some((type_power(scalar)?, scalar))),
+        ) {
+            match left_power.cmp(&right_power) {
+                core::cmp::Ordering::Less => {
+                    self.conversion(left, left_meta, right_scalar)?;
+                }
+                core::cmp::Ordering::Equal => {}
+                core::cmp::Ordering::Greater => {
+                    self.conversion(right, right_meta, left_scalar)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn implicit_splat(
+        &mut self,
+        expr: &mut Handle<Expression>,
+        meta: Span,
+        vector_size: Option<VectorSize>,
+    ) -> Result<()> {
+        let expr_type = self.resolve_type(*expr, meta)?;
+
+        if let (&TypeInner::Scalar { .. }, Some(size)) = (expr_type, vector_size) {
+            *expr = self.add_expression(Expression::Splat { size, value: *expr }, meta)?
+        }
+
+        Ok(())
+    }
+
+    pub fn vector_resize(
+        &mut self,
+        size: VectorSize,
+        vector: Handle<Expression>,
+        meta: Span,
+    ) -> Result<Handle<Expression>> {
+        self.add_expression(
+            Expression::Swizzle {
+                size,
+                vector,
+                pattern: naga::SwizzleComponent::XYZW,
+            },
+            meta,
+        )
+    }
+}
+
+impl Index<Handle<Expression>> for Context<'_> {
+    type Output = Expression;
+
+    fn index(&self, index: Handle<Expression>) -> &Self::Output {
+        if self.is_const {
+            &self.module.global_expressions[index]
+        } else {
+            &self.expressions[index]
+        }
+    }
+}
+
+/// Helper struct passed when parsing expressions
+///
+/// This struct should only be obtained through [`stmt_ctx`](Context::stmt_ctx)
+/// and only one of these may be active at any time per context.
+#[derive(Debug)]
+pub struct StmtContext {
+    /// A arena of high level expressions which can be lowered through a
+    /// [`Context`] to Naga's [`Expression`]s
+    pub hir_exprs: Arena<HirExpr>,
+}
+
+impl StmtContext {
+    const fn new() -> Self {
+        StmtContext {
+            hir_exprs: Arena::new(),
+        }
+    }
+}
+
+}
+mod error {
+use std::{
+    borrow::Cow,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+
+use crate::translate::iris_glsl::frontend::pp::PreprocessorError;
+
+use super::token::TokenValue;
+use naga::SourceLocation;
+use naga::{proc::ConstantEvaluatorError, Span};
+
+fn join_with_comma(list: &[ExpectedToken]) -> String {
+    let mut string = "".to_string();
+    for (i, val) in list.iter().enumerate() {
+        string.push_str(&val.to_string());
+        match i {
+            i if i == list.len() - 1 => {}
+            i if i == list.len() - 2 => string.push_str(" or "),
+            _ => string.push_str(", "),
+        }
+    }
+    string
+}
+
+/// One of the expected tokens returned in [`InvalidToken`](ErrorKind::InvalidToken).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExpectedToken {
+    /// A specific token was expected.
+    Token(TokenValue),
+    /// A type was expected.
+    TypeName,
+    /// An identifier was expected.
+    Identifier,
+    /// An integer literal was expected.
+    IntLiteral,
+    /// A float literal was expected.
+    FloatLiteral,
+    /// A boolean literal was expected.
+    BoolLiteral,
+    /// The end of file was expected.
+    Eof,
+}
+impl From<TokenValue> for ExpectedToken {
+    fn from(token: TokenValue) -> Self {
+        ExpectedToken::Token(token)
+    }
+}
+impl core::fmt::Display for ExpectedToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            ExpectedToken::Token(ref token) => write!(f, "{token:?}"),
+            ExpectedToken::TypeName => write!(f, "a type"),
+            ExpectedToken::Identifier => write!(f, "identifier"),
+            ExpectedToken::IntLiteral => write!(f, "integer literal"),
+            ExpectedToken::FloatLiteral => write!(f, "float literal"),
+            ExpectedToken::BoolLiteral => write!(f, "bool literal"),
+            ExpectedToken::Eof => write!(f, "end of file"),
+        }
+    }
+}
+
+/// Information about the cause of an error.
+#[derive(Clone, Debug)]
+pub enum ErrorKind {
+    /// Whilst parsing as encountered an unexpected EOF.
+    EndOfFile,
+    /// The shader specified an unsupported or invalid profile.
+    InvalidProfile(String),
+    /// The shader requested an unsupported or invalid version.
+    InvalidVersion(u64),
+    /// Whilst parsing an unexpected token was encountered.
+    ///
+    /// A list of expected tokens is also returned.
+    InvalidToken(TokenValue, Vec<ExpectedToken>),
+    /// A specific feature is not yet implemented.
+    ///
+    /// To help prioritize work please open an issue in the github issue tracker
+    /// if none exist already or react to the already existing one.
+    NotImplemented(&'static str),
+    /// A reference to a variable that wasn't declared was used.
+    UnknownVariable(String),
+    /// A reference to a type that wasn't declared was used.
+    UnknownType(String),
+    /// A reference to a non existent member of a type was made.
+    UnknownField(String),
+    /// An unknown layout qualifier was used.
+    ///
+    /// If the qualifier does exist please open an issue in the github issue tracker
+    /// if none exist already or react to the already existing one to help
+    /// prioritize work.
+    UnknownLayoutQualifier(String),
+    /// Unsupported matrix of the form matCx2
+    ///
+    /// Our IR expects matrices of the form matCx2 to have a stride of 8 however
+    /// matrices in the std140 layout have a stride of at least 16.
+    UnsupportedMatrixWithTwoRowsInStd140 { columns: u8 },
+    /// Unsupported matrix of the form f16matCxR
+    ///
+    /// Our IR expects matrices of the form f16matCxR to have a stride of 4/8/8 depending on row-count,
+    /// however matrices in the std140 layout have a stride of at least 16.
+    UnsupportedF16MatrixInStd140 { columns: u8, rows: u8 },
+    /// A variable with the same name already exists in the current scope.
+    VariableAlreadyDeclared(String),
+    /// A semantic error was detected in the shader.
+    SemanticError(Cow<'static, str>),
+    /// An error was returned by the preprocessor.
+    PreprocessorError(PreprocessorError),
+    /// The parser entered an illegal state and exited
+    ///
+    /// This obviously is a bug and as such should be reported in the github issue tracker
+    InternalError(&'static str),
+}
+
+
+impl core::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::EndOfFile => write!(f, "Unexpected end of file"),
+            Self::InvalidProfile(p) => write!(f, "Invalid profile: {p}"),
+            Self::InvalidVersion(v) => write!(f, "Invalid version: {v}"),
+            Self::InvalidToken(found, expected) => write!(f, "Expected {}, found {found:?}", join_with_comma(expected)),
+            Self::NotImplemented(w) => write!(f, "Not implemented: {w}"),
+            Self::UnknownVariable(n) => write!(f, "Unknown variable: {n}"),
+            Self::UnknownType(n) => write!(f, "Unknown type: {n}"),
+            Self::UnknownField(n) => write!(f, "Unknown field: {n}"),
+            Self::UnknownLayoutQualifier(n) => write!(f, "Unknown layout qualifier: {n}"),
+            Self::UnsupportedMatrixWithTwoRowsInStd140 { columns } => write!(f, "unsupported matrix of the form matCx2 (in this case mat{columns}x2) in std140 block layout"),
+            Self::UnsupportedF16MatrixInStd140 { columns, rows } => write!(f, "unsupported matrix of the form f16matCxR (in this case f16mat{columns}x{rows}) in std140 block layout"),
+            Self::VariableAlreadyDeclared(n) => write!(f, "Variable already declared: {n}"),
+            Self::SemanticError(e) => write!(f, "{e}"),
+            Self::PreprocessorError(e) => write!(f, "{e:?}"),
+            Self::InternalError(e) => write!(f, "Internal error: {e}"),
+        }
+    }
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.kind)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<ConstantEvaluatorError> for ErrorKind {
+    fn from(err: ConstantEvaluatorError) -> Self {
+        ErrorKind::SemanticError(err.to_string().into())
+    }
+}
+
+/// Error returned during shader parsing.
+#[derive(Clone, Debug)]
+pub struct Error {
+    /// Holds the information about the error itself.
+    pub kind: ErrorKind,
+    /// Holds information about the range of the source code where the error happened.
+    pub meta: Span,
+}
+
+impl Error {
+    /// Returns a [`SourceLocation`] for the error message.
+    pub fn location(&self, source: &str) -> Option<SourceLocation> {
+        Some(self.meta.location(source))
+    }
+}
+
+/// A collection of errors returned during shader parsing.
+#[derive(Clone, Debug)]
+pub struct ParseErrors {
+    pub errors: Vec<Error>,
+}
+
+impl ParseErrors {
+    pub fn emit_to_string(&self, source: &str) -> String {
+        let mut out = String::new();
+        for e in &self.errors {
+            let line = e.meta.to_range().map_or(0, |r| source[..r.start.min(source.len())].matches('\n').count() + 1);
+            out.push_str(&format!("line {line}: {}\n", e.kind));
+        }
+        out
+    }
+}
+
+impl core::fmt::Display for ParseErrors {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        self.errors.iter().try_for_each(|e| write!(f, "{e:?}"))
+    }
+}
+
+impl core::error::Error for ParseErrors {}
+
+impl From<Vec<Error>> for ParseErrors {
+    fn from(errors: Vec<Error>) -> Self {
+        Self { errors }
+    }
+}
+
+}
+mod functions {
+use std::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::iter;
+
+use super::{
+    ast::*,
+    builtins::{inject_builtin, sampled_to_depth},
+    context::{Context, ExprPos, StmtContext},
+    error::{Error, ErrorKind},
+    types::scalar_components,
+    Frontend, Result,
+};
+use crate::translate::iris_glsl::frontend::types::type_power;
+use naga::{proc::ensure_block_returns, AddressSpace, Block, EntryPoint,
+    Expression, Function, FunctionArgument, FunctionResult, Handle, Literal, LocalVariable, Scalar,
+    ScalarKind, Span, Statement, StructMember, Type, TypeInner};
+
+/// Struct detailing a store operation that must happen after a function call
+struct ProxyWrite {
+    /// The store target
+    target: Handle<Expression>,
+    /// A pointer to read the value of the store
+    value: Handle<Expression>,
+    /// An optional conversion to be applied
+    convert: Option<Scalar>,
+}
+
+impl Frontend {
+    pub(crate) fn function_or_constructor_call(
+        &mut self,
+        ctx: &mut Context,
+        stmt: &StmtContext,
+        fc: FunctionCallKind,
+        raw_args: &[Handle<HirExpr>],
+        meta: Span,
+    ) -> Result<Option<Handle<Expression>>> {
+        // Iris Features: atomics on buffer and shared memory (`atomicAdd(counts[i], 1u)`).
+        if let FunctionCallKind::Function(ref name) = fc
+            && let Some(fun) = atomic_function(name)
+            && raw_args.len() == if name == "atomicCompSwap" { 3 } else { 2 }
+        {
+            return self.atomic_call(ctx, stmt, name, fun, raw_args, meta).map(Some);
+        }
+        let args: Vec<_> = raw_args
+            .iter()
+            .map(|e| ctx.lower_expect_inner(stmt, self, *e, ExprPos::Rhs))
+            .collect::<Result<_>>()?;
+
+        match fc {
+            FunctionCallKind::TypeConstructor(ty) => {
+                if args.len() == 1 {
+                    self.constructor_single(ctx, ty, args[0], meta).map(Some)
+                } else {
+                    self.constructor_many(ctx, ty, args, meta).map(Some)
+                }
+            }
+            FunctionCallKind::Function(name) => {
+                self.function_call(ctx, stmt, name, args, raw_args, meta)
+            }
+        }
+    }
+
+    /// `atomicAdd(mem, v)` and its kin: an atomic statement on `mem`'s pointer, its old value
+    /// the call's. The memory's type becomes atomic afterwards (`atomic_types`).
+    fn atomic_call(
+        &mut self,
+        ctx: &mut Context,
+        stmt: &StmtContext,
+        name: &str,
+        fun: naga::AtomicFunction,
+        raw_args: &[Handle<HirExpr>],
+        meta: Span,
+    ) -> Result<Handle<Expression>> {
+        let (pointer, _) = ctx.lower_expect_inner(stmt, self, raw_args[0], ExprPos::Lhs)?;
+        let scalar = match *ctx.resolve_type(pointer, meta)? {
+            TypeInner::Pointer { base, .. } => match ctx.module.types[base].inner {
+                TypeInner::Scalar(s) => s,
+                TypeInner::Atomic(s) => s,
+                _ => {
+                    return Err(Error {
+                        kind: ErrorKind::SemanticError(format!("`{name}` on memory that is not an integer").into()),
+                        meta,
+                    })
+                }
+            },
+            TypeInner::ValuePointer { size: None, scalar, .. } => scalar,
+            _ => {
+                return Err(Error {
+                    kind: ErrorKind::SemanticError(format!("`{name}` needs a variable to work on").into()),
+                    meta,
+                })
+            }
+        };
+        let mut lower_value = |ctx: &mut Context, this: &mut Self, e: Handle<HirExpr>| -> Result<Handle<Expression>> {
+            let (mut v, vmeta) = ctx.lower_expect_inner(stmt, this, e, ExprPos::Rhs)?;
+            ctx.implicit_conversion(&mut v, vmeta, scalar)?;
+            Ok(v)
+        };
+        let fun = if name == "atomicCompSwap" {
+            let compare = lower_value(ctx, self, raw_args[1])?;
+            naga::AtomicFunction::Exchange { compare: Some(compare) }
+        } else {
+            fun
+        };
+        let value = lower_value(ctx, self, raw_args[raw_args.len() - 1])?;
+        let ty = ctx.module.types.insert(Type { name: None, inner: TypeInner::Scalar(scalar) }, Span::default());
+        ctx.emit_end();
+        let result = ctx.expressions.append(Expression::AtomicResult { ty, comparison: false }, meta);
+        ctx.local_expression_kind_tracker.insert(result, naga::proc::ExpressionKind::Runtime);
+        ctx.emit_start();
+        ctx.body.push(
+            naga::Statement::Atomic { pointer, fun, value, result: Some(result) },
+            meta,
+        );
+        Ok(result)
+    }
+
+    fn constructor_single(
+        &mut self,
+        ctx: &mut Context,
+        ty: Handle<Type>,
+        (mut value, expr_meta): (Handle<Expression>, Span),
+        meta: Span,
+    ) -> Result<Handle<Expression>> {
+        let expr_type = ctx.resolve_type(value, expr_meta)?;
+
+        let vector_size = match *expr_type {
+            TypeInner::Vector { size, .. } => Some(size),
+            _ => None,
+        };
+
+        let expr_is_bool = expr_type.scalar_kind() == Some(ScalarKind::Bool);
+
+        // Special case: if casting from a bool, we need to use Select and not As.
+        match ctx.module.types[ty].inner.scalar() {
+            Some(result_scalar) if expr_is_bool && result_scalar.kind != ScalarKind::Bool => {
+                let result_scalar = Scalar {
+                    width: 4,
+                    ..result_scalar
+                };
+                let l0 = Literal::zero(result_scalar).unwrap();
+                let l1 = Literal::one(result_scalar).unwrap();
+                let mut reject = ctx.add_expression(Expression::Literal(l0), expr_meta)?;
+                let mut accept = ctx.add_expression(Expression::Literal(l1), expr_meta)?;
+
+                ctx.implicit_splat(&mut reject, meta, vector_size)?;
+                ctx.implicit_splat(&mut accept, meta, vector_size)?;
+
+                let h = ctx.add_expression(
+                    Expression::Select {
+                        accept,
+                        reject,
+                        condition: value,
+                    },
+                    expr_meta,
+                )?;
+
+                return Ok(h);
+            }
+            _ => {}
+        }
+
+        Ok(match ctx.module.types[ty].inner {
+            TypeInner::Vector { size, scalar } if vector_size.is_none() => {
+                ctx.forced_conversion(&mut value, expr_meta, scalar)?;
+
+                if let TypeInner::Scalar { .. } = *ctx.resolve_type(value, expr_meta)? {
+                    ctx.add_expression(Expression::Splat { size, value }, meta)?
+                } else {
+                    self.vector_constructor(ctx, ty, size, scalar, &[(value, expr_meta)], meta)?
+                }
+            }
+            TypeInner::Scalar(scalar) => {
+                let mut expr = value;
+                if let TypeInner::Vector { .. } | TypeInner::Matrix { .. } =
+                    *ctx.resolve_type(value, expr_meta)?
+                {
+                    expr = ctx.add_expression(
+                        Expression::AccessIndex {
+                            base: expr,
+                            index: 0,
+                        },
+                        meta,
+                    )?;
+                }
+
+                if let TypeInner::Matrix { .. } = *ctx.resolve_type(value, expr_meta)? {
+                    expr = ctx.add_expression(
+                        Expression::AccessIndex {
+                            base: expr,
+                            index: 0,
+                        },
+                        meta,
+                    )?;
+                }
+
+                ctx.add_expression(
+                    Expression::As {
+                        kind: scalar.kind,
+                        expr,
+                        convert: Some(scalar.width),
+                    },
+                    meta,
+                )?
+            }
+            TypeInner::Vector { size, scalar } => {
+                if vector_size != Some(size) {
+                    value = ctx.vector_resize(size, value, expr_meta)?;
+                }
+
+                ctx.add_expression(
+                    Expression::As {
+                        kind: scalar.kind,
+                        expr: value,
+                        convert: Some(scalar.width),
+                    },
+                    meta,
+                )?
+            }
+            TypeInner::Matrix {
+                columns,
+                rows,
+                scalar,
+            } => self.matrix_one_arg(ctx, ty, columns, rows, scalar, (value, expr_meta), meta)?,
+            TypeInner::Struct { ref members, .. } => {
+                let scalar_components = members
+                    .first()
+                    .and_then(|member| scalar_components(&ctx.module.types[member.ty].inner));
+                if let Some(scalar) = scalar_components {
+                    ctx.implicit_conversion(&mut value, expr_meta, scalar)?;
+                }
+
+                ctx.add_expression(
+                    Expression::Compose {
+                        ty,
+                        components: vec![value],
+                    },
+                    meta,
+                )?
+            }
+
+            TypeInner::Array { base, .. } => {
+                let scalar_components = scalar_components(&ctx.module.types[base].inner);
+                if let Some(scalar) = scalar_components {
+                    ctx.implicit_conversion(&mut value, expr_meta, scalar)?;
+                }
+
+                ctx.add_expression(
+                    Expression::Compose {
+                        ty,
+                        components: vec![value],
+                    },
+                    meta,
+                )?
+            }
+            _ => {
+                self.errors.push(Error {
+                    kind: ErrorKind::SemanticError("Bad type constructor".into()),
+                    meta,
+                });
+
+                value
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matrix_one_arg(
+        &mut self,
+        ctx: &mut Context,
+        ty: Handle<Type>,
+        columns: naga::VectorSize,
+        rows: naga::VectorSize,
+        element_scalar: Scalar,
+        (mut value, expr_meta): (Handle<Expression>, Span),
+        meta: Span,
+    ) -> Result<Handle<Expression>> {
+        let mut components = Vec::with_capacity(columns as usize);
+        // TODO: casts
+        // `Expression::As` doesn't support matrix width
+        // casts so we need to do some extra work for casts
+
+        ctx.forced_conversion(&mut value, expr_meta, element_scalar)?;
+        match *ctx.resolve_type(value, expr_meta)? {
+            TypeInner::Scalar(_) => {
+                // If a matrix is constructed with a single scalar value, then that
+                // value is used to initialize all the values along the diagonal of
+                // the matrix; the rest are given zeros.
+                let vector_ty = ctx.module.types.insert(
+                    Type {
+                        name: None,
+                        inner: TypeInner::Vector {
+                            size: rows,
+                            scalar: element_scalar,
+                        },
+                    },
+                    meta,
+                );
+
+                let zero_literal = Literal::zero(element_scalar).unwrap();
+                let zero = ctx.add_expression(Expression::Literal(zero_literal), meta)?;
+
+                for i in 0..columns as u32 {
+                    components.push(
+                        ctx.add_expression(
+                            Expression::Compose {
+                                ty: vector_ty,
+                                components: (0..rows as u32)
+                                    .map(|r| match r == i {
+                                        true => value,
+                                        false => zero,
+                                    })
+                                    .collect(),
+                            },
+                            meta,
+                        )?,
+                    )
+                }
+            }
+            TypeInner::Matrix {
+                rows: ori_rows,
+                columns: ori_cols,
+                ..
+            } => {
+                // If a matrix is constructed from a matrix, then each component
+                // (column i, row j) in the result that has a corresponding component
+                // (column i, row j) in the argument will be initialized from there. All
+                // other components will be initialized to the identity matrix.
+
+                let zero_literal = Literal::zero(element_scalar).unwrap();
+                let one_literal = Literal::one(element_scalar).unwrap();
+
+                let zero = ctx.add_expression(Expression::Literal(zero_literal), meta)?;
+                let one = ctx.add_expression(Expression::Literal(one_literal), meta)?;
+
+                let vector_ty = ctx.module.types.insert(
+                    Type {
+                        name: None,
+                        inner: TypeInner::Vector {
+                            size: rows,
+                            scalar: element_scalar,
+                        },
+                    },
+                    meta,
+                );
+
+                for i in 0..columns as u32 {
+                    if i < ori_cols as u32 {
+                        use core::cmp::Ordering;
+
+                        let vector = ctx.add_expression(
+                            Expression::AccessIndex {
+                                base: value,
+                                index: i,
+                            },
+                            meta,
+                        )?;
+
+                        components.push(match ori_rows.cmp(&rows) {
+                            Ordering::Less => {
+                                let components = (0..rows as u32)
+                                    .map(|r| {
+                                        if r < ori_rows as u32 {
+                                            ctx.add_expression(
+                                                Expression::AccessIndex {
+                                                    base: vector,
+                                                    index: r,
+                                                },
+                                                meta,
+                                            )
+                                        } else if r == i {
+                                            Ok(one)
+                                        } else {
+                                            Ok(zero)
+                                        }
+                                    })
+                                    .collect::<Result<_>>()?;
+
+                                ctx.add_expression(
+                                    Expression::Compose {
+                                        ty: vector_ty,
+                                        components,
+                                    },
+                                    meta,
+                                )?
+                            }
+                            Ordering::Equal => vector,
+                            Ordering::Greater => ctx.vector_resize(rows, vector, meta)?,
+                        })
+                    } else {
+                        let compose_expr = Expression::Compose {
+                            ty: vector_ty,
+                            components: (0..rows as u32)
+                                .map(|r| match r == i {
+                                    true => one,
+                                    false => zero,
+                                })
+                                .collect(),
+                        };
+
+                        let vec = ctx.add_expression(compose_expr, meta)?;
+
+                        components.push(vec)
+                    }
+                }
+            }
+            _ => {
+                components = iter::repeat_n(value, columns as usize).collect();
+            }
+        }
+
+        ctx.add_expression(Expression::Compose { ty, components }, meta)
+    }
+
+    fn vector_constructor(
+        &mut self,
+        ctx: &mut Context,
+        ty: Handle<Type>,
+        size: naga::VectorSize,
+        scalar: Scalar,
+        args: &[(Handle<Expression>, Span)],
+        meta: Span,
+    ) -> Result<Handle<Expression>> {
+        let mut components = Vec::with_capacity(size as usize);
+
+        for (mut arg, expr_meta) in args.iter().copied() {
+            ctx.forced_conversion(&mut arg, expr_meta, scalar)?;
+
+            if components.len() >= size as usize {
+                break;
+            }
+
+            match *ctx.resolve_type(arg, expr_meta)? {
+                TypeInner::Scalar { .. } => components.push(arg),
+                TypeInner::Matrix { rows, columns, .. } => {
+                    components.reserve(rows as usize * columns as usize);
+                    for c in 0..(columns as u32) {
+                        let base = ctx.add_expression(
+                            Expression::AccessIndex {
+                                base: arg,
+                                index: c,
+                            },
+                            expr_meta,
+                        )?;
+                        for r in 0..(rows as u32) {
+                            components.push(ctx.add_expression(
+                                Expression::AccessIndex { base, index: r },
+                                expr_meta,
+                            )?)
+                        }
+                    }
+                }
+                TypeInner::Vector { size: ori_size, .. } => {
+                    components.reserve(ori_size as usize);
+                    for index in 0..(ori_size as u32) {
+                        components.push(ctx.add_expression(
+                            Expression::AccessIndex { base: arg, index },
+                            expr_meta,
+                        )?)
+                    }
+                }
+                _ => components.push(arg),
+            }
+        }
+
+        components.truncate(size as usize);
+
+        ctx.add_expression(Expression::Compose { ty, components }, meta)
+    }
+
+    fn constructor_many(
+        &mut self,
+        ctx: &mut Context,
+        ty: Handle<Type>,
+        args: Vec<(Handle<Expression>, Span)>,
+        meta: Span,
+    ) -> Result<Handle<Expression>> {
+        let mut components = Vec::with_capacity(args.len());
+
+        let struct_member_data = match ctx.module.types[ty].inner {
+            TypeInner::Matrix {
+                columns,
+                rows,
+                scalar: element_scalar,
+            } => {
+                let mut flattened = Vec::with_capacity(columns as usize * rows as usize);
+
+                for (mut arg, meta) in args.iter().copied() {
+                    ctx.forced_conversion(&mut arg, meta, element_scalar)?;
+
+                    match *ctx.resolve_type(arg, meta)? {
+                        TypeInner::Vector { size, .. } => {
+                            for i in 0..(size as u32) {
+                                flattened.push(ctx.add_expression(
+                                    Expression::AccessIndex {
+                                        base: arg,
+                                        index: i,
+                                    },
+                                    meta,
+                                )?)
+                            }
+                        }
+                        _ => flattened.push(arg),
+                    }
+                }
+
+                let ty = ctx.module.types.insert(
+                    Type {
+                        name: None,
+                        inner: TypeInner::Vector {
+                            size: rows,
+                            scalar: element_scalar,
+                        },
+                    },
+                    meta,
+                );
+
+                for chunk in flattened.chunks(rows as usize) {
+                    components.push(ctx.add_expression(
+                        Expression::Compose {
+                            ty,
+                            components: Vec::from(chunk),
+                        },
+                        meta,
+                    )?)
+                }
+                None
+            }
+            TypeInner::Vector { size, scalar } => {
+                return self.vector_constructor(ctx, ty, size, scalar, &args, meta)
+            }
+            TypeInner::Array { base, .. } => {
+                for (mut arg, meta) in args.iter().copied() {
+                    let scalar_components = scalar_components(&ctx.module.types[base].inner);
+                    if let Some(scalar) = scalar_components {
+                        ctx.implicit_conversion(&mut arg, meta, scalar)?;
+                    }
+
+                    components.push(arg)
+                }
+                None
+            }
+            TypeInner::Struct { ref members, .. } => Some(
+                members
+                    .iter()
+                    .map(|member| scalar_components(&ctx.module.types[member.ty].inner))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => {
+                return Err(Error {
+                    kind: ErrorKind::SemanticError("Constructor: Too many arguments".into()),
+                    meta,
+                })
+            }
+        };
+
+        if let Some(struct_member_data) = struct_member_data {
+            for ((mut arg, meta), scalar_components) in
+                args.iter().copied().zip(struct_member_data.iter().copied())
+            {
+                if let Some(scalar) = scalar_components {
+                    ctx.implicit_conversion(&mut arg, meta, scalar)?;
+                }
+
+                components.push(arg)
+            }
+        }
+
+        ctx.add_expression(Expression::Compose { ty, components }, meta)
+    }
+
+    fn function_call(
+        &mut self,
+        ctx: &mut Context,
+        stmt: &StmtContext,
+        name: String,
+        args: Vec<(Handle<Expression>, Span)>,
+        raw_args: &[Handle<HirExpr>],
+        meta: Span,
+    ) -> Result<Option<Handle<Expression>>> {
+        // Grow the typifier to be able to index it later without needing
+        // to hold the context mutably
+        for &(expr, span) in args.iter() {
+            ctx.typifier_grow(expr, span)?;
+        }
+
+        // Check if the passed arguments require any special variations
+        let mut variations =
+            builtin_required_variations(args.iter().map(|&(expr, _)| ctx.get_type(expr)));
+
+        // Initiate the declaration if it wasn't previously initialized and inject builtins
+        let declaration = self.lookup_function.entry(name.clone()).or_insert_with(|| {
+            variations |= BuiltinVariations::STANDARD;
+            Default::default()
+        });
+        inject_builtin(declaration, ctx.module, &name, variations);
+
+        // Borrow again but without mutability, at this point a declaration is guaranteed
+        let declaration = self.lookup_function.get(&name).unwrap();
+
+        // Possibly contains the overload to be used in the call
+        let mut maybe_overload = None;
+        // The conversions needed for the best analyzed overload, this is initialized all to
+        // `NONE` to make sure that conversions always pass the first time without ambiguity
+        let mut old_conversions = vec![Conversion::None; args.len()];
+        // Tracks whether the comparison between overloads lead to an ambiguity
+        let mut ambiguous = false;
+
+        // Iterate over all the available overloads to select either an exact match or a
+        // overload which has suitable implicit conversions
+        'outer: for (overload_idx, overload) in declaration.overloads.iter().enumerate() {
+            // If the overload and the function call don't have the same number of arguments
+            // continue to the next overload
+            if args.len() != overload.parameters.len() {
+                continue;
+            }
+
+            crate::translate::iris_glsl::frontend::no_log!("Testing overload {overload_idx}");
+
+            // Stores whether the current overload matches exactly the function call
+            let mut exact = true;
+            // State of the selection
+            // If None we still don't know what is the best overload
+            // If Some(true) the new overload is better
+            // If Some(false) the old overload is better
+            let mut superior = None;
+            // Store the conversions for the current overload so that later they can replace the
+            // conversions used for querying the best overload
+            let mut new_conversions = vec![Conversion::None; args.len()];
+
+            // Loop through the overload parameters and check if the current overload is better
+            // compared to the previous best overload.
+            for (i, overload_parameter) in overload.parameters.iter().enumerate() {
+                let call_argument = &args[i];
+                let parameter_info = &overload.parameters_info[i];
+
+                // If the image is used in the overload as a depth texture convert it
+                // before comparing, otherwise exact matches wouldn't be reported
+                if parameter_info.depth {
+                    sampled_to_depth(ctx, call_argument.0, call_argument.1, &mut self.errors);
+                    ctx.invalidate_expression(call_argument.0, call_argument.1)?
+                }
+
+                ctx.typifier_grow(call_argument.0, call_argument.1)?;
+
+                let overload_param_ty = &ctx.module.types[*overload_parameter].inner;
+                let call_arg_ty = ctx.get_type(call_argument.0);
+
+                crate::translate::iris_glsl::frontend::no_log!(
+                    "Testing parameter {i}\n\tOverload = {overload_param_ty:?}\n\tCall = {call_arg_ty:?}"
+                );
+
+                // Storage images cannot be directly compared since while the access is part of the
+                // type in naga's IR, in glsl they are a qualifier and don't enter in the match as
+                // long as the access needed is satisfied.
+                if let (
+                    &TypeInner::Image {
+                        class:
+                            naga::ImageClass::Storage {
+                                format: overload_format,
+                                access: overload_access,
+                            },
+                        dim: overload_dim,
+                        arrayed: overload_arrayed,
+                    },
+                    &TypeInner::Image {
+                        class:
+                            naga::ImageClass::Storage {
+                                format: call_format,
+                                access: call_access,
+                            },
+                        dim: call_dim,
+                        arrayed: call_arrayed,
+                    },
+                ) = (overload_param_ty, call_arg_ty)
+                {
+                    // Images size must match otherwise the overload isn't what we want
+                    let good_size = call_dim == overload_dim && call_arrayed == overload_arrayed;
+                    // Glsl requires the formats to strictly match unless you are builtin
+                    // function overload and have not been replaced, in which case we only
+                    // check that the format scalar kind matches
+                    let good_format = overload_format == call_format
+                        || (overload.internal
+                            && Scalar::from(overload_format) == Scalar::from(call_format));
+                    if !(good_size && good_format) {
+                        continue 'outer;
+                    }
+
+                    // While storage access mismatch is an error it isn't one that causes
+                    // the overload matching to fail so we defer the error and consider
+                    // that the images match exactly
+                    if !call_access.contains(overload_access) {
+                        self.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                format!(
+                                    "'{name}': image needs {overload_access:?} access but only {call_access:?} was provided"
+                                )
+                                .into(),
+                            ),
+                            meta,
+                        });
+                    }
+
+                    // The images satisfy the conditions to be considered as an exact match
+                    new_conversions[i] = Conversion::Exact;
+                    continue;
+                } else if overload_param_ty == call_arg_ty {
+                    // If the types match there's no need to check for conversions so continue
+                    new_conversions[i] = Conversion::Exact;
+                    continue;
+                }
+
+                // Glsl defines that inout follows both the conversions for input parameters and
+                // output parameters, this means that the type must have a conversion from both the
+                // call argument to the function parameter and the function parameter to the call
+                // argument, the only way this is possible is for the conversion to be an identity
+                // (i.e. call argument = function parameter)
+                if let ParameterQualifier::InOut = parameter_info.qualifier {
+                    continue 'outer;
+                }
+
+                // The function call argument and the function definition
+                // parameter are not equal at this point, so we need to try
+                // implicit conversions.
+                //
+                // Now there are two cases, the argument is defined as a normal
+                // parameter (`in` or `const`), in this case an implicit
+                // conversion is made from the calling argument to the
+                // definition argument. If the parameter is `out` the
+                // opposite needs to be done, so the implicit conversion is made
+                // from the definition argument to the calling argument.
+                let maybe_conversion = if parameter_info.qualifier.is_lhs() {
+                    conversion(call_arg_ty, overload_param_ty)
+                } else {
+                    conversion(overload_param_ty, call_arg_ty)
+                };
+
+                let conversion = match maybe_conversion {
+                    Some(info) => info,
+                    None => continue 'outer,
+                };
+
+                // At this point a conversion will be needed so the overload no longer
+                // exactly matches the call arguments
+                exact = false;
+
+                // Compare the conversions needed for this overload parameter to that of the
+                // last overload analyzed respective parameter, the value is:
+                // - `true` when the new overload argument has a better conversion
+                // - `false` when the old overload argument has a better conversion
+                let best_arg = match (conversion, old_conversions[i]) {
+                    // An exact match is always better, we don't need to check this for the
+                    // current overload since it was checked earlier
+                    (_, Conversion::Exact) => false,
+                    // No overload was yet analyzed so this one is the best yet
+                    (_, Conversion::None) => true,
+                    // A conversion from a float to a double is the best possible conversion
+                    (Conversion::FloatToDouble, _) => true,
+                    (_, Conversion::FloatToDouble) => false,
+                    // A conversion from a float to an integer is preferred than one
+                    // from double to an integer
+                    (Conversion::IntToFloat, Conversion::IntToDouble) => true,
+                    (Conversion::IntToDouble, Conversion::IntToFloat) => false,
+                    // This case handles things like no conversion and exact which were already
+                    // treated and other cases which no conversion is better than the other
+                    _ => continue,
+                };
+
+                // Check if the best parameter corresponds to the current selected overload
+                // to pass to the next comparison, if this isn't true mark it as ambiguous
+                match best_arg {
+                    true => match superior {
+                        Some(false) => ambiguous = true,
+                        _ => {
+                            superior = Some(true);
+                            new_conversions[i] = conversion
+                        }
+                    },
+                    false => match superior {
+                        Some(true) => ambiguous = true,
+                        _ => superior = Some(false),
+                    },
+                }
+            }
+
+            // The overload matches exactly the function call so there's no ambiguity (since
+            // repeated overload aren't allowed) and the current overload is selected, no
+            // further querying is needed.
+            if exact {
+                maybe_overload = Some(overload);
+                ambiguous = false;
+                break;
+            }
+
+            match superior {
+                // New overload is better keep it
+                Some(true) => {
+                    maybe_overload = Some(overload);
+                    // Replace the conversions
+                    old_conversions = new_conversions;
+                }
+                // Old overload is better do nothing
+                Some(false) => {}
+                // No overload was better than the other this can be caused
+                // when all conversions are ambiguous in which the overloads themselves are
+                // ambiguous.
+                // Iris Features: the drivers Iris packs are written for take the call with one of
+                // them (`max(uintValue, 1)`); the first found stays.
+                None => {}
+            }
+        }
+
+        if ambiguous {
+            self.errors.push(Error {
+                kind: ErrorKind::SemanticError(
+                    format!("Ambiguous best function for '{name}'").into(),
+                ),
+                meta,
+            })
+        }
+
+        let overload = maybe_overload.ok_or_else(|| Error {
+            kind: ErrorKind::SemanticError(format!("Unknown function '{name}'").into()),
+            meta,
+        })?;
+
+        let parameters_info = overload.parameters_info.clone();
+        let parameters = overload.parameters.clone();
+        let is_void = overload.void;
+        let kind = overload.kind;
+
+        let mut arguments = Vec::with_capacity(args.len());
+        let mut proxy_writes = Vec::new();
+
+        // Iterate through the function call arguments applying transformations as needed
+        for (((parameter_info, call_argument), expr), parameter) in parameters_info
+            .iter()
+            .zip(&args)
+            .zip(raw_args)
+            .zip(&parameters)
+        {
+            if parameter_info.qualifier.is_lhs() {
+                // Reprocess argument in LHS position
+                let (handle, meta) = ctx.lower_expect_inner(stmt, self, *expr, ExprPos::Lhs)?;
+
+                self.process_lhs_argument(
+                    ctx,
+                    meta,
+                    *parameter,
+                    parameter_info,
+                    handle,
+                    call_argument,
+                    &mut proxy_writes,
+                    &mut arguments,
+                )?;
+
+                continue;
+            }
+
+            let (mut handle, meta) = *call_argument;
+
+            let scalar_comps = scalar_components(&ctx.module.types[*parameter].inner);
+
+            // Apply implicit conversions as needed
+            if let Some(scalar) = scalar_comps {
+                ctx.implicit_conversion(&mut handle, meta, scalar)?;
+            }
+
+            arguments.push(handle)
+        }
+
+        match kind {
+            FunctionKind::Call(function) => {
+                ctx.emit_end();
+
+                let result = if !is_void {
+                    Some(ctx.add_expression(Expression::CallResult(function), meta)?)
+                } else {
+                    None
+                };
+
+                ctx.body.push(
+                    Statement::Call {
+                        function,
+                        arguments,
+                        result,
+                    },
+                    meta,
+                );
+
+                ctx.emit_start();
+
+                // Write back all the variables that were scheduled to their original place
+                for proxy_write in proxy_writes {
+                    let mut value = ctx.add_expression(
+                        Expression::Load {
+                            pointer: proxy_write.value,
+                        },
+                        meta,
+                    )?;
+
+                    if let Some(scalar) = proxy_write.convert {
+                        ctx.conversion(&mut value, meta, scalar)?;
+                    }
+
+                    ctx.emit_restart();
+
+                    ctx.body.push(
+                        Statement::Store {
+                            pointer: proxy_write.target,
+                            value,
+                        },
+                        meta,
+                    );
+                }
+
+                Ok(result)
+            }
+            FunctionKind::Macro(builtin) => builtin.call(self, ctx, arguments.as_mut_slice(), meta),
+        }
+    }
+
+    /// Processes a function call argument that appears in place of an output
+    /// parameter.
+    #[allow(clippy::too_many_arguments)]
+    fn process_lhs_argument(
+        &mut self,
+        ctx: &mut Context,
+        meta: Span,
+        parameter_ty: Handle<Type>,
+        parameter_info: &ParameterInfo,
+        original: Handle<Expression>,
+        call_argument: &(Handle<Expression>, Span),
+        proxy_writes: &mut Vec<ProxyWrite>,
+        arguments: &mut Vec<Handle<Expression>>,
+    ) -> Result<()> {
+        let original_ty = ctx.resolve_type(original, meta)?;
+        let original_pointer_space = original_ty.pointer_space();
+
+        // The type of a possible spill variable needed for a proxy write
+        let mut maybe_ty = match *original_ty {
+            // If the argument is to be passed as a pointer but the type of the
+            // expression returns a vector it must mean that it was for example
+            // swizzled and it must be spilled into a local before calling
+            TypeInner::Vector { size, scalar } => Some(ctx.module.types.insert(
+                Type {
+                    name: None,
+                    inner: TypeInner::Vector { size, scalar },
+                },
+                Span::default(),
+            )),
+            // If the argument is a pointer whose address space isn't `Function`, an
+            // indirection through a local variable is needed to align the address
+            // spaces of the call argument and the overload parameter.
+            TypeInner::Pointer { base, space } if space != AddressSpace::Function => Some(base),
+            TypeInner::ValuePointer {
+                size,
+                scalar,
+                space,
+            } if space != AddressSpace::Function => {
+                let inner = match size {
+                    Some(size) => TypeInner::Vector { size, scalar },
+                    None => TypeInner::Scalar(scalar),
+                };
+
+                Some(
+                    ctx.module
+                        .types
+                        .insert(Type { name: None, inner }, Span::default()),
+                )
+            }
+            _ => None,
+        };
+
+        // Since the original expression might be a pointer and we want a value
+        // for the proxy writes, we might need to load the pointer.
+        let value = if original_pointer_space.is_some() {
+            ctx.add_expression(Expression::Load { pointer: original }, Span::default())?
+        } else {
+            original
+        };
+
+        ctx.typifier_grow(call_argument.0, call_argument.1)?;
+
+        let overload_param_ty = &ctx.module.types[parameter_ty].inner;
+        let call_arg_ty = ctx.get_type(call_argument.0);
+        let needs_conversion = call_arg_ty != overload_param_ty;
+
+        let arg_scalar_comps = scalar_components(call_arg_ty);
+
+        // Since output parameters also allow implicit conversions from the
+        // parameter to the argument, we need to spill the conversion to a
+        // variable and create a proxy write for the original variable.
+        if needs_conversion {
+            maybe_ty = Some(parameter_ty);
+        }
+
+        if let Some(ty) = maybe_ty {
+            // Create the spill variable
+            let spill_var = ctx.locals.append(
+                LocalVariable {
+                    name: None,
+                    ty,
+                    init: None,
+                },
+                Span::default(),
+            );
+            let spill_expr =
+                ctx.add_expression(Expression::LocalVariable(spill_var), Span::default())?;
+
+            // If the argument is also copied in we must store the value of the
+            // original variable to the spill variable.
+            if let ParameterQualifier::InOut = parameter_info.qualifier {
+                ctx.body.push(
+                    Statement::Store {
+                        pointer: spill_expr,
+                        value,
+                    },
+                    Span::default(),
+                );
+            }
+
+            // Add the spill variable as an argument to the function call
+            arguments.push(spill_expr);
+
+            let convert = if needs_conversion {
+                arg_scalar_comps
+            } else {
+                None
+            };
+
+            // Register the temporary local to be written back to it's original
+            // place after the function call
+            if let Expression::Swizzle {
+                size,
+                mut vector,
+                pattern,
+            } = ctx.expressions[original]
+            {
+                if let Expression::Load { pointer } = ctx.expressions[vector] {
+                    vector = pointer;
+                }
+
+                for (i, component) in pattern.iter().take(size as usize).enumerate() {
+                    let original = ctx.add_expression(
+                        Expression::AccessIndex {
+                            base: vector,
+                            index: *component as u32,
+                        },
+                        Span::default(),
+                    )?;
+
+                    let spill_component = ctx.add_expression(
+                        Expression::AccessIndex {
+                            base: spill_expr,
+                            index: i as u32,
+                        },
+                        Span::default(),
+                    )?;
+
+                    proxy_writes.push(ProxyWrite {
+                        target: original,
+                        value: spill_component,
+                        convert,
+                    });
+                }
+            } else {
+                proxy_writes.push(ProxyWrite {
+                    target: original,
+                    value: spill_expr,
+                    convert,
+                });
+            }
+        } else {
+            arguments.push(original);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn add_function(
+        &mut self,
+        mut ctx: Context,
+        name: String,
+        result: Option<FunctionResult>,
+        meta: Span,
+    ) {
+        ensure_block_returns(&mut ctx.body);
+
+        let void = result.is_none();
+
+        // Check if the passed arguments require any special variations
+        let mut variations = builtin_required_variations(
+            ctx.parameters
+                .iter()
+                .map(|&arg| &ctx.module.types[arg].inner),
+        );
+
+        // Initiate the declaration if it wasn't previously initialized and inject builtins
+        let declaration = self.lookup_function.entry(name.clone()).or_insert_with(|| {
+            variations |= BuiltinVariations::STANDARD;
+            Default::default()
+        });
+        inject_builtin(declaration, ctx.module, &name, variations);
+
+        let Context {
+            expressions,
+            locals,
+            arguments,
+            parameters,
+            parameters_info,
+            body,
+            module,
+            ..
+        } = ctx;
+
+        let function = Function {
+            name: Some(name),
+            arguments,
+            result,
+            local_variables: locals,
+            expressions,
+            named_expressions: Default::default(),
+            body,
+            diagnostic_filter_leaf: None,
+        };
+
+        'outer: for decl in declaration.overloads.iter_mut() {
+            if parameters.len() != decl.parameters.len() {
+                continue;
+            }
+
+            for (new_parameter, old_parameter) in parameters.iter().zip(decl.parameters.iter()) {
+                let new_inner = &module.types[*new_parameter].inner;
+                let old_inner = &module.types[*old_parameter].inner;
+
+                if new_inner != old_inner {
+                    continue 'outer;
+                }
+            }
+
+            if decl.defined {
+                return self.errors.push(Error {
+                    kind: ErrorKind::SemanticError("Function already defined".into()),
+                    meta,
+                });
+            }
+
+            decl.defined = true;
+            decl.parameters_info = parameters_info;
+            match decl.kind {
+                FunctionKind::Call(handle) => *module.functions.get_mut(handle) = function,
+                FunctionKind::Macro(_) => {
+                    let handle = module.functions.append(function, meta);
+                    decl.kind = FunctionKind::Call(handle)
+                }
+            }
+            return;
+        }
+
+        let handle = module.functions.append(function, meta);
+        declaration.overloads.push(Overload {
+            parameters,
+            parameters_info,
+            kind: FunctionKind::Call(handle),
+            defined: true,
+            internal: false,
+            void,
+        });
+    }
+
+    pub(crate) fn add_prototype(
+        &mut self,
+        ctx: Context,
+        name: String,
+        result: Option<FunctionResult>,
+        meta: Span,
+    ) {
+        let void = result.is_none();
+
+        // Check if the passed arguments require any special variations
+        let mut variations = builtin_required_variations(
+            ctx.parameters
+                .iter()
+                .map(|&arg| &ctx.module.types[arg].inner),
+        );
+
+        // Initiate the declaration if it wasn't previously initialized and inject builtins
+        let declaration = self.lookup_function.entry(name.clone()).or_insert_with(|| {
+            variations |= BuiltinVariations::STANDARD;
+            Default::default()
+        });
+        inject_builtin(declaration, ctx.module, &name, variations);
+
+        let Context {
+            arguments,
+            parameters,
+            parameters_info,
+            module,
+            ..
+        } = ctx;
+
+        let function = Function {
+            name: Some(name),
+            arguments,
+            result,
+            ..Default::default()
+        };
+
+        'outer: for decl in declaration.overloads.iter() {
+            if parameters.len() != decl.parameters.len() {
+                continue;
+            }
+
+            for (new_parameter, old_parameter) in parameters.iter().zip(decl.parameters.iter()) {
+                let new_inner = &module.types[*new_parameter].inner;
+                let old_inner = &module.types[*old_parameter].inner;
+
+                if new_inner != old_inner {
+                    continue 'outer;
+                }
+            }
+
+            return self.errors.push(Error {
+                kind: ErrorKind::SemanticError("Prototype already defined".into()),
+                meta,
+            });
+        }
+
+        let handle = module.functions.append(function, meta);
+        declaration.overloads.push(Overload {
+            parameters,
+            parameters_info,
+            kind: FunctionKind::Call(handle),
+            defined: false,
+            internal: false,
+            void,
+        });
+    }
+
+    /// Create a Naga [`EntryPoint`] that calls the GLSL `main` function.
+    ///
+    /// We compile the GLSL `main` function as an ordinary Naga [`Function`].
+    /// This function synthesizes a Naga [`EntryPoint`] to call that.
+    ///
+    /// Each GLSL input and output variable (including builtins) becomes a Naga
+    /// [`GlobalVariable`]s in the [`Private`] address space, which `main` can
+    /// access in the usual way.
+    ///
+    /// The `EntryPoint` we synthesize here has an argument for each GLSL input
+    /// variable, and returns a struct with a member for each GLSL output
+    /// variable. The entry point contains code to:
+    ///
+    /// - copy its arguments into the Naga globals representing the GLSL input
+    ///   variables,
+    ///
+    /// - call the Naga `Function` representing the GLSL `main` function, and then
+    ///
+    /// - build its return value from whatever values the GLSL `main` left in
+    ///   the Naga globals representing GLSL `output` variables.
+    ///
+    /// Upon entry, [`ctx.body`] should contain code, accumulated by prior calls
+    /// to [`ParsingContext::parse_external_declaration`][pxd], to initialize
+    /// private global variables as needed. This code gets spliced into the
+    /// entry point before the call to `main`.
+    ///
+    /// [`GlobalVariable`]: naga::GlobalVariable
+    /// [`Private`]: naga::AddressSpace::Private
+    /// [`ctx.body`]: Context::body
+    /// [pxd]: super::ParsingContext::parse_external_declaration
+    pub(crate) fn add_entry_point(
+        &mut self,
+        function: Handle<Function>,
+        mut ctx: Context,
+    ) -> Result<()> {
+        let mut arguments = Vec::new();
+
+        let body = Block::with_capacity(
+            // global init body
+            ctx.body.len() +
+            // prologue and epilogue
+            self.entry_args.len() * 2
+            // Call, Emit for composing struct and return
+            + 3,
+        );
+
+        let global_init_body = core::mem::replace(&mut ctx.body, body);
+
+        for arg in self.entry_args.iter() {
+            if arg.storage != StorageQualifier::Input {
+                continue;
+            }
+
+            let pointer = ctx
+                .expressions
+                .append(Expression::GlobalVariable(arg.handle), Default::default());
+            ctx.local_expression_kind_tracker
+                .insert(pointer, naga::proc::ExpressionKind::Runtime);
+
+            let ty = ctx.module.global_variables[arg.handle].ty;
+
+            ctx.arg_type_walker(
+                arg.name.clone(),
+                arg.binding.clone(),
+                pointer,
+                ty,
+                &mut |ctx, name, pointer, ty, binding| {
+                    let idx = arguments.len() as u32;
+
+                    arguments.push(FunctionArgument {
+                        name,
+                        ty,
+                        binding: Some(binding),
+                    });
+
+                    let value = ctx
+                        .expressions
+                        .append(Expression::FunctionArgument(idx), Default::default());
+                    ctx.local_expression_kind_tracker
+                        .insert(value, naga::proc::ExpressionKind::Runtime);
+                    ctx.body
+                        .push(Statement::Store { pointer, value }, Default::default());
+                },
+            )?
+        }
+
+        ctx.body.extend_block(global_init_body);
+
+        ctx.body.push(
+            Statement::Call {
+                function,
+                arguments: Vec::new(),
+                result: None,
+            },
+            Default::default(),
+        );
+
+        let mut span = 0;
+        let mut members = Vec::new();
+        let mut components = Vec::new();
+
+        for arg in self.entry_args.iter() {
+            if arg.storage != StorageQualifier::Output {
+                continue;
+            }
+
+            let pointer = ctx
+                .expressions
+                .append(Expression::GlobalVariable(arg.handle), Default::default());
+            ctx.local_expression_kind_tracker
+                .insert(pointer, naga::proc::ExpressionKind::Runtime);
+
+            let ty = ctx.module.global_variables[arg.handle].ty;
+
+            ctx.arg_type_walker(
+                arg.name.clone(),
+                arg.binding.clone(),
+                pointer,
+                ty,
+                &mut |ctx, name, pointer, ty, binding| {
+                    members.push(StructMember {
+                        name,
+                        ty,
+                        binding: Some(binding),
+                        offset: span,
+                    });
+
+                    span += ctx.module.types[ty].inner.size(ctx.module.to_ctx());
+
+                    let len = ctx.expressions.len();
+                    let load = ctx
+                        .expressions
+                        .append(Expression::Load { pointer }, Default::default());
+                    ctx.local_expression_kind_tracker
+                        .insert(load, naga::proc::ExpressionKind::Runtime);
+                    ctx.body.push(
+                        Statement::Emit(ctx.expressions.range_from(len)),
+                        Default::default(),
+                    );
+                    components.push(load)
+                },
+            )?
+        }
+
+        let (ty, value) = if !components.is_empty() {
+            let ty = ctx.module.types.insert(
+                Type {
+                    name: None,
+                    inner: TypeInner::Struct { members, span },
+                },
+                Default::default(),
+            );
+
+            let len = ctx.expressions.len();
+            let res = ctx
+                .expressions
+                .append(Expression::Compose { ty, components }, Default::default());
+            ctx.local_expression_kind_tracker
+                .insert(res, naga::proc::ExpressionKind::Runtime);
+            ctx.body.push(
+                Statement::Emit(ctx.expressions.range_from(len)),
+                Default::default(),
+            );
+
+            (Some(ty), Some(res))
+        } else {
+            (None, None)
+        };
+
+        ctx.body
+            .push(Statement::Return { value }, Default::default());
+
+        let Context {
+            body, expressions, ..
+        } = ctx;
+
+        ctx.module.entry_points.push(EntryPoint {
+            name: "main".to_string(),
+            stage: self.meta.stage,
+            early_depth_test: Some(naga::EarlyDepthTest::Force)
+                .filter(|_| self.meta.early_fragment_tests),
+            workgroup_size: self.meta.workgroup_size,
+            workgroup_size_overrides: None,
+            function: Function {
+                arguments,
+                expressions,
+                body,
+                result: ty.map(|ty| FunctionResult { ty, binding: None }),
+                ..Default::default()
+            },
+            mesh_info: None,
+            task_payload: None,
+            incoming_ray_payload: None,
+        });
+
+        Ok(())
+    }
+}
+
+impl Context<'_> {
+    /// Helper function for building the input/output interface of the entry point
+    ///
+    /// Calls `f` with the data of the entry point argument, flattening composite types
+    /// recursively
+    ///
+    /// The passed arguments to the callback are:
+    /// - The ctx
+    /// - The name
+    /// - The pointer expression to the global storage
+    /// - The handle to the type of the entry point argument
+    /// - The binding of the entry point argument
+    fn arg_type_walker(
+        &mut self,
+        name: Option<String>,
+        binding: naga::Binding,
+        pointer: Handle<Expression>,
+        ty: Handle<Type>,
+        f: &mut impl FnMut(
+            &mut Context,
+            Option<String>,
+            Handle<Expression>,
+            Handle<Type>,
+            naga::Binding,
+        ),
+    ) -> Result<()> {
+        match self.module.types[ty].inner {
+            // TODO: Better error reporting
+            // right now we just don't walk the array if the size isn't known at
+            // compile time and let validation catch it
+            TypeInner::Array {
+                base,
+                size: naga::ArraySize::Constant(size),
+                ..
+            } => {
+                let mut location = match binding {
+                    naga::Binding::Location { location, .. } => location,
+                    naga::Binding::BuiltIn(_) => return Ok(()),
+                };
+
+                let interpolation =
+                    self.module.types[base]
+                        .inner
+                        .scalar_kind()
+                        .map(|kind| match kind {
+                            ScalarKind::Float => naga::Interpolation::Perspective,
+                            _ => naga::Interpolation::Flat,
+                        });
+
+                for index in 0..size.get() {
+                    let member_pointer = self.add_expression(
+                        Expression::AccessIndex {
+                            base: pointer,
+                            index,
+                        },
+                        Span::default(),
+                    )?;
+
+                    let binding = naga::Binding::Location {
+                        location,
+                        interpolation,
+                        sampling: None,
+                        blend_src: None,
+                        per_primitive: false,
+                    };
+                    location += 1;
+
+                    self.arg_type_walker(name.clone(), binding, member_pointer, base, f)?
+                }
+            }
+            TypeInner::Struct { ref members, .. } => {
+                let mut location = match binding {
+                    naga::Binding::Location { location, .. } => location,
+                    naga::Binding::BuiltIn(_) => return Ok(()),
+                };
+
+                for (i, member) in members.clone().into_iter().enumerate() {
+                    let member_pointer = self.add_expression(
+                        Expression::AccessIndex {
+                            base: pointer,
+                            index: i as u32,
+                        },
+                        Span::default(),
+                    )?;
+
+                    let binding = match member.binding {
+                        Some(binding) => binding,
+                        None => {
+                            let interpolation = self.module.types[member.ty]
+                                .inner
+                                .scalar_kind()
+                                .map(|kind| match kind {
+                                    ScalarKind::Float => naga::Interpolation::Perspective,
+                                    _ => naga::Interpolation::Flat,
+                                });
+                            let binding = naga::Binding::Location {
+                                location,
+                                interpolation,
+                                sampling: None,
+                                blend_src: None,
+                                per_primitive: false,
+                            };
+                            location += 1;
+                            binding
+                        }
+                    };
+
+                    self.arg_type_walker(member.name, binding, member_pointer, member.ty, f)?
+                }
+            }
+            _ => f(self, name, pointer, ty, binding),
+        }
+
+        Ok(())
+    }
+}
+
+/// Helper enum containing the type of conversion need for a call
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum Conversion {
+    /// No conversion needed
+    Exact,
+    /// Float to double conversion needed
+    FloatToDouble,
+    /// Int or uint to float conversion needed
+    IntToFloat,
+    /// Int or uint to double conversion needed
+    IntToDouble,
+    /// Other type of conversion needed
+    Other,
+    /// No conversion was yet registered
+    None,
+}
+
+/// Helper function, returns the type of conversion from `source` to `target`, if a
+/// conversion is not possible returns None.
+fn conversion(target: &TypeInner, source: &TypeInner) -> Option<Conversion> {
+    use ScalarKind::*;
+
+    // Gather the `ScalarKind` and scalar width from both the target and the source
+    let (target_scalar, source_scalar) = match (target, source) {
+        // Conversions between scalars are allowed
+        (&TypeInner::Scalar(tgt_scalar), &TypeInner::Scalar(src_scalar)) => {
+            (tgt_scalar, src_scalar)
+        }
+        // Conversions between vectors of the same size are allowed
+        (
+            &TypeInner::Vector {
+                size: tgt_size,
+                scalar: tgt_scalar,
+            },
+            &TypeInner::Vector {
+                size: src_size,
+                scalar: src_scalar,
+            },
+        ) if tgt_size == src_size => (tgt_scalar, src_scalar),
+        // Conversions between matrices of the same size are allowed
+        (
+            &TypeInner::Matrix {
+                rows: tgt_rows,
+                columns: tgt_cols,
+                scalar: tgt_scalar,
+            },
+            &TypeInner::Matrix {
+                rows: src_rows,
+                columns: src_cols,
+                scalar: src_scalar,
+            },
+        ) if tgt_cols == src_cols && tgt_rows == src_rows => (tgt_scalar, src_scalar),
+        _ => return None,
+    };
+
+    // Check if source can be converted into target, if this is the case then the type
+    // power of target must be higher than that of source
+    let target_power = type_power(target_scalar);
+    let source_power = type_power(source_scalar);
+    if target_power < source_power {
+        return None;
+    }
+
+    Some(match (target_scalar, source_scalar) {
+        // A conversion from a float to a double is special
+        (Scalar::F64, Scalar::F32) => Conversion::FloatToDouble,
+        // A conversion from an integer to a float is special
+        (
+            Scalar::F32,
+            Scalar {
+                kind: Sint | Uint,
+                width: _,
+            },
+        ) => Conversion::IntToFloat,
+        // A conversion from an integer to a double is special
+        (
+            Scalar::F64,
+            Scalar {
+                kind: Sint | Uint,
+                width: _,
+            },
+        ) => Conversion::IntToDouble,
+        _ => Conversion::Other,
+    })
+}
+
+/// Helper method returning all the non standard builtin variations needed
+/// to process the function call with the passed arguments
+fn builtin_required_variations<'a>(args: impl Iterator<Item = &'a TypeInner>) -> BuiltinVariations {
+    let mut variations = BuiltinVariations::empty();
+
+    for ty in args {
+        match *ty {
+            TypeInner::ValuePointer { scalar, .. }
+            | TypeInner::Scalar(scalar)
+            | TypeInner::Vector { scalar, .. }
+            | TypeInner::Matrix { scalar, .. } => {
+                if scalar == Scalar::F64 {
+                    variations |= BuiltinVariations::DOUBLE
+                }
+            }
+            TypeInner::Image {
+                dim,
+                arrayed,
+                class,
+            } => {
+                if dim == naga::ImageDimension::Cube && arrayed {
+                    variations |= BuiltinVariations::CUBE_TEXTURES_ARRAY
+                }
+
+                if dim == naga::ImageDimension::D2 && arrayed && class.is_multisampled() {
+                    variations |= BuiltinVariations::D2_MULTI_TEXTURES_ARRAY
+                }
+            }
+            _ => {}
+        }
+    }
+
+    variations
+}
+
+/// The atomic function of a GLSL atomic built-in's name (`atomicCompSwap`'s comparison comes later).
+fn atomic_function(name: &str) -> Option<naga::AtomicFunction> {
+    use naga::AtomicFunction as A;
+    Some(match name {
+        "atomicAdd" => A::Add,
+        "atomicMin" => A::Min,
+        "atomicMax" => A::Max,
+        "atomicAnd" => A::And,
+        "atomicOr" => A::InclusiveOr,
+        "atomicXor" => A::ExclusiveOr,
+        "atomicExchange" => A::Exchange { compare: None },
+        "atomicCompSwap" => A::Exchange { compare: None },
+        _ => return None,
+    })
+}
+
+}
+mod lex {
+use std::string::String;
+
+use crate::translate::iris_glsl::frontend::pp::{
+    Preprocessor,
+    PreprocessorError, Punct, TokenValue as PPTokenValue,
+};
+
+use super::{
+    ast::Precision,
+    token::{Directive, DirectiveKind, Token, TokenValue},
+    types::parse_type,
+};
+use naga::{FastHashMap, Span, StorageAccess};
+
+#[derive(Debug)]
+pub struct LexerResult {
+    pub kind: LexerResultKind,
+    pub meta: Span,
+}
+
+#[derive(Debug)]
+pub enum LexerResultKind {
+    Token(Token),
+    Directive(Directive),
+    Error(PreprocessorError),
+}
+
+pub struct Lexer<'a> {
+    pp: Preprocessor<'a>,
+}
+
+impl<'a> Lexer<'a> {
+    pub fn new(input: &'a str, defines: &'a FastHashMap<String, String>) -> Self {
+        let mut pp = Preprocessor::new(input);
+        for (define, value) in defines {
+            pp.add_define(define, value).unwrap(); //TODO: handle error
+        }
+        Lexer { pp }
+    }
+}
+
+impl Iterator for Lexer<'_> {
+    type Item = LexerResult;
+    fn next(&mut self) -> Option<Self::Item> {
+        let pp_token = match self.pp.next()? {
+            Ok(t) => t,
+            Err((err, loc)) => {
+                return Some(LexerResult {
+                    kind: LexerResultKind::Error(err),
+                    meta: loc.into(),
+                });
+            }
+        };
+
+        let meta = pp_token.location.into();
+        let value = match pp_token.value {
+            PPTokenValue::Extension(extension) => {
+                return Some(LexerResult {
+                    kind: LexerResultKind::Directive(Directive {
+                        kind: DirectiveKind::Extension,
+                        tokens: extension.tokens,
+                    }),
+                    meta,
+                })
+            }
+            PPTokenValue::Float(float) => TokenValue::FloatConstant(float),
+            PPTokenValue::Ident(ident) => {
+                match ident.as_str() {
+                    // Qualifiers
+                    "layout" => TokenValue::Layout,
+                    "in" => TokenValue::In,
+                    "out" => TokenValue::Out,
+                    "uniform" => TokenValue::Uniform,
+                    "buffer" => TokenValue::Buffer,
+                    "shared" => TokenValue::Shared,
+                    "invariant" => TokenValue::Invariant,
+                    "flat" => TokenValue::Interpolation(naga::Interpolation::Flat),
+                    "noperspective" => TokenValue::Interpolation(naga::Interpolation::Linear),
+                    "smooth" => TokenValue::Interpolation(naga::Interpolation::Perspective),
+                    "centroid" => TokenValue::Sampling(naga::Sampling::Centroid),
+                    "sample" => TokenValue::Sampling(naga::Sampling::Sample),
+                    "const" => TokenValue::Const,
+                    "inout" => TokenValue::InOut,
+                    "precision" => TokenValue::Precision,
+                    "highp" => TokenValue::PrecisionQualifier(Precision::High),
+                    "mediump" => TokenValue::PrecisionQualifier(Precision::Medium),
+                    "lowp" => TokenValue::PrecisionQualifier(Precision::Low),
+                    "restrict" => TokenValue::Restrict,
+                    // Iris Features: memory qualifiers naga has no use for (it orders memory by
+                    // barriers): read as `restrict`, which it also ignores.
+                    "coherent" | "volatile" => TokenValue::Restrict,
+                    "readonly" => TokenValue::MemoryQualifier(StorageAccess::LOAD),
+                    "writeonly" => TokenValue::MemoryQualifier(StorageAccess::STORE),
+                    // values
+                    "true" => TokenValue::BoolConstant(true),
+                    "false" => TokenValue::BoolConstant(false),
+                    // jump statements
+                    "continue" => TokenValue::Continue,
+                    "break" => TokenValue::Break,
+                    "return" => TokenValue::Return,
+                    "discard" => TokenValue::Discard,
+                    // selection statements
+                    "if" => TokenValue::If,
+                    "else" => TokenValue::Else,
+                    "switch" => TokenValue::Switch,
+                    "case" => TokenValue::Case,
+                    "default" => TokenValue::Default,
+                    // iteration statements
+                    "while" => TokenValue::While,
+                    "do" => TokenValue::Do,
+                    "for" => TokenValue::For,
+                    // types
+                    "void" => TokenValue::Void,
+                    "struct" => TokenValue::Struct,
+                    word => match parse_type(word) {
+                        Some(t) => TokenValue::TypeName(t),
+                        None => TokenValue::Identifier(String::from(word)),
+                    },
+                }
+            }
+            PPTokenValue::Integer(integer) => TokenValue::IntConstant(integer),
+            PPTokenValue::Punct(punct) => match punct {
+                // Compound assignments
+                Punct::AddAssign => TokenValue::AddAssign,
+                Punct::SubAssign => TokenValue::SubAssign,
+                Punct::MulAssign => TokenValue::MulAssign,
+                Punct::DivAssign => TokenValue::DivAssign,
+                Punct::ModAssign => TokenValue::ModAssign,
+                Punct::LeftShiftAssign => TokenValue::LeftShiftAssign,
+                Punct::RightShiftAssign => TokenValue::RightShiftAssign,
+                Punct::AndAssign => TokenValue::AndAssign,
+                Punct::XorAssign => TokenValue::XorAssign,
+                Punct::OrAssign => TokenValue::OrAssign,
+
+                // Two character punctuation
+                Punct::Increment => TokenValue::Increment,
+                Punct::Decrement => TokenValue::Decrement,
+                Punct::LogicalAnd => TokenValue::LogicalAnd,
+                Punct::LogicalOr => TokenValue::LogicalOr,
+                Punct::LogicalXor => TokenValue::LogicalXor,
+                Punct::LessEqual => TokenValue::LessEqual,
+                Punct::GreaterEqual => TokenValue::GreaterEqual,
+                Punct::EqualEqual => TokenValue::Equal,
+                Punct::NotEqual => TokenValue::NotEqual,
+                Punct::LeftShift => TokenValue::LeftShift,
+                Punct::RightShift => TokenValue::RightShift,
+
+                // Parenthesis or similar
+                Punct::LeftBrace => TokenValue::LeftBrace,
+                Punct::RightBrace => TokenValue::RightBrace,
+                Punct::LeftParen => TokenValue::LeftParen,
+                Punct::RightParen => TokenValue::RightParen,
+                Punct::LeftBracket => TokenValue::LeftBracket,
+                Punct::RightBracket => TokenValue::RightBracket,
+
+                // Other one character punctuation
+                Punct::LeftAngle => TokenValue::LeftAngle,
+                Punct::RightAngle => TokenValue::RightAngle,
+                Punct::Semicolon => TokenValue::Semicolon,
+                Punct::Comma => TokenValue::Comma,
+                Punct::Colon => TokenValue::Colon,
+                Punct::Dot => TokenValue::Dot,
+                Punct::Equal => TokenValue::Assign,
+                Punct::Bang => TokenValue::Bang,
+                Punct::Minus => TokenValue::Dash,
+                Punct::Tilde => TokenValue::Tilde,
+                Punct::Plus => TokenValue::Plus,
+                Punct::Star => TokenValue::Star,
+                Punct::Slash => TokenValue::Slash,
+                Punct::Percent => TokenValue::Percent,
+                Punct::Pipe => TokenValue::VerticalBar,
+                Punct::Caret => TokenValue::Caret,
+                Punct::Ampersand => TokenValue::Ampersand,
+                Punct::Question => TokenValue::Question,
+            },
+            PPTokenValue::Pragma(pragma) => {
+                return Some(LexerResult {
+                    kind: LexerResultKind::Directive(Directive {
+                        kind: DirectiveKind::Pragma,
+                        tokens: pragma.tokens,
+                    }),
+                    meta,
+                })
+            }
+            PPTokenValue::Version(version) => {
+                return Some(LexerResult {
+                    kind: LexerResultKind::Directive(Directive {
+                        kind: DirectiveKind::Version {
+                            is_first_directive: version.is_first_directive,
+                        },
+                        tokens: version.tokens,
+                    }),
+                    meta,
+                })
+            }
+        };
+
+        Some(LexerResult {
+            kind: LexerResultKind::Token(Token { value, meta }),
+            meta,
+        })
+    }
+}
+
+}
+mod offset {
+/*!
+Module responsible for calculating the offset and span for types.
+
+There exists two types of layouts std140 and std430 (there's technically
+two more layouts, shared and packed. Shared is not supported by spirv. Packed is
+implementation dependent and for now it's just implemented as an alias to
+std140).
+
+The OpenGl spec (the layout rules are defined by the OpenGl spec in section
+7.6.2.2 as opposed to the GLSL spec) uses the term basic machine units which are
+equivalent to bytes.
+*/
+
+use std::vec::Vec;
+
+use super::{
+    ast::StructLayout,
+    error::{Error, ErrorKind},
+    Span,
+};
+use naga::{proc::Alignment, Handle, Scalar, Type, TypeInner, UniqueArena};
+
+/// Struct with information needed for defining a struct member.
+///
+/// Returned by [`calculate_offset`].
+#[derive(Debug)]
+pub struct TypeAlignSpan {
+    /// The handle to the type, this might be the same handle passed to
+    /// [`calculate_offset`] or a new such a new array type with a different
+    /// stride set.
+    pub ty: Handle<Type>,
+    /// The alignment required by the type.
+    pub align: Alignment,
+    /// The size of the type.
+    pub span: u32,
+}
+
+/// Returns the type, alignment and span of a struct member according to a [`StructLayout`].
+///
+/// The functions returns a [`TypeAlignSpan`] which has a `ty` member this
+/// should be used as the struct member type because for example arrays may have
+/// to change the stride and as such need to have a different type.
+pub fn calculate_offset(
+    mut ty: Handle<Type>,
+    meta: Span,
+    layout: StructLayout,
+    types: &mut UniqueArena<Type>,
+    errors: &mut Vec<Error>,
+) -> TypeAlignSpan {
+    // When using the std430 storage layout, shader storage blocks will be laid out in buffer storage
+    // identically to uniform and shader storage blocks using the std140 layout, except
+    // that the base alignment and stride of arrays of scalars and vectors in rule 4 and of
+    // structures in rule 9 are not rounded up a multiple of the base alignment of a vec4.
+
+    let (align, span) = match types[ty].inner {
+        // 1. If the member is a scalar consuming N basic machine units,
+        // the base alignment is N.
+        TypeInner::Scalar(Scalar { width, .. }) => (Alignment::from_width(width), width as u32),
+        // 2. If the member is a two- or four-component vector with components
+        // consuming N basic machine units, the base alignment is 2N or 4N, respectively.
+        // 3. If the member is a three-component vector with components consuming N
+        // basic machine units, the base alignment is 4N.
+        TypeInner::Vector {
+            size,
+            scalar: Scalar { width, .. },
+        } => (
+            Alignment::from(size) * Alignment::from_width(width),
+            size as u32 * width as u32,
+        ),
+        // 4. If the member is an array of scalars or vectors, the base alignment and array
+        // stride are set to match the base alignment of a single array element, according
+        // to rules (1), (2), and (3), and rounded up to the base alignment of a vec4.
+        // TODO: Matrices array
+        TypeInner::Array { base, size, .. } => {
+            let info = calculate_offset(base, meta, layout, types, errors);
+
+            let name = types[ty].name.clone();
+
+            // See comment at the beginning of the function
+            let (align, stride) = if StructLayout::Std430 == layout {
+                (info.align, info.align.round_up(info.span))
+            } else {
+                let align = info.align.max(Alignment::MIN_UNIFORM);
+                (align, align.round_up(info.span))
+            };
+
+            let span = match size {
+                naga::ArraySize::Constant(size) => size.get() * stride,
+                naga::ArraySize::Pending(_) => unreachable!(),
+                naga::ArraySize::Dynamic => stride,
+            };
+
+            let ty_span = types.get_span(ty);
+            ty = types.insert(
+                Type {
+                    name,
+                    inner: TypeInner::Array {
+                        base: info.ty,
+                        size,
+                        stride,
+                    },
+                },
+                ty_span,
+            );
+
+            (align, span)
+        }
+        // 5. If the member is a column-major matrix with C columns and R rows, the
+        // matrix is stored identically to an array of C column vectors with R
+        // components each, according to rule (4)
+        // TODO: Row major matrices
+        TypeInner::Matrix {
+            columns,
+            rows,
+            scalar,
+        } => {
+            let mut align = Alignment::from(rows) * Alignment::from_width(scalar.width);
+
+            // See comment at the beginning of the function
+            if StructLayout::Std430 != layout {
+                align = align.max(Alignment::MIN_UNIFORM);
+            }
+
+            // See comment on the error kind
+            if StructLayout::Std140 == layout {
+                // Do the f16 test first, as it's more specific
+                if scalar == Scalar::F16 {
+                    errors.push(Error {
+                        kind: ErrorKind::UnsupportedF16MatrixInStd140 {
+                            columns: columns as u8,
+                            rows: rows as u8,
+                        },
+                        meta,
+                    });
+                }
+                if rows == naga::VectorSize::Bi {
+                    errors.push(Error {
+                        kind: ErrorKind::UnsupportedMatrixWithTwoRowsInStd140 {
+                            columns: columns as u8,
+                        },
+                        meta,
+                    });
+                }
+            }
+
+            (align, align * columns as u32)
+        }
+        TypeInner::Struct { ref members, .. } => {
+            let mut span = 0;
+            let mut align = Alignment::ONE;
+            let mut members = members.clone();
+            let name = types[ty].name.clone();
+
+            for member in members.iter_mut() {
+                let info = calculate_offset(member.ty, meta, layout, types, errors);
+
+                let member_alignment = info.align;
+                span = member_alignment.round_up(span);
+                align = member_alignment.max(align);
+
+                member.ty = info.ty;
+                member.offset = span;
+
+                span += info.span;
+            }
+
+            span = align.round_up(span);
+
+            let ty_span = types.get_span(ty);
+            ty = types.insert(
+                Type {
+                    name,
+                    inner: TypeInner::Struct { members, span },
+                },
+                ty_span,
+            );
+
+            (align, span)
+        }
+        _ => {
+            errors.push(Error {
+                kind: ErrorKind::SemanticError("Invalid struct member type".into()),
+                meta,
+            });
+            (Alignment::ONE, 0)
+        }
+    };
+
+    TypeAlignSpan { ty, align, span }
+}
+
+}
+mod parser {
+use std::{string::String, vec};
+use core::iter::Peekable;
+
+use crate::translate::iris_glsl::frontend::pp::{PreprocessorError, Token as PPToken, TokenValue as PPTokenValue};
+
+use super::{
+    ast::{FunctionKind, Profile, TypeQualifiers},
+    context::{Context, ExprPos},
+    error::ExpectedToken,
+    error::{Error, ErrorKind},
+    lex::{Lexer, LexerResultKind},
+    token::{Directive, DirectiveKind},
+    token::{Token, TokenValue},
+    variables::{GlobalOrConstant, VarDeclaration},
+    Frontend, Result,
+};
+use naga::{Handle, proc::ConstValueError, Expression, Module, Span, Type};
+
+mod declarations {
+use std::{string::String, vec, vec::Vec};
+
+use super::{DeclarationContext, ParsingContext, Result};
+use crate::translate::iris_glsl::frontend::{
+        ast::{
+            GlobalLookup, GlobalLookupKind, Precision, QualifierKey, QualifierValue,
+            StorageQualifier, StructLayout, TypeQualifiers,
+        },
+        context::{Context, ExprPos},
+        error::ExpectedToken,
+        offset,
+        token::{Token, TokenValue},
+        types::scalar_components,
+        variables::{GlobalOrConstant, VarDeclaration},
+        Error, ErrorKind, Frontend, Span,
+    };
+use naga::{proc::Alignment,
+    AddressSpace, Expression, FunctionResult, Handle, Scalar, ScalarKind, Statement, StructMember,
+    Type, TypeInner};
+
+/// Helper method used to retrieve the child type of `ty` at
+/// index `i`.
+///
+/// # Note
+///
+/// Does not check if the index is valid and returns the same type
+/// when indexing out-of-bounds a struct or indexing a non indexable
+/// type.
+fn element_or_member_type(
+    ty: Handle<Type>,
+    i: usize,
+    types: &mut naga::UniqueArena<Type>,
+) -> Handle<Type> {
+    match types[ty].inner {
+        // The child type of a vector is a scalar of the same kind and width
+        TypeInner::Vector { scalar, .. } => types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Scalar(scalar),
+            },
+            Default::default(),
+        ),
+        // The child type of a matrix is a vector of floats with the same
+        // width and the size of the matrix rows.
+        TypeInner::Matrix { rows, scalar, .. } => types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Vector { size: rows, scalar },
+            },
+            Default::default(),
+        ),
+        // The child type of an array is the base type of the array
+        TypeInner::Array { base, .. } => base,
+        // The child type of a struct at index `i` is the type of it's
+        // member at that same index.
+        //
+        // In case the index is out of bounds the same type is returned
+        TypeInner::Struct { ref members, .. } => {
+            members.get(i).map(|member| member.ty).unwrap_or(ty)
+        }
+        // The type isn't indexable, the same type is returned
+        _ => ty,
+    }
+}
+
+impl ParsingContext<'_> {
+    pub fn parse_external_declaration(
+        &mut self,
+        frontend: &mut Frontend,
+        global_ctx: &mut Context,
+    ) -> Result<()> {
+        if self
+            .parse_declaration(frontend, global_ctx, true, false)?
+            .is_none()
+        {
+            let token = self.bump(frontend)?;
+            match token.value {
+                TokenValue::Semicolon if frontend.meta.version == 460 => Ok(()),
+                _ => {
+                    let expected = match frontend.meta.version {
+                        460 => vec![TokenValue::Semicolon.into(), ExpectedToken::Eof],
+                        _ => vec![ExpectedToken::Eof],
+                    };
+                    Err(Error {
+                        kind: ErrorKind::InvalidToken(token.value, expected),
+                        meta: token.meta,
+                    })
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn parse_initializer(
+        &mut self,
+        frontend: &mut Frontend,
+        ty: Handle<Type>,
+        ctx: &mut Context,
+    ) -> Result<(Handle<Expression>, Span)> {
+        // initializer:
+        //     assignment_expression
+        //     LEFT_BRACE initializer_list RIGHT_BRACE
+        //     LEFT_BRACE initializer_list COMMA RIGHT_BRACE
+        //
+        // initializer_list:
+        //     initializer
+        //     initializer_list COMMA initializer
+        if let Some(Token { mut meta, .. }) = self.bump_if(frontend, TokenValue::LeftBrace) {
+            // initializer_list
+            let mut components = Vec::new();
+            loop {
+                // The type expected to be parsed inside the initializer list
+                let new_ty = element_or_member_type(ty, components.len(), &mut ctx.module.types);
+
+                components.push(self.parse_initializer(frontend, new_ty, ctx)?.0);
+
+                let token = self.bump(frontend)?;
+                match token.value {
+                    TokenValue::Comma => {
+                        if let Some(Token { meta: end_meta, .. }) =
+                            self.bump_if(frontend, TokenValue::RightBrace)
+                        {
+                            meta.subsume(end_meta);
+                            break;
+                        }
+                    }
+                    TokenValue::RightBrace => {
+                        meta.subsume(token.meta);
+                        break;
+                    }
+                    _ => {
+                        return Err(Error {
+                            kind: ErrorKind::InvalidToken(
+                                token.value,
+                                vec![TokenValue::Comma.into(), TokenValue::RightBrace.into()],
+                            ),
+                            meta: token.meta,
+                        })
+                    }
+                }
+            }
+
+            Ok((
+                ctx.add_expression(Expression::Compose { ty, components }, meta)?,
+                meta,
+            ))
+        } else {
+            let mut stmt = ctx.stmt_ctx();
+            let expr = self.parse_assignment(frontend, ctx, &mut stmt)?;
+            let (mut init, init_meta) = ctx.lower_expect(stmt, frontend, expr, ExprPos::Rhs)?;
+
+            let scalar_components = scalar_components(&ctx.module.types[ty].inner);
+            if let Some(scalar) = scalar_components {
+                ctx.implicit_conversion(&mut init, init_meta, scalar)?;
+            }
+
+            Ok((init, init_meta))
+        }
+    }
+
+    // Note: caller preparsed the type and qualifiers
+    // Note: caller skips this if the fallthrough token is not expected to be consumed here so this
+    // produced Error::InvalidToken if it isn't consumed
+    pub fn parse_init_declarator_list(
+        &mut self,
+        frontend: &mut Frontend,
+        mut ty: Handle<Type>,
+        ctx: &mut DeclarationContext,
+    ) -> Result<()> {
+        // init_declarator_list:
+        //     single_declaration
+        //     init_declarator_list COMMA IDENTIFIER
+        //     init_declarator_list COMMA IDENTIFIER array_specifier
+        //     init_declarator_list COMMA IDENTIFIER array_specifier EQUAL initializer
+        //     init_declarator_list COMMA IDENTIFIER EQUAL initializer
+        //
+        // single_declaration:
+        //     fully_specified_type
+        //     fully_specified_type IDENTIFIER
+        //     fully_specified_type IDENTIFIER array_specifier
+        //     fully_specified_type IDENTIFIER array_specifier EQUAL initializer
+        //     fully_specified_type IDENTIFIER EQUAL initializer
+
+        // Consume any leading comma, e.g. this is valid: `float, a=1;`
+        if self
+            .peek(frontend)
+            .is_some_and(|t| t.value == TokenValue::Comma)
+        {
+            self.next(frontend);
+        }
+
+        let base_ty = ty;
+        loop {
+            let token = self.bump(frontend)?;
+            let name = match token.value {
+                TokenValue::Semicolon => break,
+                TokenValue::Identifier(name) => name,
+                _ => {
+                    return Err(Error {
+                        kind: ErrorKind::InvalidToken(
+                            token.value,
+                            vec![ExpectedToken::Identifier, TokenValue::Semicolon.into()],
+                        ),
+                        meta: token.meta,
+                    })
+                }
+            };
+            let mut meta = token.meta;
+
+            // array_specifier
+            // array_specifier EQUAL initializer
+            // EQUAL initializer
+
+            // parse an array specifier if it exists
+            // NOTE: unlike other parse methods this one doesn't expect an array specifier and
+            // returns Ok(None) rather than an error if there is not one
+            // Iris Features: each name's array size applies to the declaration's type, not to
+            // the type the name before it ended with (`float a[4], b[4]` gave `b` a
+            // `float[4][4]`).
+            let mut ty = base_ty;
+            self.parse_array_specifier(frontend, ctx.ctx, &mut meta, &mut ty)?;
+
+            let is_global_const =
+                ctx.qualifiers.storage.0 == StorageQualifier::Const && ctx.external;
+
+            let init = self
+                .bump_if(frontend, TokenValue::Assign)
+                .map::<Result<_>, _>(|_| {
+                    let prev_const = ctx.ctx.is_const;
+                    ctx.ctx.is_const = is_global_const;
+
+                    let (mut expr, init_meta) = self.parse_initializer(frontend, ty, ctx.ctx)?;
+
+                    let scalar_components = scalar_components(&ctx.ctx.module.types[ty].inner);
+                    if let Some(scalar) = scalar_components {
+                        ctx.ctx.implicit_conversion(&mut expr, init_meta, scalar)?;
+                    }
+
+                    ctx.ctx.is_const = prev_const;
+
+                    meta.subsume(init_meta);
+
+                    Ok(expr)
+                })
+                .transpose()?;
+
+            let decl_initializer;
+            let late_initializer;
+            if is_global_const {
+                decl_initializer = init;
+                late_initializer = None;
+            } else if ctx.external {
+                decl_initializer =
+                    init.and_then(|expr| ctx.ctx.lift_up_const_expression(expr).ok());
+                late_initializer = None;
+            } else if let Some(init) = init {
+                if ctx.is_inside_loop || !ctx.ctx.local_expression_kind_tracker.is_const(init) {
+                    decl_initializer = None;
+                    late_initializer = Some(init);
+                } else {
+                    decl_initializer = Some(init);
+                    late_initializer = None;
+                }
+            } else {
+                decl_initializer = None;
+                late_initializer = None;
+            };
+
+            let pointer = ctx.add_var(frontend, ty, name, decl_initializer, meta)?;
+
+            if let Some(value) = late_initializer {
+                ctx.ctx.emit_restart();
+                ctx.ctx.body.push(Statement::Store { pointer, value }, meta);
+            }
+
+            let token = self.bump(frontend)?;
+            match token.value {
+                TokenValue::Semicolon => break,
+                TokenValue::Comma => {}
+                _ => {
+                    return Err(Error {
+                        kind: ErrorKind::InvalidToken(
+                            token.value,
+                            vec![TokenValue::Comma.into(), TokenValue::Semicolon.into()],
+                        ),
+                        meta: token.meta,
+                    })
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// `external` whether or not we are in a global or local context
+    pub fn parse_declaration(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        external: bool,
+        is_inside_loop: bool,
+    ) -> Result<Option<Span>> {
+        //declaration:
+        //    function_prototype  SEMICOLON
+        //
+        //    init_declarator_list SEMICOLON
+        //    PRECISION precision_qualifier type_specifier SEMICOLON
+        //
+        //    type_qualifier IDENTIFIER LEFT_BRACE struct_declaration_list RIGHT_BRACE SEMICOLON
+        //    type_qualifier IDENTIFIER LEFT_BRACE struct_declaration_list RIGHT_BRACE IDENTIFIER SEMICOLON
+        //    type_qualifier IDENTIFIER LEFT_BRACE struct_declaration_list RIGHT_BRACE IDENTIFIER array_specifier SEMICOLON
+        //    type_qualifier SEMICOLON type_qualifier IDENTIFIER SEMICOLON
+        //    type_qualifier IDENTIFIER identifier_list SEMICOLON
+
+        if self.peek_type_qualifier(frontend) || self.peek_type_name(frontend) {
+            let mut qualifiers = self.parse_type_qualifiers(frontend, ctx)?;
+
+            if self.peek_type_name(frontend) {
+                // This branch handles variables and function prototypes and if
+                // external is true also function definitions
+                let (ty, mut meta) = self.parse_type(frontend, ctx)?;
+
+                let token = self.bump(frontend)?;
+                let token_fallthrough = match token.value {
+                    TokenValue::Identifier(name) => match self.expect_peek(frontend)?.value {
+                        TokenValue::LeftParen => {
+                            // This branch handles function definition and prototypes
+                            self.bump(frontend)?;
+
+                            let result = ty.map(|ty| FunctionResult { ty, binding: None });
+
+                            let mut context = Context::new(
+                                frontend,
+                                ctx.module,
+                                false,
+                                ctx.global_expression_kind_tracker,
+                            )?;
+
+                            self.parse_function_args(frontend, &mut context)?;
+
+                            let end_meta = self.expect(frontend, TokenValue::RightParen)?.meta;
+                            meta.subsume(end_meta);
+
+                            let token = self.bump(frontend)?;
+                            return match token.value {
+                                TokenValue::Semicolon => {
+                                    // This branch handles function prototypes
+                                    frontend.add_prototype(context, name, result, meta);
+
+                                    Ok(Some(meta))
+                                }
+                                TokenValue::LeftBrace if external => {
+                                    // This branch handles function definitions
+                                    // as you can see by the guard this branch
+                                    // only happens if external is also true
+
+                                    // parse the body
+                                    self.parse_compound_statement(
+                                        token.meta,
+                                        frontend,
+                                        &mut context,
+                                        &mut None,
+                                        false,
+                                    )?;
+
+                                    frontend.add_function(context, name, result, meta);
+
+                                    Ok(Some(meta))
+                                }
+                                _ if external => Err(Error {
+                                    kind: ErrorKind::InvalidToken(
+                                        token.value,
+                                        vec![
+                                            TokenValue::LeftBrace.into(),
+                                            TokenValue::Semicolon.into(),
+                                        ],
+                                    ),
+                                    meta: token.meta,
+                                }),
+                                _ => Err(Error {
+                                    kind: ErrorKind::InvalidToken(
+                                        token.value,
+                                        vec![TokenValue::Semicolon.into()],
+                                    ),
+                                    meta: token.meta,
+                                }),
+                            };
+                        }
+                        // Pass the token to the init_declarator_list parser
+                        _ => Token {
+                            value: TokenValue::Identifier(name),
+                            meta: token.meta,
+                        },
+                    },
+                    // Pass the token to the init_declarator_list parser
+                    _ => token,
+                };
+
+                // If program execution has reached here then this will be a
+                // init_declarator_list
+                // token_fallthrough will have a token that was already bumped
+                if let Some(ty) = ty {
+                    let mut ctx = DeclarationContext {
+                        qualifiers,
+                        external,
+                        is_inside_loop,
+                        ctx,
+                    };
+
+                    self.backtrack(token_fallthrough)?;
+                    self.parse_init_declarator_list(frontend, ty, &mut ctx)?;
+                } else {
+                    frontend.errors.push(Error {
+                        kind: ErrorKind::SemanticError("Declaration cannot have void type".into()),
+                        meta,
+                    })
+                }
+
+                Ok(Some(meta))
+            } else {
+                // This branch handles struct definitions and modifiers like
+                // ```glsl
+                // layout(early_fragment_tests);
+                // ```
+                let token = self.bump(frontend)?;
+                match token.value {
+                    TokenValue::Identifier(ty_name) => {
+                        if self.bump_if(frontend, TokenValue::LeftBrace).is_some() {
+                            self.parse_block_declaration(
+                                frontend,
+                                ctx,
+                                &mut qualifiers,
+                                ty_name,
+                                token.meta,
+                            )
+                            .map(Some)
+                        } else {
+                            if qualifiers.invariant.take().is_some() {
+                                frontend.make_variable_invariant(ctx, &ty_name, token.meta)?;
+
+                                qualifiers.unused_errors(&mut frontend.errors);
+                                self.expect(frontend, TokenValue::Semicolon)?;
+                                return Ok(Some(qualifiers.span));
+                            }
+
+                            //TODO: declaration
+                            // type_qualifier IDENTIFIER SEMICOLON
+                            // type_qualifier IDENTIFIER identifier_list SEMICOLON
+                            Err(Error {
+                                kind: ErrorKind::NotImplemented("variable qualifier"),
+                                meta: token.meta,
+                            })
+                        }
+                    }
+                    TokenValue::Semicolon => {
+                        if let Some(value) =
+                            qualifiers.uint_layout_qualifier("local_size_x", &mut frontend.errors)
+                        {
+                            frontend.meta.workgroup_size[0] = value;
+                        }
+                        if let Some(value) =
+                            qualifiers.uint_layout_qualifier("local_size_y", &mut frontend.errors)
+                        {
+                            frontend.meta.workgroup_size[1] = value;
+                        }
+                        if let Some(value) =
+                            qualifiers.uint_layout_qualifier("local_size_z", &mut frontend.errors)
+                        {
+                            frontend.meta.workgroup_size[2] = value;
+                        }
+
+                        frontend.meta.early_fragment_tests |= qualifiers
+                            .none_layout_qualifier("early_fragment_tests", &mut frontend.errors);
+
+                        qualifiers.unused_errors(&mut frontend.errors);
+
+                        Ok(Some(qualifiers.span))
+                    }
+                    _ => Err(Error {
+                        kind: ErrorKind::InvalidToken(
+                            token.value,
+                            vec![ExpectedToken::Identifier, TokenValue::Semicolon.into()],
+                        ),
+                        meta: token.meta,
+                    }),
+                }
+            }
+        } else {
+            match self.peek(frontend).map(|t| &t.value) {
+                Some(&TokenValue::Precision) => {
+                    // PRECISION precision_qualifier type_specifier SEMICOLON
+                    self.bump(frontend)?;
+
+                    let token = self.bump(frontend)?;
+                    let _ = match token.value {
+                        TokenValue::PrecisionQualifier(p) => p,
+                        _ => {
+                            return Err(Error {
+                                kind: ErrorKind::InvalidToken(
+                                    token.value,
+                                    vec![
+                                        TokenValue::PrecisionQualifier(Precision::High).into(),
+                                        TokenValue::PrecisionQualifier(Precision::Medium).into(),
+                                        TokenValue::PrecisionQualifier(Precision::Low).into(),
+                                    ],
+                                ),
+                                meta: token.meta,
+                            })
+                        }
+                    };
+
+                    let (ty, meta) = self.parse_type_non_void(frontend, ctx)?;
+
+                    match ctx.module.types[ty].inner {
+                        TypeInner::Scalar(Scalar {
+                            kind: ScalarKind::Float | ScalarKind::Sint,
+                            ..
+                        }) => {}
+                        _ => frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Precision statement can only work on floats and ints".into(),
+                            ),
+                            meta,
+                        }),
+                    }
+
+                    self.expect(frontend, TokenValue::Semicolon)?;
+
+                    Ok(Some(meta))
+                }
+                _ => Ok(None),
+            }
+        }
+    }
+
+    pub fn parse_block_declaration(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        qualifiers: &mut TypeQualifiers,
+        ty_name: String,
+        mut meta: Span,
+    ) -> Result<Span> {
+        let layout = match qualifiers.layout_qualifiers.remove(&QualifierKey::Layout) {
+            Some((QualifierValue::Layout(l), _)) => l,
+            None => {
+                if let StorageQualifier::AddressSpace(AddressSpace::Storage { .. }) =
+                    qualifiers.storage.0
+                {
+                    StructLayout::Std430
+                } else {
+                    StructLayout::Std140
+                }
+            }
+            _ => unreachable!(),
+        };
+
+        let mut members = Vec::new();
+        let span = self.parse_struct_declaration_list(frontend, ctx, &mut members, layout)?;
+        self.expect(frontend, TokenValue::RightBrace)?;
+
+        let mut ty = ctx.module.types.insert(
+            Type {
+                name: Some(ty_name),
+                inner: TypeInner::Struct {
+                    members: members.clone(),
+                    span,
+                },
+            },
+            Default::default(),
+        );
+
+        let token = self.bump(frontend)?;
+        let name = match token.value {
+            TokenValue::Semicolon => None,
+            TokenValue::Identifier(name) => {
+                self.parse_array_specifier(frontend, ctx, &mut meta, &mut ty)?;
+
+                self.expect(frontend, TokenValue::Semicolon)?;
+
+                Some(name)
+            }
+            _ => {
+                return Err(Error {
+                    kind: ErrorKind::InvalidToken(
+                        token.value,
+                        vec![ExpectedToken::Identifier, TokenValue::Semicolon.into()],
+                    ),
+                    meta: token.meta,
+                })
+            }
+        };
+
+        let global = frontend.add_global_var(
+            ctx,
+            VarDeclaration {
+                qualifiers,
+                ty,
+                name,
+                init: None,
+                meta,
+            },
+        )?;
+
+        for (i, k, ty) in members.into_iter().enumerate().filter_map(|(i, m)| {
+            let ty = m.ty;
+            m.name.map(|s| (i as u32, s, ty))
+        }) {
+            let lookup = GlobalLookup {
+                kind: match global {
+                    GlobalOrConstant::Global(handle) => GlobalLookupKind::BlockSelect(handle, i),
+                    GlobalOrConstant::Constant(handle) => GlobalLookupKind::Constant(handle, ty),
+                    GlobalOrConstant::Override(handle) => GlobalLookupKind::Override(handle, ty),
+                },
+                entry_arg: None,
+                mutable: true,
+            };
+            ctx.add_global(&k, lookup)?;
+
+            frontend.global_variables.push((k, lookup));
+        }
+
+        Ok(meta)
+    }
+
+    // TODO: Accept layout arguments
+    pub fn parse_struct_declaration_list(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        members: &mut Vec<StructMember>,
+        layout: StructLayout,
+    ) -> Result<u32> {
+        let mut span = 0;
+        let mut align = Alignment::ONE;
+
+        loop {
+            // TODO: type_qualifier
+
+            let (base_ty, mut meta) = self.parse_type_non_void(frontend, ctx)?;
+
+            loop {
+                let (name, name_meta) = self.expect_ident(frontend)?;
+                let mut ty = base_ty;
+                self.parse_array_specifier(frontend, ctx, &mut meta, &mut ty)?;
+
+                meta.subsume(name_meta);
+
+                let info = offset::calculate_offset(
+                    ty,
+                    meta,
+                    layout,
+                    &mut ctx.module.types,
+                    &mut frontend.errors,
+                );
+
+                let member_alignment = info.align;
+                span = member_alignment.round_up(span);
+                align = member_alignment.max(align);
+
+                members.push(StructMember {
+                    name: Some(name),
+                    ty: info.ty,
+                    binding: None,
+                    offset: span,
+                });
+
+                span += info.span;
+
+                if self.bump_if(frontend, TokenValue::Comma).is_none() {
+                    break;
+                }
+            }
+
+            self.expect(frontend, TokenValue::Semicolon)?;
+
+            if let TokenValue::RightBrace = self.expect_peek(frontend)?.value {
+                break;
+            }
+        }
+
+        span = align.round_up(span);
+
+        Ok(span)
+    }
+}
+
+}
+mod expressions {
+use std::{vec, vec::Vec};
+use core::num::NonZeroU32;
+
+use crate::translate::iris_glsl::frontend::{
+        ast::{FunctionCall, FunctionCallKind, HirExpr, HirExprKind},
+        context::{Context, StmtContext},
+        error::{ErrorKind, ExpectedToken},
+        parser::ParsingContext,
+        token::{Token, TokenValue},
+        Error, Frontend, Result, Span,
+    };
+use naga::{ArraySize, BinaryOperator, Handle, Literal, Type, TypeInner, UnaryOperator};
+
+impl ParsingContext<'_> {
+    pub fn parse_primary(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        stmt: &mut StmtContext,
+    ) -> Result<Handle<HirExpr>> {
+        let mut token = self.bump(frontend)?;
+
+        let literal = match token.value {
+            TokenValue::IntConstant(int) => {
+                if int.width != 32 {
+                    frontend.errors.push(Error {
+                        kind: ErrorKind::SemanticError("Unsupported non-32bit integer".into()),
+                        meta: token.meta,
+                    });
+                }
+                if int.signed {
+                    Literal::I32(int.value as i32)
+                } else {
+                    Literal::U32(int.value as u32)
+                }
+            }
+            TokenValue::FloatConstant(float) => {
+                if float.width != 32 {
+                    frontend.errors.push(Error {
+                        kind: ErrorKind::SemanticError(
+                            concat!(
+                                "Unsupported floating-point value ",
+                                "(expected single-precision floating-point number)"
+                            )
+                            .into(),
+                        ),
+                        meta: token.meta,
+                    });
+                }
+                Literal::F32(float.value)
+            }
+            TokenValue::BoolConstant(value) => Literal::Bool(value),
+            TokenValue::LeftParen => {
+                let expr = self.parse_expression(frontend, ctx, stmt)?;
+                let meta = self.expect(frontend, TokenValue::RightParen)?.meta;
+
+                token.meta.subsume(meta);
+
+                return Ok(expr);
+            }
+            _ => {
+                return Err(Error {
+                    kind: ErrorKind::InvalidToken(
+                        token.value,
+                        vec![
+                            TokenValue::LeftParen.into(),
+                            ExpectedToken::IntLiteral,
+                            ExpectedToken::FloatLiteral,
+                            ExpectedToken::BoolLiteral,
+                        ],
+                    ),
+                    meta: token.meta,
+                });
+            }
+        };
+
+        Ok(stmt.hir_exprs.append(
+            HirExpr {
+                kind: HirExprKind::Literal(literal),
+                meta: token.meta,
+            },
+            Default::default(),
+        ))
+    }
+
+    pub fn parse_function_call_args(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        stmt: &mut StmtContext,
+        meta: &mut Span,
+    ) -> Result<Vec<Handle<HirExpr>>> {
+        let mut args = Vec::new();
+        if let Some(token) = self.bump_if(frontend, TokenValue::RightParen) {
+            meta.subsume(token.meta);
+        } else {
+            loop {
+                args.push(self.parse_assignment(frontend, ctx, stmt)?);
+
+                let token = self.bump(frontend)?;
+                match token.value {
+                    TokenValue::Comma => {}
+                    TokenValue::RightParen => {
+                        meta.subsume(token.meta);
+                        break;
+                    }
+                    _ => {
+                        return Err(Error {
+                            kind: ErrorKind::InvalidToken(
+                                token.value,
+                                vec![TokenValue::Comma.into(), TokenValue::RightParen.into()],
+                            ),
+                            meta: token.meta,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(args)
+    }
+
+    pub fn parse_postfix(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        stmt: &mut StmtContext,
+    ) -> Result<Handle<HirExpr>> {
+        let mut base = if self.peek_type_name(frontend) {
+            let (mut handle, mut meta) = self.parse_type_non_void(frontend, ctx)?;
+
+            self.expect(frontend, TokenValue::LeftParen)?;
+            let args = self.parse_function_call_args(frontend, ctx, stmt, &mut meta)?;
+
+            if let TypeInner::Array {
+                size: ArraySize::Dynamic,
+                stride,
+                base,
+            } = ctx.module.types[handle].inner
+            {
+                let span = ctx.module.types.get_span(handle);
+
+                let size = u32::try_from(args.len())
+                    .ok()
+                    .and_then(NonZeroU32::new)
+                    .ok_or(Error {
+                        kind: ErrorKind::SemanticError(
+                            "There must be at least one argument".into(),
+                        ),
+                        meta,
+                    })?;
+
+                handle = ctx.module.types.insert(
+                    Type {
+                        name: None,
+                        inner: TypeInner::Array {
+                            stride,
+                            base,
+                            size: ArraySize::Constant(size),
+                        },
+                    },
+                    span,
+                )
+            }
+
+            stmt.hir_exprs.append(
+                HirExpr {
+                    kind: HirExprKind::Call(FunctionCall {
+                        kind: FunctionCallKind::TypeConstructor(handle),
+                        args,
+                    }),
+                    meta,
+                },
+                Default::default(),
+            )
+        } else if let TokenValue::Identifier(_) = self.expect_peek(frontend)?.value {
+            let (name, mut meta) = self.expect_ident(frontend)?;
+
+            let expr = if self.bump_if(frontend, TokenValue::LeftParen).is_some() {
+                let args = self.parse_function_call_args(frontend, ctx, stmt, &mut meta)?;
+
+                let kind = match frontend.lookup_type.get(&name) {
+                    Some(ty) => FunctionCallKind::TypeConstructor(*ty),
+                    None => FunctionCallKind::Function(name),
+                };
+
+                HirExpr {
+                    kind: HirExprKind::Call(FunctionCall { kind, args }),
+                    meta,
+                }
+            } else {
+                let var = match frontend.lookup_variable(ctx, &name, meta)? {
+                    Some(var) => var,
+                    None => {
+                        return Err(Error {
+                            kind: ErrorKind::UnknownVariable(name),
+                            meta,
+                        })
+                    }
+                };
+
+                HirExpr {
+                    kind: HirExprKind::Variable(var),
+                    meta,
+                }
+            };
+
+            stmt.hir_exprs.append(expr, Default::default())
+        } else {
+            self.parse_primary(frontend, ctx, stmt)?
+        };
+
+        while let TokenValue::LeftBracket
+        | TokenValue::Dot
+        | TokenValue::Increment
+        | TokenValue::Decrement = self.expect_peek(frontend)?.value
+        {
+            let Token { value, mut meta } = self.bump(frontend)?;
+
+            match value {
+                TokenValue::LeftBracket => {
+                    let index = self.parse_expression(frontend, ctx, stmt)?;
+                    let end_meta = self.expect(frontend, TokenValue::RightBracket)?.meta;
+
+                    meta.subsume(end_meta);
+                    base = stmt.hir_exprs.append(
+                        HirExpr {
+                            kind: HirExprKind::Access { base, index },
+                            meta,
+                        },
+                        Default::default(),
+                    )
+                }
+                TokenValue::Dot => {
+                    let (field, end_meta) = self.expect_ident(frontend)?;
+
+                    if self.bump_if(frontend, TokenValue::LeftParen).is_some() {
+                        let args = self.parse_function_call_args(frontend, ctx, stmt, &mut meta)?;
+
+                        base = stmt.hir_exprs.append(
+                            HirExpr {
+                                kind: HirExprKind::Method {
+                                    expr: base,
+                                    name: field,
+                                    args,
+                                },
+                                meta,
+                            },
+                            Default::default(),
+                        );
+                        continue;
+                    }
+
+                    meta.subsume(end_meta);
+                    base = stmt.hir_exprs.append(
+                        HirExpr {
+                            kind: HirExprKind::Select { base, field },
+                            meta,
+                        },
+                        Default::default(),
+                    )
+                }
+                TokenValue::Increment | TokenValue::Decrement => {
+                    base = stmt.hir_exprs.append(
+                        HirExpr {
+                            kind: HirExprKind::PrePostfix {
+                                op: match value {
+                                    TokenValue::Increment => BinaryOperator::Add,
+                                    _ => BinaryOperator::Subtract,
+                                },
+                                postfix: true,
+                                expr: base,
+                            },
+                            meta,
+                        },
+                        Default::default(),
+                    )
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        Ok(base)
+    }
+
+    pub fn parse_unary(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        stmt: &mut StmtContext,
+    ) -> Result<Handle<HirExpr>> {
+        Ok(match self.expect_peek(frontend)?.value {
+            TokenValue::Plus | TokenValue::Dash | TokenValue::Bang | TokenValue::Tilde => {
+                let Token { value, mut meta } = self.bump(frontend)?;
+
+                let expr = self.parse_unary(frontend, ctx, stmt)?;
+                let end_meta = stmt.hir_exprs[expr].meta;
+
+                let kind = match value {
+                    TokenValue::Dash => HirExprKind::Unary {
+                        op: UnaryOperator::Negate,
+                        expr,
+                    },
+                    TokenValue::Bang => HirExprKind::Unary {
+                        op: UnaryOperator::LogicalNot,
+                        expr,
+                    },
+                    TokenValue::Tilde => HirExprKind::Unary {
+                        op: UnaryOperator::BitwiseNot,
+                        expr,
+                    },
+                    _ => return Ok(expr),
+                };
+
+                meta.subsume(end_meta);
+                stmt.hir_exprs
+                    .append(HirExpr { kind, meta }, Default::default())
+            }
+            TokenValue::Increment | TokenValue::Decrement => {
+                let Token { value, meta } = self.bump(frontend)?;
+
+                let expr = self.parse_unary(frontend, ctx, stmt)?;
+
+                stmt.hir_exprs.append(
+                    HirExpr {
+                        kind: HirExprKind::PrePostfix {
+                            op: match value {
+                                TokenValue::Increment => BinaryOperator::Add,
+                                _ => BinaryOperator::Subtract,
+                            },
+                            postfix: false,
+                            expr,
+                        },
+                        meta,
+                    },
+                    Default::default(),
+                )
+            }
+            _ => self.parse_postfix(frontend, ctx, stmt)?,
+        })
+    }
+
+    pub fn parse_binary(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        stmt: &mut StmtContext,
+        passthrough: Option<Handle<HirExpr>>,
+        min_bp: u8,
+    ) -> Result<Handle<HirExpr>> {
+        let mut left = passthrough
+            .ok_or(ErrorKind::EndOfFile /* Dummy error */)
+            .or_else(|_| self.parse_unary(frontend, ctx, stmt))?;
+        let mut meta = stmt.hir_exprs[left].meta;
+
+        while let Some((l_bp, r_bp)) = binding_power(&self.expect_peek(frontend)?.value) {
+            if l_bp < min_bp {
+                break;
+            }
+
+            let Token { value, .. } = self.bump(frontend)?;
+
+            let right = self.parse_binary(frontend, ctx, stmt, None, r_bp)?;
+            let end_meta = stmt.hir_exprs[right].meta;
+
+            meta.subsume(end_meta);
+            left = stmt.hir_exprs.append(
+                HirExpr {
+                    kind: HirExprKind::Binary {
+                        left,
+                        op: match value {
+                            TokenValue::LogicalOr => BinaryOperator::LogicalOr,
+                            TokenValue::LogicalXor => BinaryOperator::NotEqual,
+                            TokenValue::LogicalAnd => BinaryOperator::LogicalAnd,
+                            TokenValue::VerticalBar => BinaryOperator::InclusiveOr,
+                            TokenValue::Caret => BinaryOperator::ExclusiveOr,
+                            TokenValue::Ampersand => BinaryOperator::And,
+                            TokenValue::Equal => BinaryOperator::Equal,
+                            TokenValue::NotEqual => BinaryOperator::NotEqual,
+                            TokenValue::GreaterEqual => BinaryOperator::GreaterEqual,
+                            TokenValue::LessEqual => BinaryOperator::LessEqual,
+                            TokenValue::LeftAngle => BinaryOperator::Less,
+                            TokenValue::RightAngle => BinaryOperator::Greater,
+                            TokenValue::LeftShift => BinaryOperator::ShiftLeft,
+                            TokenValue::RightShift => BinaryOperator::ShiftRight,
+                            TokenValue::Plus => BinaryOperator::Add,
+                            TokenValue::Dash => BinaryOperator::Subtract,
+                            TokenValue::Star => BinaryOperator::Multiply,
+                            TokenValue::Slash => BinaryOperator::Divide,
+                            TokenValue::Percent => BinaryOperator::Modulo,
+                            _ => unreachable!(),
+                        },
+                        right,
+                    },
+                    meta,
+                },
+                Default::default(),
+            )
+        }
+
+        Ok(left)
+    }
+
+    pub fn parse_conditional(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        stmt: &mut StmtContext,
+        passthrough: Option<Handle<HirExpr>>,
+    ) -> Result<Handle<HirExpr>> {
+        let mut condition = self.parse_binary(frontend, ctx, stmt, passthrough, 0)?;
+        let mut meta = stmt.hir_exprs[condition].meta;
+
+        if self.bump_if(frontend, TokenValue::Question).is_some() {
+            let accept = self.parse_expression(frontend, ctx, stmt)?;
+            self.expect(frontend, TokenValue::Colon)?;
+            let reject = self.parse_assignment(frontend, ctx, stmt)?;
+            let end_meta = stmt.hir_exprs[reject].meta;
+
+            meta.subsume(end_meta);
+            condition = stmt.hir_exprs.append(
+                HirExpr {
+                    kind: HirExprKind::Conditional {
+                        condition,
+                        accept,
+                        reject,
+                    },
+                    meta,
+                },
+                Default::default(),
+            )
+        }
+
+        Ok(condition)
+    }
+
+    pub fn parse_assignment(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        stmt: &mut StmtContext,
+    ) -> Result<Handle<HirExpr>> {
+        let tgt = self.parse_unary(frontend, ctx, stmt)?;
+        let mut meta = stmt.hir_exprs[tgt].meta;
+
+        Ok(match self.expect_peek(frontend)?.value {
+            TokenValue::Assign => {
+                self.bump(frontend)?;
+                let value = self.parse_assignment(frontend, ctx, stmt)?;
+                let end_meta = stmt.hir_exprs[value].meta;
+
+                meta.subsume(end_meta);
+                stmt.hir_exprs.append(
+                    HirExpr {
+                        kind: HirExprKind::Assign { tgt, value },
+                        meta,
+                    },
+                    Default::default(),
+                )
+            }
+            TokenValue::OrAssign
+            | TokenValue::AndAssign
+            | TokenValue::AddAssign
+            | TokenValue::DivAssign
+            | TokenValue::ModAssign
+            | TokenValue::SubAssign
+            | TokenValue::MulAssign
+            | TokenValue::LeftShiftAssign
+            | TokenValue::RightShiftAssign
+            | TokenValue::XorAssign => {
+                let token = self.bump(frontend)?;
+                let right = self.parse_assignment(frontend, ctx, stmt)?;
+                let end_meta = stmt.hir_exprs[right].meta;
+
+                meta.subsume(end_meta);
+                let value = stmt.hir_exprs.append(
+                    HirExpr {
+                        meta,
+                        kind: HirExprKind::Binary {
+                            left: tgt,
+                            op: match token.value {
+                                TokenValue::OrAssign => BinaryOperator::InclusiveOr,
+                                TokenValue::AndAssign => BinaryOperator::And,
+                                TokenValue::AddAssign => BinaryOperator::Add,
+                                TokenValue::DivAssign => BinaryOperator::Divide,
+                                TokenValue::ModAssign => BinaryOperator::Modulo,
+                                TokenValue::SubAssign => BinaryOperator::Subtract,
+                                TokenValue::MulAssign => BinaryOperator::Multiply,
+                                TokenValue::LeftShiftAssign => BinaryOperator::ShiftLeft,
+                                TokenValue::RightShiftAssign => BinaryOperator::ShiftRight,
+                                TokenValue::XorAssign => BinaryOperator::ExclusiveOr,
+                                _ => unreachable!(),
+                            },
+                            right,
+                        },
+                    },
+                    Default::default(),
+                );
+
+                stmt.hir_exprs.append(
+                    HirExpr {
+                        kind: HirExprKind::Assign { tgt, value },
+                        meta,
+                    },
+                    Default::default(),
+                )
+            }
+            _ => self.parse_conditional(frontend, ctx, stmt, Some(tgt))?,
+        })
+    }
+
+    pub fn parse_expression(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        stmt: &mut StmtContext,
+    ) -> Result<Handle<HirExpr>> {
+        let mut exprs = Vec::new();
+        let mut expr = self.parse_assignment(frontend, ctx, stmt)?;
+        exprs.push(expr);
+
+        while let TokenValue::Comma = self.expect_peek(frontend)?.value {
+            self.bump(frontend)?;
+            expr = self.parse_assignment(frontend, ctx, stmt)?;
+            exprs.push(expr);
+        }
+
+        if exprs.len() == 1 {
+            Ok(expr)
+        } else {
+            let mut meta = stmt.hir_exprs[exprs[0]].meta;
+            for &e in &exprs[1..] {
+                meta.subsume(stmt.hir_exprs[e].meta);
+            }
+            expr = stmt.hir_exprs.append(
+                HirExpr {
+                    kind: HirExprKind::Sequence { exprs },
+                    meta,
+                },
+                Default::default(),
+            );
+
+            Ok(expr)
+        }
+    }
+}
+
+const fn binding_power(value: &TokenValue) -> Option<(u8, u8)> {
+    Some(match *value {
+        TokenValue::LogicalOr => (1, 2),
+        TokenValue::LogicalXor => (3, 4),
+        TokenValue::LogicalAnd => (5, 6),
+        TokenValue::VerticalBar => (7, 8),
+        TokenValue::Caret => (9, 10),
+        TokenValue::Ampersand => (11, 12),
+        TokenValue::Equal | TokenValue::NotEqual => (13, 14),
+        TokenValue::GreaterEqual
+        | TokenValue::LessEqual
+        | TokenValue::LeftAngle
+        | TokenValue::RightAngle => (15, 16),
+        TokenValue::LeftShift | TokenValue::RightShift => (17, 18),
+        TokenValue::Plus | TokenValue::Dash => (19, 20),
+        TokenValue::Star | TokenValue::Slash | TokenValue::Percent => (21, 22),
+        _ => return None,
+    })
+}
+
+}
+mod functions {
+use std::{vec, vec::Vec};
+
+use crate::translate::iris_glsl::frontend::context::ExprPos;
+use crate::translate::iris_glsl::frontend::Span;
+use naga::Literal;
+use crate::translate::iris_glsl::frontend::{
+        ast::ParameterQualifier,
+        context::Context,
+        parser::ParsingContext,
+        token::{Token, TokenValue},
+        variables::VarDeclaration,
+        Error, ErrorKind, Frontend, Result,
+    };
+use naga::{Block, Expression, Statement, SwitchCase, UnaryOperator};
+
+impl ParsingContext<'_> {
+    pub fn peek_parameter_qualifier(&mut self, frontend: &mut Frontend) -> bool {
+        self.peek(frontend).is_some_and(|t| match t.value {
+            TokenValue::In | TokenValue::Out | TokenValue::InOut | TokenValue::Const => true,
+            _ => false,
+        })
+    }
+
+    /// Returns the parsed `ParameterQualifier` or `ParameterQualifier::In`
+    pub fn parse_parameter_qualifier(&mut self, frontend: &mut Frontend) -> ParameterQualifier {
+        if self.peek_parameter_qualifier(frontend) {
+            match self.bump(frontend).unwrap().value {
+                TokenValue::In => ParameterQualifier::In,
+                TokenValue::Out => ParameterQualifier::Out,
+                TokenValue::InOut => ParameterQualifier::InOut,
+                TokenValue::Const => ParameterQualifier::Const,
+                _ => unreachable!(),
+            }
+        } else {
+            ParameterQualifier::In
+        }
+    }
+
+    pub fn parse_statement(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        terminator: &mut Option<usize>,
+        is_inside_loop: bool,
+    ) -> Result<Option<Span>> {
+        // Type qualifiers always identify a declaration statement
+        if self.peek_type_qualifier(frontend) {
+            return self.parse_declaration(frontend, ctx, false, is_inside_loop);
+        }
+
+        // Type names can identify either declaration statements or type constructors
+        // depending on whether the token following the type name is a `(` (LeftParen)
+        if self.peek_type_name(frontend) {
+            // Start by consuming the type name so that we can peek the token after it
+            let token = self.bump(frontend)?;
+            // Peek the next token and check if it's a `(` (LeftParen) if so the statement
+            // is a constructor, otherwise it's a declaration. We need to do the check
+            // beforehand and not in the if since we will backtrack before the if
+            let declaration = TokenValue::LeftParen != self.expect_peek(frontend)?.value;
+
+            self.backtrack(token)?;
+
+            if declaration {
+                return self.parse_declaration(frontend, ctx, false, is_inside_loop);
+            }
+        }
+
+        let new_break = || {
+            let mut block = Block::new();
+            block.push(Statement::Break, Span::default());
+            block
+        };
+
+        let &Token {
+            ref value,
+            mut meta,
+        } = self.expect_peek(frontend)?;
+
+        let meta_rest = match *value {
+            TokenValue::Continue => {
+                let meta = self.bump(frontend)?.meta;
+                ctx.body.push(Statement::Continue, meta);
+                terminator.get_or_insert(ctx.body.len());
+                self.expect(frontend, TokenValue::Semicolon)?.meta
+            }
+            TokenValue::Break => {
+                let meta = self.bump(frontend)?.meta;
+                ctx.body.push(Statement::Break, meta);
+                terminator.get_or_insert(ctx.body.len());
+                self.expect(frontend, TokenValue::Semicolon)?.meta
+            }
+            TokenValue::Return => {
+                self.bump(frontend)?;
+                let (value, meta) = match self.expect_peek(frontend)?.value {
+                    TokenValue::Semicolon => (None, self.bump(frontend)?.meta),
+                    _ => {
+                        // TODO: Implicit conversions
+                        let mut stmt = ctx.stmt_ctx();
+                        let expr = self.parse_expression(frontend, ctx, &mut stmt)?;
+                        self.expect(frontend, TokenValue::Semicolon)?;
+                        let (handle, meta) =
+                            ctx.lower_expect(stmt, frontend, expr, ExprPos::Rhs)?;
+                        (Some(handle), meta)
+                    }
+                };
+
+                ctx.emit_restart();
+
+                ctx.body.push(Statement::Return { value }, meta);
+                terminator.get_or_insert(ctx.body.len());
+
+                meta
+            }
+            TokenValue::Discard => {
+                let meta = self.bump(frontend)?.meta;
+                ctx.body.push(Statement::Kill, meta);
+                terminator.get_or_insert(ctx.body.len());
+
+                self.expect(frontend, TokenValue::Semicolon)?.meta
+            }
+            TokenValue::If => {
+                let mut meta = self.bump(frontend)?.meta;
+
+                self.expect(frontend, TokenValue::LeftParen)?;
+                let condition = {
+                    let mut stmt = ctx.stmt_ctx();
+                    let expr = self.parse_expression(frontend, ctx, &mut stmt)?;
+                    let (handle, more_meta) =
+                        ctx.lower_expect(stmt, frontend, expr, ExprPos::Rhs)?;
+                    meta.subsume(more_meta);
+                    handle
+                };
+                self.expect(frontend, TokenValue::RightParen)?;
+
+                let accept = ctx.new_body(|ctx| {
+                    if let Some(more_meta) =
+                        self.parse_statement(frontend, ctx, &mut None, is_inside_loop)?
+                    {
+                        meta.subsume(more_meta);
+                    }
+                    Ok(())
+                })?;
+
+                let reject = ctx.new_body(|ctx| {
+                    if self.bump_if(frontend, TokenValue::Else).is_some() {
+                        if let Some(more_meta) =
+                            self.parse_statement(frontend, ctx, &mut None, is_inside_loop)?
+                        {
+                            meta.subsume(more_meta);
+                        }
+                    }
+                    Ok(())
+                })?;
+
+                ctx.body.push(
+                    Statement::If {
+                        condition,
+                        accept,
+                        reject,
+                    },
+                    meta,
+                );
+
+                meta
+            }
+            TokenValue::Switch => {
+                let mut meta = self.bump(frontend)?.meta;
+                let end_meta;
+
+                self.expect(frontend, TokenValue::LeftParen)?;
+
+                let (selector, uint) = {
+                    let mut stmt = ctx.stmt_ctx();
+                    let expr = self.parse_expression(frontend, ctx, &mut stmt)?;
+                    let (root, meta) = ctx.lower_expect(stmt, frontend, expr, ExprPos::Rhs)?;
+                    let uint = ctx.resolve_type(root, meta)?.scalar_kind()
+                        == Some(naga::ScalarKind::Uint);
+                    (root, uint)
+                };
+
+                self.expect(frontend, TokenValue::RightParen)?;
+
+                ctx.emit_restart();
+
+                let mut cases = Vec::new();
+                // Track if any default case is present in the switch statement.
+                let mut default_present = false;
+
+                self.expect(frontend, TokenValue::LeftBrace)?;
+                loop {
+                    let value = match self.expect_peek(frontend)?.value {
+                        TokenValue::Case => {
+                            self.bump(frontend)?;
+
+                            let (const_expr, meta) = self.parse_constant_expression(
+                                frontend,
+                                ctx.module,
+                                ctx.global_expression_kind_tracker,
+                            )?;
+
+                            match ctx.module.global_expressions[const_expr] {
+                                Expression::Literal(Literal::I32(value)) => match uint {
+                                    // This unchecked cast isn't good, but since
+                                    // we only reach this code when the selector
+                                    // is unsigned but the case label is signed,
+                                    // verification will reject the module
+                                    // anyway (which also matches GLSL's rules).
+                                    true => naga::SwitchValue::U32(value as u32),
+                                    false => naga::SwitchValue::I32(value),
+                                },
+                                Expression::Literal(Literal::U32(value)) => {
+                                    naga::SwitchValue::U32(value)
+                                }
+                                _ => {
+                                    frontend.errors.push(Error {
+                                        kind: ErrorKind::SemanticError(
+                                            "Case values can only be integers".into(),
+                                        ),
+                                        meta,
+                                    });
+
+                                    naga::SwitchValue::I32(0)
+                                }
+                            }
+                        }
+                        TokenValue::Default => {
+                            self.bump(frontend)?;
+                            default_present = true;
+                            naga::SwitchValue::Default
+                        }
+                        TokenValue::RightBrace => {
+                            end_meta = self.bump(frontend)?.meta;
+                            break;
+                        }
+                        _ => {
+                            let Token { value, meta } = self.bump(frontend)?;
+                            return Err(Error {
+                                kind: ErrorKind::InvalidToken(
+                                    value,
+                                    vec![
+                                        TokenValue::Case.into(),
+                                        TokenValue::Default.into(),
+                                        TokenValue::RightBrace.into(),
+                                    ],
+                                ),
+                                meta,
+                            });
+                        }
+                    };
+
+                    self.expect(frontend, TokenValue::Colon)?;
+
+                    let mut fall_through = true;
+
+                    let body = ctx.new_body(|ctx| {
+                        let mut case_terminator = None;
+                        loop {
+                            match self.expect_peek(frontend)?.value {
+                                TokenValue::Case | TokenValue::Default | TokenValue::RightBrace => {
+                                    break
+                                }
+                                _ => {
+                                    self.parse_statement(
+                                        frontend,
+                                        ctx,
+                                        &mut case_terminator,
+                                        is_inside_loop,
+                                    )?;
+                                }
+                            }
+                        }
+
+                        if let Some(mut idx) = case_terminator {
+                            if let Statement::Break = ctx.body[idx - 1] {
+                                fall_through = false;
+                                idx -= 1;
+                            }
+
+                            ctx.body.cull(idx..)
+                        }
+
+                        Ok(())
+                    })?;
+
+                    cases.push(SwitchCase {
+                        value,
+                        body,
+                        fall_through,
+                    })
+                }
+
+                meta.subsume(end_meta);
+
+                // NOTE: do not unwrap here since a switch statement isn't required
+                // to have any cases.
+                if let Some(case) = cases.last_mut() {
+                    // GLSL requires that the last case not be empty, so we check
+                    // that here and produce an error otherwise (fall_through must
+                    // also be checked because `break`s count as statements but
+                    // they aren't added to the body)
+                    if case.body.is_empty() && case.fall_through {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "last case/default label must be followed by statements".into(),
+                            ),
+                            meta,
+                        })
+                    }
+
+                    // GLSL allows the last case to not have any `break` statement,
+                    // this would mark it as fall through but naga's IR requires that
+                    // the last case must not be fall through, so we mark need to mark
+                    // the last case as not fall through always.
+                    case.fall_through = false;
+                }
+
+                // Add an empty default case in case non was present, this is needed because
+                // naga's IR requires that all switch statements must have a default case but
+                // GLSL doesn't require that, so we might need to add an empty default case.
+                if !default_present {
+                    cases.push(SwitchCase {
+                        value: naga::SwitchValue::Default,
+                        body: Block::new(),
+                        fall_through: false,
+                    })
+                }
+
+                ctx.body.push(Statement::Switch { selector, cases }, meta);
+
+                meta
+            }
+            TokenValue::While => {
+                let mut meta = self.bump(frontend)?.meta;
+
+                let loop_body = ctx.new_body(|ctx| {
+                    let mut stmt = ctx.stmt_ctx();
+                    self.expect(frontend, TokenValue::LeftParen)?;
+                    let root = self.parse_expression(frontend, ctx, &mut stmt)?;
+                    meta.subsume(self.expect(frontend, TokenValue::RightParen)?.meta);
+
+                    let (expr, expr_meta) = ctx.lower_expect(stmt, frontend, root, ExprPos::Rhs)?;
+                    let condition = ctx.add_expression(
+                        Expression::Unary {
+                            op: UnaryOperator::LogicalNot,
+                            expr,
+                        },
+                        expr_meta,
+                    )?;
+
+                    ctx.emit_restart();
+
+                    ctx.body.push(
+                        Statement::If {
+                            condition,
+                            accept: new_break(),
+                            reject: Block::new(),
+                        },
+                        Span::default(),
+                    );
+
+                    meta.subsume(expr_meta);
+
+                    if let Some(body_meta) = self.parse_statement(frontend, ctx, &mut None, true)? {
+                        meta.subsume(body_meta);
+                    }
+                    Ok(())
+                })?;
+
+                ctx.body.push(
+                    Statement::Loop {
+                        body: loop_body,
+                        continuing: Block::new(),
+                        break_if: None,
+                    },
+                    meta,
+                );
+
+                meta
+            }
+            TokenValue::Do => {
+                let mut meta = self.bump(frontend)?.meta;
+
+                let loop_body = ctx.new_body(|ctx| {
+                    let mut terminator = None;
+                    self.parse_statement(frontend, ctx, &mut terminator, true)?;
+
+                    let mut stmt = ctx.stmt_ctx();
+
+                    self.expect(frontend, TokenValue::While)?;
+                    self.expect(frontend, TokenValue::LeftParen)?;
+                    let root = self.parse_expression(frontend, ctx, &mut stmt)?;
+                    let end_meta = self.expect(frontend, TokenValue::RightParen)?.meta;
+
+                    meta.subsume(end_meta);
+
+                    let (expr, expr_meta) = ctx.lower_expect(stmt, frontend, root, ExprPos::Rhs)?;
+                    let condition = ctx.add_expression(
+                        Expression::Unary {
+                            op: UnaryOperator::LogicalNot,
+                            expr,
+                        },
+                        expr_meta,
+                    )?;
+
+                    ctx.emit_restart();
+
+                    ctx.body.push(
+                        Statement::If {
+                            condition,
+                            accept: new_break(),
+                            reject: Block::new(),
+                        },
+                        Span::default(),
+                    );
+
+                    if let Some(idx) = terminator {
+                        ctx.body.cull(idx..)
+                    }
+                    Ok(())
+                })?;
+
+                ctx.body.push(
+                    Statement::Loop {
+                        body: loop_body,
+                        continuing: Block::new(),
+                        break_if: None,
+                    },
+                    meta,
+                );
+
+                meta
+            }
+            TokenValue::For => {
+                let mut meta = self.bump(frontend)?.meta;
+
+                ctx.symbol_table.push_scope();
+                self.expect(frontend, TokenValue::LeftParen)?;
+
+                if self.bump_if(frontend, TokenValue::Semicolon).is_none() {
+                    if self.peek_type_name(frontend) || self.peek_type_qualifier(frontend) {
+                        self.parse_declaration(frontend, ctx, false, is_inside_loop)?;
+                    } else {
+                        let mut stmt = ctx.stmt_ctx();
+                        let expr = self.parse_expression(frontend, ctx, &mut stmt)?;
+                        ctx.lower(stmt, frontend, expr, ExprPos::Rhs)?;
+                        self.expect(frontend, TokenValue::Semicolon)?;
+                    }
+                }
+
+                let loop_body = ctx.new_body(|ctx| {
+                    if self.bump_if(frontend, TokenValue::Semicolon).is_none() {
+                        let (expr, expr_meta) = if self.peek_type_name(frontend)
+                            || self.peek_type_qualifier(frontend)
+                        {
+                            let mut qualifiers = self.parse_type_qualifiers(frontend, ctx)?;
+                            let (ty, mut meta) = self.parse_type_non_void(frontend, ctx)?;
+                            let name = self.expect_ident(frontend)?.0;
+
+                            self.expect(frontend, TokenValue::Assign)?;
+
+                            let (value, end_meta) = self.parse_initializer(frontend, ty, ctx)?;
+                            meta.subsume(end_meta);
+
+                            let decl = VarDeclaration {
+                                qualifiers: &mut qualifiers,
+                                ty,
+                                name: Some(name),
+                                init: None,
+                                meta,
+                            };
+
+                            let pointer = frontend.add_local_var(ctx, decl)?;
+
+                            ctx.emit_restart();
+
+                            ctx.body.push(Statement::Store { pointer, value }, meta);
+
+                            (value, end_meta)
+                        } else {
+                            let mut stmt = ctx.stmt_ctx();
+                            let root = self.parse_expression(frontend, ctx, &mut stmt)?;
+                            ctx.lower_expect(stmt, frontend, root, ExprPos::Rhs)?
+                        };
+
+                        let condition = ctx.add_expression(
+                            Expression::Unary {
+                                op: UnaryOperator::LogicalNot,
+                                expr,
+                            },
+                            expr_meta,
+                        )?;
+
+                        ctx.emit_restart();
+
+                        ctx.body.push(
+                            Statement::If {
+                                condition,
+                                accept: new_break(),
+                                reject: Block::new(),
+                            },
+                            Span::default(),
+                        );
+
+                        self.expect(frontend, TokenValue::Semicolon)?;
+                    }
+                    Ok(())
+                })?;
+
+                let continuing = ctx.new_body(|ctx| {
+                    match self.expect_peek(frontend)?.value {
+                        TokenValue::RightParen => {}
+                        _ => {
+                            let mut stmt = ctx.stmt_ctx();
+                            let rest = self.parse_expression(frontend, ctx, &mut stmt)?;
+                            ctx.lower(stmt, frontend, rest, ExprPos::Rhs)?;
+                        }
+                    }
+                    Ok(())
+                })?;
+
+                meta.subsume(self.expect(frontend, TokenValue::RightParen)?.meta);
+
+                let loop_body = ctx.with_body(loop_body, |ctx| {
+                    if let Some(stmt_meta) = self.parse_statement(frontend, ctx, &mut None, true)? {
+                        meta.subsume(stmt_meta);
+                    }
+                    Ok(())
+                })?;
+
+                ctx.body.push(
+                    Statement::Loop {
+                        body: loop_body,
+                        continuing,
+                        break_if: None,
+                    },
+                    meta,
+                );
+
+                ctx.symbol_table.pop_scope();
+
+                meta
+            }
+            TokenValue::LeftBrace => {
+                let mut meta = self.bump(frontend)?.meta;
+
+                let mut block_terminator = None;
+
+                let block = ctx.new_body(|ctx| {
+                    let block_meta = self.parse_compound_statement(
+                        meta,
+                        frontend,
+                        ctx,
+                        &mut block_terminator,
+                        is_inside_loop,
+                    )?;
+                    meta.subsume(block_meta);
+                    Ok(())
+                })?;
+
+                ctx.body.push(Statement::Block(block), meta);
+                if block_terminator.is_some() {
+                    terminator.get_or_insert(ctx.body.len());
+                }
+
+                meta
+            }
+            TokenValue::Semicolon => self.bump(frontend)?.meta,
+            _ => {
+                // Attempt to force expression parsing for remainder of the
+                // tokens. Unknown or invalid tokens will be caught there and
+                // turned into an error.
+                let mut stmt = ctx.stmt_ctx();
+                let expr = self.parse_expression(frontend, ctx, &mut stmt)?;
+                ctx.lower(stmt, frontend, expr, ExprPos::Rhs)?;
+                self.expect(frontend, TokenValue::Semicolon)?.meta
+            }
+        };
+
+        meta.subsume(meta_rest);
+        Ok(Some(meta))
+    }
+
+    pub fn parse_compound_statement(
+        &mut self,
+        mut meta: Span,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        terminator: &mut Option<usize>,
+        is_inside_loop: bool,
+    ) -> Result<Span> {
+        ctx.symbol_table.push_scope();
+
+        loop {
+            if let Some(Token {
+                meta: brace_meta, ..
+            }) = self.bump_if(frontend, TokenValue::RightBrace)
+            {
+                meta.subsume(brace_meta);
+                break;
+            }
+
+            let stmt = self.parse_statement(frontend, ctx, terminator, is_inside_loop)?;
+
+            if let Some(stmt_meta) = stmt {
+                meta.subsume(stmt_meta);
+            }
+        }
+
+        if let Some(idx) = *terminator {
+            ctx.body.cull(idx..)
+        }
+
+        ctx.symbol_table.pop_scope();
+
+        Ok(meta)
+    }
+
+    pub fn parse_function_args(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+    ) -> Result<()> {
+        if self.bump_if(frontend, TokenValue::Void).is_some() {
+            return Ok(());
+        }
+
+        loop {
+            if self.peek_type_name(frontend) || self.peek_parameter_qualifier(frontend) {
+                let qualifier = self.parse_parameter_qualifier(frontend);
+                let mut ty = self.parse_type_non_void(frontend, ctx)?.0;
+
+                match self.expect_peek(frontend)?.value {
+                    TokenValue::Comma => {
+                        self.bump(frontend)?;
+                        ctx.add_function_arg(None, ty, qualifier)?;
+                        continue;
+                    }
+                    TokenValue::Identifier(_) => {
+                        let mut name = self.expect_ident(frontend)?;
+                        self.parse_array_specifier(frontend, ctx, &mut name.1, &mut ty)?;
+
+                        ctx.add_function_arg(Some(name), ty, qualifier)?;
+
+                        if self.bump_if(frontend, TokenValue::Comma).is_some() {
+                            continue;
+                        }
+
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+
+            break;
+        }
+
+        Ok(())
+    }
+}
+
+}
+mod types {
+use std::{vec, vec::Vec};
+use core::num::NonZeroU32;
+
+use crate::translate::iris_glsl::frontend::{
+        ast::{QualifierKey, QualifierValue, StorageQualifier, StructLayout, TypeQualifiers},
+        context::Context,
+        error::ExpectedToken,
+        parser::ParsingContext,
+        token::{Token, TokenValue},
+        Error, ErrorKind, Frontend, Result,
+    };
+use naga::{AddressSpace, ArraySize, Handle, Span, Type, TypeInner};
+
+impl ParsingContext<'_> {
+    /// Parses an optional array_specifier returning whether or not it's present
+    /// and modifying the type handle if it exists
+    pub fn parse_array_specifier(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        span: &mut Span,
+        ty: &mut Handle<Type>,
+    ) -> Result<()> {
+        while self.parse_array_specifier_single(frontend, ctx, span, ty)? {}
+        Ok(())
+    }
+
+    /// Implementation of [`Self::parse_array_specifier`] for a single array_specifier
+    fn parse_array_specifier_single(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        span: &mut Span,
+        ty: &mut Handle<Type>,
+    ) -> Result<bool> {
+        if self.bump_if(frontend, TokenValue::LeftBracket).is_some() {
+            let size = if let Some(Token { meta, .. }) =
+                self.bump_if(frontend, TokenValue::RightBracket)
+            {
+                span.subsume(meta);
+                ArraySize::Dynamic
+            } else {
+                let (value, constant_span) = self.parse_uint_constant(frontend, ctx)?;
+                let size = NonZeroU32::new(value).ok_or(Error {
+                    kind: ErrorKind::SemanticError("Array size must be greater than zero".into()),
+                    meta: constant_span,
+                })?;
+                let end_span = self.expect(frontend, TokenValue::RightBracket)?.meta;
+                span.subsume(end_span);
+                ArraySize::Constant(size)
+            };
+
+            frontend.layouter.update(ctx.module.to_ctx()).unwrap();
+            let stride = frontend.layouter[*ty].to_stride();
+            *ty = ctx.module.types.insert(
+                Type {
+                    name: None,
+                    inner: TypeInner::Array {
+                        base: *ty,
+                        size,
+                        stride,
+                    },
+                },
+                *span,
+            );
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn parse_type(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+    ) -> Result<(Option<Handle<Type>>, Span)> {
+        let token = self.bump(frontend)?;
+        let mut handle = match token.value {
+            TokenValue::Void => return Ok((None, token.meta)),
+            TokenValue::TypeName(ty) => ctx.module.types.insert(ty, token.meta),
+            TokenValue::Struct => {
+                let mut meta = token.meta;
+                let ty_name = self.expect_ident(frontend)?.0;
+                self.expect(frontend, TokenValue::LeftBrace)?;
+                let mut members = Vec::new();
+                // Iris Features: a plain struct takes its arrays with the shader's own strides
+                // (as `std430` lays them out), so `S(float[3](...))` and `f(s.array)` match;
+                // `std140` gave a `float[3]` member a stride of 16.
+                let span = self.parse_struct_declaration_list(
+                    frontend,
+                    ctx,
+                    &mut members,
+                    StructLayout::Std430,
+                )?;
+                let end_meta = self.expect(frontend, TokenValue::RightBrace)?.meta;
+                meta.subsume(end_meta);
+                let ty = ctx.module.types.insert(
+                    Type {
+                        name: Some(ty_name.clone()),
+                        inner: TypeInner::Struct { members, span },
+                    },
+                    meta,
+                );
+                frontend.lookup_type.insert(ty_name, ty);
+                ty
+            }
+            TokenValue::Identifier(ident) => match frontend.lookup_type.get(&ident) {
+                Some(ty) => *ty,
+                None => {
+                    return Err(Error {
+                        kind: ErrorKind::UnknownType(ident),
+                        meta: token.meta,
+                    })
+                }
+            },
+            _ => {
+                return Err(Error {
+                    kind: ErrorKind::InvalidToken(
+                        token.value,
+                        vec![
+                            TokenValue::Void.into(),
+                            TokenValue::Struct.into(),
+                            ExpectedToken::TypeName,
+                        ],
+                    ),
+                    meta: token.meta,
+                });
+            }
+        };
+
+        let mut span = token.meta;
+        self.parse_array_specifier(frontend, ctx, &mut span, &mut handle)?;
+        Ok((Some(handle), span))
+    }
+
+    pub fn parse_type_non_void(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+    ) -> Result<(Handle<Type>, Span)> {
+        let (maybe_ty, meta) = self.parse_type(frontend, ctx)?;
+        let ty = maybe_ty.ok_or_else(|| Error {
+            kind: ErrorKind::SemanticError("Type can't be void".into()),
+            meta,
+        })?;
+
+        Ok((ty, meta))
+    }
+
+    pub fn peek_type_qualifier(&mut self, frontend: &mut Frontend) -> bool {
+        self.peek(frontend).is_some_and(|t| match t.value {
+            TokenValue::Invariant
+            | TokenValue::Interpolation(_)
+            | TokenValue::Sampling(_)
+            | TokenValue::PrecisionQualifier(_)
+            | TokenValue::Const
+            | TokenValue::In
+            | TokenValue::Out
+            | TokenValue::Uniform
+            | TokenValue::Shared
+            | TokenValue::Buffer
+            | TokenValue::Restrict
+            | TokenValue::MemoryQualifier(_)
+            | TokenValue::Layout => true,
+            _ => false,
+        })
+    }
+
+    pub fn parse_type_qualifiers<'a>(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+    ) -> Result<TypeQualifiers<'a>> {
+        let mut qualifiers = TypeQualifiers::default();
+
+        while self.peek_type_qualifier(frontend) {
+            let token = self.bump(frontend)?;
+
+            // Handle layout qualifiers outside the match since this can push multiple values
+            if token.value == TokenValue::Layout {
+                self.parse_layout_qualifier_id_list(frontend, ctx, &mut qualifiers)?;
+                continue;
+            }
+
+            qualifiers.span.subsume(token.meta);
+
+            match token.value {
+                TokenValue::Invariant => {
+                    if qualifiers.invariant.is_some() {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Cannot use more than one invariant qualifier per declaration"
+                                    .into(),
+                            ),
+                            meta: token.meta,
+                        })
+                    }
+
+                    qualifiers.invariant = Some(token.meta);
+                }
+                TokenValue::Interpolation(i) => {
+                    if qualifiers.interpolation.is_some() {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Cannot use more than one interpolation qualifier per declaration"
+                                    .into(),
+                            ),
+                            meta: token.meta,
+                        })
+                    }
+
+                    qualifiers.interpolation = Some((i, token.meta));
+                }
+                TokenValue::Const
+                | TokenValue::In
+                | TokenValue::Out
+                | TokenValue::Uniform
+                | TokenValue::Shared
+                | TokenValue::Buffer => {
+                    let storage = match token.value {
+                        TokenValue::Const => StorageQualifier::Const,
+                        TokenValue::In => StorageQualifier::Input,
+                        TokenValue::Out => StorageQualifier::Output,
+                        TokenValue::Uniform => {
+                            StorageQualifier::AddressSpace(AddressSpace::Uniform)
+                        }
+                        TokenValue::Shared => {
+                            StorageQualifier::AddressSpace(AddressSpace::WorkGroup)
+                        }
+                        TokenValue::Buffer => {
+                            StorageQualifier::AddressSpace(AddressSpace::Storage {
+                                access: naga::StorageAccess::LOAD | naga::StorageAccess::STORE,
+                            })
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    if StorageQualifier::AddressSpace(AddressSpace::Function)
+                        != qualifiers.storage.0
+                    {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Cannot use more than one storage qualifier per declaration".into(),
+                            ),
+                            meta: token.meta,
+                        });
+                    }
+
+                    qualifiers.storage = (storage, token.meta);
+                }
+                TokenValue::Sampling(s) => {
+                    if qualifiers.sampling.is_some() {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Cannot use more than one sampling qualifier per declaration"
+                                    .into(),
+                            ),
+                            meta: token.meta,
+                        })
+                    }
+
+                    qualifiers.sampling = Some((s, token.meta));
+                }
+                TokenValue::PrecisionQualifier(p) => {
+                    if qualifiers.precision.is_some() {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "Cannot use more than one precision qualifier per declaration"
+                                    .into(),
+                            ),
+                            meta: token.meta,
+                        })
+                    }
+
+                    qualifiers.precision = Some((p, token.meta));
+                }
+                TokenValue::MemoryQualifier(access) => {
+                    let load_store = naga::StorageAccess::LOAD | naga::StorageAccess::STORE;
+                    let storage_access = qualifiers
+                        .storage_access
+                        .get_or_insert((load_store, Span::default()));
+
+                    if !storage_access.0.contains(!access & load_store) {
+                        frontend.errors.push(Error {
+                            kind: ErrorKind::SemanticError(
+                                "The same memory qualifier can only be used once".into(),
+                            ),
+                            meta: token.meta,
+                        })
+                    }
+
+                    storage_access.0 &= access;
+                    storage_access.1.subsume(token.meta);
+                }
+                TokenValue::Restrict => continue,
+                _ => unreachable!(),
+            };
+        }
+
+        Ok(qualifiers)
+    }
+
+    pub fn parse_layout_qualifier_id_list(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        qualifiers: &mut TypeQualifiers,
+    ) -> Result<()> {
+        self.expect(frontend, TokenValue::LeftParen)?;
+        loop {
+            self.parse_layout_qualifier_id(frontend, ctx, &mut qualifiers.layout_qualifiers)?;
+
+            if self.bump_if(frontend, TokenValue::Comma).is_some() {
+                continue;
+            }
+
+            break;
+        }
+        let token = self.expect(frontend, TokenValue::RightParen)?;
+        qualifiers.span.subsume(token.meta);
+
+        Ok(())
+    }
+
+    pub fn parse_layout_qualifier_id(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+        qualifiers: &mut naga::FastHashMap<QualifierKey, (QualifierValue, Span)>,
+    ) -> Result<()> {
+        // layout_qualifier_id:
+        //     IDENTIFIER
+        //     IDENTIFIER EQUAL constant_expression
+        //     SHARED
+        let mut token = self.bump(frontend)?;
+        match token.value {
+            TokenValue::Identifier(name) => {
+                let (key, value) = match name.as_str() {
+                    "std140" => (
+                        QualifierKey::Layout,
+                        QualifierValue::Layout(StructLayout::Std140),
+                    ),
+                    "std430" => (
+                        QualifierKey::Layout,
+                        QualifierValue::Layout(StructLayout::Std430),
+                    ),
+                    "index" => {
+                        self.expect(frontend, TokenValue::Assign)?;
+                        let (value, end_meta) = self.parse_uint_constant(frontend, ctx)?;
+                        token.meta.subsume(end_meta);
+
+                        (QualifierKey::Index, QualifierValue::Uint(value))
+                    }
+                    word => {
+                        if let Some(format) = map_image_format(word) {
+                            (QualifierKey::Format, QualifierValue::Format(format))
+                        } else {
+                            let key = QualifierKey::String(name.into());
+                            let value = if self.bump_if(frontend, TokenValue::Assign).is_some() {
+                                let (value, end_meta) =
+                                    match self.parse_uint_constant(frontend, ctx) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            frontend.errors.push(e);
+                                            (0, Span::default())
+                                        }
+                                    };
+                                token.meta.subsume(end_meta);
+
+                                QualifierValue::Uint(value)
+                            } else {
+                                QualifierValue::None
+                            };
+
+                            (key, value)
+                        }
+                    }
+                };
+
+                qualifiers.insert(key, (value, token.meta));
+            }
+            _ => frontend.errors.push(Error {
+                kind: ErrorKind::InvalidToken(token.value, vec![ExpectedToken::Identifier]),
+                meta: token.meta,
+            }),
+        }
+
+        Ok(())
+    }
+
+    pub fn peek_type_name(&mut self, frontend: &mut Frontend) -> bool {
+        self.peek(frontend).is_some_and(|t| match t.value {
+            TokenValue::TypeName(_) | TokenValue::Void => true,
+            TokenValue::Struct => true,
+            TokenValue::Identifier(ref ident) => frontend.lookup_type.contains_key(ident),
+            _ => false,
+        })
+    }
+}
+
+fn map_image_format(word: &str) -> Option<naga::StorageFormat> {
+    use naga::StorageFormat as Sf;
+
+    let format = match word {
+        // float-image-format-qualifier:
+        "rgba32f" => Sf::Rgba32Float,
+        "rgba16f" => Sf::Rgba16Float,
+        "rg32f" => Sf::Rg32Float,
+        "rg16f" => Sf::Rg16Float,
+        "r11f_g11f_b10f" => Sf::Rg11b10Ufloat,
+        "r32f" => Sf::R32Float,
+        "r16f" => Sf::R16Float,
+        "rgba16" => Sf::Rgba16Unorm,
+        "rgb10_a2ui" => Sf::Rgb10a2Uint,
+        "rgb10_a2" => Sf::Rgb10a2Unorm,
+        "rgba8" => Sf::Rgba8Unorm,
+        "rg16" => Sf::Rg16Unorm,
+        "rg8" => Sf::Rg8Unorm,
+        "r16" => Sf::R16Unorm,
+        "r8" => Sf::R8Unorm,
+        "rgba16_snorm" => Sf::Rgba16Snorm,
+        "rgba8_snorm" => Sf::Rgba8Snorm,
+        "rg16_snorm" => Sf::Rg16Snorm,
+        "rg8_snorm" => Sf::Rg8Snorm,
+        "r16_snorm" => Sf::R16Snorm,
+        "r8_snorm" => Sf::R8Snorm,
+        // int-image-format-qualifier:
+        "rgba32i" => Sf::Rgba32Sint,
+        "rgba16i" => Sf::Rgba16Sint,
+        "rgba8i" => Sf::Rgba8Sint,
+        "rg32i" => Sf::Rg32Sint,
+        "rg16i" => Sf::Rg16Sint,
+        "rg8i" => Sf::Rg8Sint,
+        "r32i" => Sf::R32Sint,
+        "r16i" => Sf::R16Sint,
+        "r8i" => Sf::R8Sint,
+        // uint-image-format-qualifier:
+        "rgba32ui" => Sf::Rgba32Uint,
+        "rgba16ui" => Sf::Rgba16Uint,
+        "rgba8ui" => Sf::Rgba8Uint,
+        "r64ui" => Sf::R64Uint,
+        "rg32ui" => Sf::Rg32Uint,
+        "rg16ui" => Sf::Rg16Uint,
+        "rg8ui" => Sf::Rg8Uint,
+        "r32ui" => Sf::R32Uint,
+        "r16ui" => Sf::R16Uint,
+        "r8ui" => Sf::R8Uint,
+        // TODO: These next ones seem incorrect to me
+        // "rgb10_a2ui" => Sf::Rgb10a2Unorm,
+        _ => return None,
+    };
+
+    Some(format)
+}
+
+}
+
+pub struct ParsingContext<'source> {
+    lexer: Peekable<Lexer<'source>>,
+    /// Used to store tokens already consumed by the parser but that need to be backtracked
+    backtracked_token: Option<Token>,
+    last_meta: Span,
+}
+
+impl<'source> ParsingContext<'source> {
+    pub fn new(lexer: Lexer<'source>) -> Self {
+        ParsingContext {
+            lexer: lexer.peekable(),
+            backtracked_token: None,
+            last_meta: Span::default(),
+        }
+    }
+
+    /// Helper method for backtracking from a consumed token
+    ///
+    /// This method should always be used instead of assigning to `backtracked_token` since
+    /// it validates that backtracking hasn't occurred more than one time in a row
+    ///
+    /// # Panics
+    /// - If the parser already backtracked without bumping in between
+    pub fn backtrack(&mut self, token: Token) -> Result<()> {
+        // This should never happen
+        if let Some(ref prev_token) = self.backtracked_token {
+            return Err(Error {
+                kind: ErrorKind::InternalError("The parser tried to backtrack twice in a row"),
+                meta: prev_token.meta,
+            });
+        }
+
+        self.backtracked_token = Some(token);
+
+        Ok(())
+    }
+
+    pub fn expect_ident(&mut self, frontend: &mut Frontend) -> Result<(String, Span)> {
+        let token = self.bump(frontend)?;
+
+        match token.value {
+            TokenValue::Identifier(name) => Ok((name, token.meta)),
+            _ => Err(Error {
+                kind: ErrorKind::InvalidToken(token.value, vec![ExpectedToken::Identifier]),
+                meta: token.meta,
+            }),
+        }
+    }
+
+    pub fn expect(&mut self, frontend: &mut Frontend, value: TokenValue) -> Result<Token> {
+        let token = self.bump(frontend)?;
+
+        if token.value != value {
+            Err(Error {
+                kind: ErrorKind::InvalidToken(token.value, vec![value.into()]),
+                meta: token.meta,
+            })
+        } else {
+            Ok(token)
+        }
+    }
+
+    pub fn next(&mut self, frontend: &mut Frontend) -> Option<Token> {
+        loop {
+            if let Some(token) = self.backtracked_token.take() {
+                self.last_meta = token.meta;
+                break Some(token);
+            }
+
+            let res = self.lexer.next()?;
+
+            match res.kind {
+                LexerResultKind::Token(token) => {
+                    self.last_meta = token.meta;
+                    break Some(token);
+                }
+                LexerResultKind::Directive(directive) => {
+                    frontend.handle_directive(directive, res.meta)
+                }
+                LexerResultKind::Error(error) => frontend.errors.push(Error {
+                    kind: ErrorKind::PreprocessorError(error),
+                    meta: res.meta,
+                }),
+            }
+        }
+    }
+
+    pub fn bump(&mut self, frontend: &mut Frontend) -> Result<Token> {
+        self.next(frontend).ok_or(Error {
+            kind: ErrorKind::EndOfFile,
+            meta: self.last_meta,
+        })
+    }
+
+    /// Returns None on the end of the file rather than an error like other methods
+    pub fn bump_if(&mut self, frontend: &mut Frontend, value: TokenValue) -> Option<Token> {
+        if self.peek(frontend).filter(|t| t.value == value).is_some() {
+            self.bump(frontend).ok()
+        } else {
+            None
+        }
+    }
+
+    pub fn peek(&mut self, frontend: &mut Frontend) -> Option<&Token> {
+        loop {
+            if let Some(ref token) = self.backtracked_token {
+                break Some(token);
+            }
+
+            match self.lexer.peek()?.kind {
+                LexerResultKind::Token(_) => {
+                    let res = self.lexer.peek()?;
+
+                    match res.kind {
+                        LexerResultKind::Token(ref token) => break Some(token),
+                        _ => unreachable!(),
+                    }
+                }
+                LexerResultKind::Error(_) | LexerResultKind::Directive(_) => {
+                    let res = self.lexer.next()?;
+
+                    match res.kind {
+                        LexerResultKind::Directive(directive) => {
+                            frontend.handle_directive(directive, res.meta)
+                        }
+                        LexerResultKind::Error(error) => frontend.errors.push(Error {
+                            kind: ErrorKind::PreprocessorError(error),
+                            meta: res.meta,
+                        }),
+                        LexerResultKind::Token(_) => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn expect_peek(&mut self, frontend: &mut Frontend) -> Result<&Token> {
+        let meta = self.last_meta;
+        self.peek(frontend).ok_or(Error {
+            kind: ErrorKind::EndOfFile,
+            meta,
+        })
+    }
+
+    pub fn parse(&mut self, frontend: &mut Frontend) -> Result<Module> {
+        let mut module = Module::default();
+        let mut global_expression_kind_tracker = naga::proc::ExpressionKindTracker::new();
+
+        // Body and expression arena for global initialization
+        let mut ctx = Context::new(
+            frontend,
+            &mut module,
+            false,
+            &mut global_expression_kind_tracker,
+        )?;
+
+        while self.peek(frontend).is_some() {
+            self.parse_external_declaration(frontend, &mut ctx)?;
+        }
+
+        // Add an `EntryPoint` to `parser.module` for `main`, if a
+        // suitable overload exists. Error out if we can't find one.
+        if let Some(declaration) = frontend.lookup_function.get("main") {
+            for decl in declaration.overloads.iter() {
+                if let FunctionKind::Call(handle) = decl.kind {
+                    if decl.defined && decl.parameters.is_empty() {
+                        frontend.add_entry_point(handle, ctx)?;
+                        return Ok(module);
+                    }
+                }
+            }
+        }
+
+        Err(Error {
+            kind: ErrorKind::SemanticError("Missing entry point".into()),
+            meta: Span::default(),
+        })
+    }
+
+    fn parse_uint_constant(
+        &mut self,
+        frontend: &mut Frontend,
+        ctx: &mut Context,
+    ) -> Result<(u32, Span)> {
+        let (const_expr, meta) = self.parse_constant_expression(
+            frontend,
+            ctx.module,
+            ctx.global_expression_kind_tracker,
+        )?;
+
+        let res = crate::translate::iris_glsl::frontend::const_val(ctx.module, const_expr, &ctx.module.global_expressions);
+
+        let int = match res {
+            Ok(value) => Ok(value),
+            Err(ConstValueError::Negative) => Err(Error {
+                kind: ErrorKind::SemanticError("int constant overflows".into()),
+                meta,
+            }),
+            Err(ConstValueError::NonConst | ConstValueError::InvalidType) => Err(Error {
+                kind: ErrorKind::SemanticError("Expected a uint constant".into()),
+                meta,
+            }),
+        }?;
+
+        Ok((int, meta))
+    }
+
+    fn parse_constant_expression(
+        &mut self,
+        frontend: &mut Frontend,
+        module: &mut Module,
+        global_expression_kind_tracker: &mut naga::proc::ExpressionKindTracker,
+    ) -> Result<(Handle<Expression>, Span)> {
+        let mut ctx = Context::new(frontend, module, true, global_expression_kind_tracker)?;
+
+        let mut stmt_ctx = ctx.stmt_ctx();
+        let expr = self.parse_conditional(frontend, &mut ctx, &mut stmt_ctx, None)?;
+        let (root, meta) = ctx.lower_expect(stmt_ctx, frontend, expr, ExprPos::Rhs)?;
+
+        Ok((root, meta))
+    }
+}
+
+impl Frontend {
+    fn handle_directive(&mut self, directive: Directive, meta: Span) {
+        let mut tokens = directive.tokens.into_iter();
+
+        match directive.kind {
+            DirectiveKind::Version { is_first_directive } => {
+                if !is_first_directive {
+                    self.errors.push(Error {
+                        kind: ErrorKind::SemanticError(
+                            "#version must occur first in shader".into(),
+                        ),
+                        meta,
+                    })
+                }
+
+                match tokens.next() {
+                    Some(PPToken {
+                        value: PPTokenValue::Integer(int),
+                        location,
+                    }) => match int.value {
+                        440 | 450 | 460 => self.meta.version = int.value as u16,
+                        _ => self.errors.push(Error {
+                            kind: ErrorKind::InvalidVersion(int.value),
+                            meta: location.into(),
+                        }),
+                    },
+                    Some(PPToken { value, location }) => self.errors.push(Error {
+                        kind: ErrorKind::PreprocessorError(PreprocessorError::UnexpectedToken(
+                            value,
+                        )),
+                        meta: location.into(),
+                    }),
+                    None => self.errors.push(Error {
+                        kind: ErrorKind::PreprocessorError(PreprocessorError::UnexpectedNewLine),
+                        meta,
+                    }),
+                };
+
+                match tokens.next() {
+                    Some(PPToken {
+                        value: PPTokenValue::Ident(name),
+                        location,
+                    }) => match name.as_str() {
+                        "core" => self.meta.profile = Profile::Core,
+                        _ => self.errors.push(Error {
+                            kind: ErrorKind::InvalidProfile(name),
+                            meta: location.into(),
+                        }),
+                    },
+                    Some(PPToken { value, location }) => self.errors.push(Error {
+                        kind: ErrorKind::PreprocessorError(PreprocessorError::UnexpectedToken(
+                            value,
+                        )),
+                        meta: location.into(),
+                    }),
+                    None => {}
+                };
+
+                if let Some(PPToken { value, location }) = tokens.next() {
+                    self.errors.push(Error {
+                        kind: ErrorKind::PreprocessorError(PreprocessorError::UnexpectedToken(
+                            value,
+                        )),
+                        meta: location.into(),
+                    })
+                }
+            }
+            DirectiveKind::Extension => {
+                // TODO: Proper extension handling
+                // - Checking for extension support in the compiler
+                // - Handle behaviors such as warn
+                // - Handle the all extension
+                let name = match tokens.next() {
+                    Some(PPToken {
+                        value: PPTokenValue::Ident(name),
+                        ..
+                    }) => Some(name),
+                    Some(PPToken { value, location }) => {
+                        self.errors.push(Error {
+                            kind: ErrorKind::PreprocessorError(PreprocessorError::UnexpectedToken(
+                                value,
+                            )),
+                            meta: location.into(),
+                        });
+
+                        None
+                    }
+                    None => {
+                        self.errors.push(Error {
+                            kind: ErrorKind::PreprocessorError(
+                                PreprocessorError::UnexpectedNewLine,
+                            ),
+                            meta,
+                        });
+
+                        None
+                    }
+                };
+
+                match tokens.next() {
+                    Some(PPToken {
+                        value: PPTokenValue::Punct(crate::translate::iris_glsl::frontend::pp::Punct::Colon),
+                        ..
+                    }) => {}
+                    Some(PPToken { value, location }) => self.errors.push(Error {
+                        kind: ErrorKind::PreprocessorError(PreprocessorError::UnexpectedToken(
+                            value,
+                        )),
+                        meta: location.into(),
+                    }),
+                    None => self.errors.push(Error {
+                        kind: ErrorKind::PreprocessorError(PreprocessorError::UnexpectedNewLine),
+                        meta,
+                    }),
+                };
+
+                match tokens.next() {
+                    Some(PPToken {
+                        value: PPTokenValue::Ident(behavior),
+                        location,
+                    }) => match behavior.as_str() {
+                        "require" | "enable" | "warn" | "disable" => {
+                            if let Some(name) = name {
+                                self.meta.extensions.insert(name);
+                            }
+                        }
+                        _ => self.errors.push(Error {
+                            kind: ErrorKind::PreprocessorError(PreprocessorError::UnexpectedToken(
+                                PPTokenValue::Ident(behavior),
+                            )),
+                            meta: location.into(),
+                        }),
+                    },
+                    Some(PPToken { value, location }) => self.errors.push(Error {
+                        kind: ErrorKind::PreprocessorError(PreprocessorError::UnexpectedToken(
+                            value,
+                        )),
+                        meta: location.into(),
+                    }),
+                    None => self.errors.push(Error {
+                        kind: ErrorKind::PreprocessorError(PreprocessorError::UnexpectedNewLine),
+                        meta,
+                    }),
+                }
+
+                if let Some(PPToken { value, location }) = tokens.next() {
+                    self.errors.push(Error {
+                        kind: ErrorKind::PreprocessorError(PreprocessorError::UnexpectedToken(
+                            value,
+                        )),
+                        meta: location.into(),
+                    })
+                }
+            }
+            DirectiveKind::Pragma => {
+                // TODO: handle some common pragmas?
+            }
+        }
+    }
+}
+
+pub struct DeclarationContext<'ctx, 'qualifiers, 'a> {
+    qualifiers: TypeQualifiers<'qualifiers>,
+    /// Indicates a global declaration
+    external: bool,
+    is_inside_loop: bool,
+    ctx: &'ctx mut Context<'a>,
+}
+
+impl DeclarationContext<'_, '_, '_> {
+    fn add_var(
+        &mut self,
+        frontend: &mut Frontend,
+        ty: Handle<Type>,
+        name: String,
+        init: Option<Handle<Expression>>,
+        meta: Span,
+    ) -> Result<Handle<Expression>> {
+        let decl = VarDeclaration {
+            qualifiers: &mut self.qualifiers,
+            ty,
+            name: Some(name),
+            init,
+            meta,
+        };
+
+        match self.external {
+            true => {
+                let global = frontend.add_global_var(self.ctx, decl)?;
+                let expr = match global {
+                    GlobalOrConstant::Global(handle) => Expression::GlobalVariable(handle),
+                    GlobalOrConstant::Constant(handle) => Expression::Constant(handle),
+                    GlobalOrConstant::Override(handle) => Expression::Override(handle),
+                };
+                Ok(self.ctx.add_expression(expr, meta)?)
+            }
+            false => frontend.add_local_var(self.ctx, decl),
+        }
+    }
+}
+
+}
+mod pp {
+// A GLSL tokenizer standing in for `pp-rs`: the text it reads is already preprocessed (Horizon
+// expands macros and conditionals), so it only splits tokens and passes `#version`,
+// `#extension` and `#pragma` lines on. The token types keep `pp-rs`'s shapes, which the
+// frontend's parser reads.
+
+use std::fmt;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Location {
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Punct {
+    AddAssign,
+    SubAssign,
+    MulAssign,
+    DivAssign,
+    ModAssign,
+    LeftShiftAssign,
+    RightShiftAssign,
+    AndAssign,
+    XorAssign,
+    OrAssign,
+    Increment,
+    Decrement,
+    LogicalAnd,
+    LogicalOr,
+    LogicalXor,
+    LessEqual,
+    GreaterEqual,
+    EqualEqual,
+    NotEqual,
+    LeftShift,
+    RightShift,
+    LeftBrace,
+    RightBrace,
+    LeftParen,
+    RightParen,
+    LeftBracket,
+    RightBracket,
+    LeftAngle,
+    RightAngle,
+    Semicolon,
+    Comma,
+    Colon,
+    Dot,
+    Equal,
+    Bang,
+    Minus,
+    Tilde,
+    Plus,
+    Star,
+    Slash,
+    Percent,
+    Pipe,
+    Caret,
+    Ampersand,
+    Question,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum PreprocessorError {
+    IntegerOverflow,
+    FloatParsingError,
+    UnexpectedCharacter,
+    UnexpectedToken(TokenValue),
+    UnexpectedNewLine,
+    NotSupported16BitLiteral,
+}
+
+impl fmt::Display for PreprocessorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IntegerOverflow => write!(f, "integer overflow"),
+            Self::FloatParsingError => write!(f, "invalid float literal"),
+            Self::UnexpectedCharacter => write!(f, "unexpected character"),
+            Self::UnexpectedToken(t) => write!(f, "unexpected token {t:?}"),
+            Self::UnexpectedNewLine => write!(f, "unexpected end of line"),
+            Self::NotSupported16BitLiteral => write!(f, "16-bit literals are not supported"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Integer {
+    pub value: u64,
+    pub signed: bool,
+    pub width: i32,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Float {
+    pub value: f32,
+    pub width: i32,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Version {
+    pub tokens: Vec<Token>,
+    pub is_first_directive: bool,
+    pub has_comments_before: bool,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Extension {
+    pub tokens: Vec<Token>,
+    pub has_non_directive_before: bool,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Pragma {
+    pub tokens: Vec<Token>,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum TokenValue {
+    Ident(String),
+    Integer(Integer),
+    Float(Float),
+    Punct(Punct),
+    Version(Version),
+    Extension(Extension),
+    Pragma(Pragma),
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Token {
+    pub value: TokenValue,
+    pub location: Location,
+}
+
+/// Tokens of preprocessed GLSL.
+pub struct Preprocessor<'a> {
+    src: &'a str,
+    at: usize,
+    /// Whether a directive has been read yet (`#version` must come first).
+    directives: bool,
+}
+
+impl<'a> Preprocessor<'a> {
+    pub fn new(src: &'a str) -> Self {
+        Preprocessor { src, at: 0, directives: false }
+    }
+
+    /// Macros are expanded before the text gets here.
+    pub fn add_define(&mut self, _name: &str, _value: &str) -> Result<(), PreprocessorError> {
+        Ok(())
+    }
+
+    fn bytes(&self) -> &'a [u8] {
+        self.src.as_bytes()
+    }
+
+    /// Skips spaces and comments; with `newlines` false, stops at a line end (inside a
+    /// directive). A backslash before a line end continues the line.
+    fn skip_space(&mut self, newlines: bool) {
+        let b = self.bytes();
+        while self.at < b.len() {
+            match b[self.at] {
+                b'\n' if !newlines => return,
+                b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c => self.at += 1,
+                b'\\' if b.get(self.at + 1) == Some(&b'\n') => self.at += 2,
+                b'\\' if b.get(self.at + 1) == Some(&b'\r') && b.get(self.at + 2) == Some(&b'\n') => self.at += 3,
+                b'/' if b.get(self.at + 1) == Some(&b'/') => {
+                    while self.at < b.len() && b[self.at] != b'\n' {
+                        self.at += 1;
+                    }
+                }
+                b'/' if b.get(self.at + 1) == Some(&b'*') => {
+                    self.at += 2;
+                    while self.at < b.len() && !(b[self.at] == b'*' && b.get(self.at + 1) == Some(&b'/')) {
+                        self.at += 1;
+                    }
+                    self.at = (self.at + 2).min(b.len());
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// One token from here (spaces already skipped).
+    fn token(&mut self) -> Result<Token, (PreprocessorError, Location)> {
+        let b = self.bytes();
+        let start = self.at;
+        let loc = |end: usize| Location { start: start as u32, end: end as u32 };
+        let c = b[start];
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let mut end = start + 1;
+            while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+                end += 1;
+            }
+            self.at = end;
+            return Ok(Token { value: TokenValue::Ident(self.src[start..end].to_owned()), location: loc(end) });
+        }
+        if c.is_ascii_digit() || (c == b'.' && b.get(start + 1).is_some_and(u8::is_ascii_digit)) {
+            return self.number();
+        }
+        use Punct as P;
+        let three = &b[start..(start + 3).min(b.len())];
+        let two = &b[start..(start + 2).min(b.len())];
+        let (punct, len) = match (three, two, c) {
+            (b"<<=", _, _) => (P::LeftShiftAssign, 3),
+            (b">>=", _, _) => (P::RightShiftAssign, 3),
+            (_, b"+=", _) => (P::AddAssign, 2),
+            (_, b"-=", _) => (P::SubAssign, 2),
+            (_, b"*=", _) => (P::MulAssign, 2),
+            (_, b"/=", _) => (P::DivAssign, 2),
+            (_, b"%=", _) => (P::ModAssign, 2),
+            (_, b"&=", _) => (P::AndAssign, 2),
+            (_, b"^=", _) => (P::XorAssign, 2),
+            (_, b"|=", _) => (P::OrAssign, 2),
+            (_, b"++", _) => (P::Increment, 2),
+            (_, b"--", _) => (P::Decrement, 2),
+            (_, b"&&", _) => (P::LogicalAnd, 2),
+            (_, b"||", _) => (P::LogicalOr, 2),
+            (_, b"^^", _) => (P::LogicalXor, 2),
+            (_, b"<=", _) => (P::LessEqual, 2),
+            (_, b">=", _) => (P::GreaterEqual, 2),
+            (_, b"==", _) => (P::EqualEqual, 2),
+            (_, b"!=", _) => (P::NotEqual, 2),
+            (_, b"<<", _) => (P::LeftShift, 2),
+            (_, b">>", _) => (P::RightShift, 2),
+            (_, _, b'{') => (P::LeftBrace, 1),
+            (_, _, b'}') => (P::RightBrace, 1),
+            (_, _, b'(') => (P::LeftParen, 1),
+            (_, _, b')') => (P::RightParen, 1),
+            (_, _, b'[') => (P::LeftBracket, 1),
+            (_, _, b']') => (P::RightBracket, 1),
+            (_, _, b'<') => (P::LeftAngle, 1),
+            (_, _, b'>') => (P::RightAngle, 1),
+            (_, _, b';') => (P::Semicolon, 1),
+            (_, _, b',') => (P::Comma, 1),
+            (_, _, b':') => (P::Colon, 1),
+            (_, _, b'.') => (P::Dot, 1),
+            (_, _, b'=') => (P::Equal, 1),
+            (_, _, b'!') => (P::Bang, 1),
+            (_, _, b'-') => (P::Minus, 1),
+            (_, _, b'~') => (P::Tilde, 1),
+            (_, _, b'+') => (P::Plus, 1),
+            (_, _, b'*') => (P::Star, 1),
+            (_, _, b'/') => (P::Slash, 1),
+            (_, _, b'%') => (P::Percent, 1),
+            (_, _, b'|') => (P::Pipe, 1),
+            (_, _, b'^') => (P::Caret, 1),
+            (_, _, b'&') => (P::Ampersand, 1),
+            (_, _, b'?') => (P::Question, 1),
+            _ => {
+                // Skip the whole character.
+                let len = self.src[start..].chars().next().map_or(1, char::len_utf8);
+                self.at = start + len;
+                return Err((PreprocessorError::UnexpectedCharacter, loc(start + len)));
+            }
+        };
+        self.at = start + len;
+        Ok(Token { value: TokenValue::Punct(punct), location: loc(start + len) })
+    }
+
+    fn number(&mut self) -> Result<Token, (PreprocessorError, Location)> {
+        let b = self.bytes();
+        let start = self.at;
+        let mut end = start;
+        // The literal's extent: digits, letters (hex digits, suffixes, exponent), dots and an
+        // exponent's sign.
+        while end < b.len() {
+            let c = b[end];
+            let exp_sign = (c == b'+' || c == b'-')
+                && end > start
+                && matches!(b[end - 1], b'e' | b'E')
+                && !(b[start] == b'0' && matches!(b.get(start + 1), Some(b'x' | b'X')));
+            if c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || exp_sign {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        self.at = end;
+        let text = &self.src[start..end];
+        let location = Location { start: start as u32, end: end as u32 };
+        let lower = text.to_ascii_lowercase();
+        let hex = lower.starts_with("0x");
+        let is_float = !hex && (lower.contains('.') || lower.contains('e') || lower.ends_with('f'));
+        if is_float {
+            let (digits, width) = if let Some(d) = lower.strip_suffix("lf") {
+                (d, 64)
+            } else if let Some(d) = lower.strip_suffix('f') {
+                (d, 32)
+            } else {
+                (lower.as_str(), 32)
+            };
+            if digits.ends_with('h') {
+                return Err((PreprocessorError::NotSupported16BitLiteral, location));
+            }
+            // A literal past f32's range (`1e39`) is the largest float, as drivers read it.
+            let value: f32 = digits
+                .parse::<f64>()
+                .map_err(|_| (PreprocessorError::FloatParsingError, location))?
+                .clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32;
+            return Ok(Token { value: TokenValue::Float(Float { value, width }), location });
+        }
+        let (digits, signed) = match lower.strip_suffix('u') {
+            Some(d) => (d, false),
+            None => (lower.as_str(), true),
+        };
+        let value = if let Some(h) = digits.strip_prefix("0x") {
+            u64::from_str_radix(h, 16)
+        } else if digits.len() > 1 && digits.starts_with('0') {
+            u64::from_str_radix(&digits[1..], 8)
+        } else {
+            digits.parse::<u64>()
+        }
+        .map_err(|_| (PreprocessorError::IntegerOverflow, location))?;
+        if value > u64::from(u32::MAX) {
+            return Err((PreprocessorError::IntegerOverflow, location));
+        }
+        Ok(Token { value: TokenValue::Integer(Integer { value, signed, width: 32 }), location })
+    }
+
+    /// The tokens of the rest of a directive's line.
+    fn line_tokens(&mut self) -> Vec<Token> {
+        let mut tokens = Vec::new();
+        loop {
+            self.skip_space(false);
+            if self.at >= self.src.len() || self.bytes()[self.at] == b'\n' {
+                return tokens;
+            }
+            match self.token() {
+                Ok(t) => tokens.push(t),
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Whether only spaces lie between the line's start and `at`.
+    fn at_line_start(&self, at: usize) -> bool {
+        self.src[..at].rsplit('\n').next().is_none_or(|l| l.trim().is_empty())
+    }
+}
+
+impl Iterator for Preprocessor<'_> {
+    type Item = Result<Token, (PreprocessorError, Location)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            self.skip_space(true);
+            if self.at >= self.src.len() {
+                return None;
+            }
+            let start = self.at;
+            if self.bytes()[start] == b'#' && self.at_line_start(start) {
+                self.at += 1;
+                self.skip_space(false);
+                let word_start = self.at;
+                while self.at < self.src.len() && (self.bytes()[self.at].is_ascii_alphanumeric() || self.bytes()[self.at] == b'_') {
+                    self.at += 1;
+                }
+                let word = self.src[word_start..self.at].to_owned();
+                let first = !self.directives;
+                self.directives = true;
+                let tokens = self.line_tokens();
+                let location = Location { start: start as u32, end: self.at as u32 };
+                let value = match word.as_str() {
+                    "version" => TokenValue::Version(Version { tokens, is_first_directive: first, has_comments_before: false }),
+                    "extension" => TokenValue::Extension(Extension { tokens, has_non_directive_before: false }),
+                    "pragma" => TokenValue::Pragma(Pragma { tokens }),
+                    // Anything else left in the text (`#line`): passed over.
+                    _ => continue,
+                };
+                return Some(Ok(Token { value, location }));
+            }
+            self.directives = true;
+            return Some(self.token());
+        }
+    }
+}
+
+}
+mod token {
+pub use crate::translate::iris_glsl::frontend::pp::{Float, Integer, Location, Token as PPToken};
+
+use std::{string::String, vec::Vec};
+
+use super::ast::Precision;
+use naga::{Interpolation, Sampling, Span, Type};
+
+impl From<Location> for Span {
+    fn from(loc: Location) -> Self {
+        Span::new(loc.start, loc.end)
+    }
+}
+
+#[derive(Debug)]
+pub struct Token {
+    pub value: TokenValue,
+    pub meta: Span,
+}
+
+/// A token passed from the lexing used in the parsing.
+///
+/// This type is exported since it's returned in the
+/// [`InvalidToken`](super::ErrorKind::InvalidToken) error.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TokenValue {
+    Identifier(String),
+
+    FloatConstant(Float),
+    IntConstant(Integer),
+    BoolConstant(bool),
+
+    Layout,
+    In,
+    Out,
+    InOut,
+    Uniform,
+    Buffer,
+    Const,
+    Shared,
+
+    Restrict,
+    /// A `glsl` memory qualifier such as `writeonly`
+    ///
+    /// The associated [`naga::StorageAccess`] is the access being allowed
+    /// (for example `writeonly` has an associated value of [`naga::StorageAccess::STORE`])
+    MemoryQualifier(naga::StorageAccess),
+
+    Invariant,
+    Interpolation(Interpolation),
+    Sampling(Sampling),
+    Precision,
+    PrecisionQualifier(Precision),
+
+    Continue,
+    Break,
+    Return,
+    Discard,
+
+    If,
+    Else,
+    Switch,
+    Case,
+    Default,
+    While,
+    Do,
+    For,
+
+    Void,
+    Struct,
+    TypeName(Type),
+
+    Assign,
+    AddAssign,
+    SubAssign,
+    MulAssign,
+    DivAssign,
+    ModAssign,
+    LeftShiftAssign,
+    RightShiftAssign,
+    AndAssign,
+    XorAssign,
+    OrAssign,
+
+    Increment,
+    Decrement,
+
+    LogicalOr,
+    LogicalAnd,
+    LogicalXor,
+
+    LessEqual,
+    GreaterEqual,
+    Equal,
+    NotEqual,
+
+    LeftShift,
+    RightShift,
+
+    LeftBrace,
+    RightBrace,
+    LeftParen,
+    RightParen,
+    LeftBracket,
+    RightBracket,
+    LeftAngle,
+    RightAngle,
+
+    Comma,
+    Semicolon,
+    Colon,
+    Dot,
+    Bang,
+    Dash,
+    Tilde,
+    Plus,
+    Star,
+    Slash,
+    Percent,
+    VerticalBar,
+    Caret,
+    Ampersand,
+    Question,
+}
+
+#[derive(Debug)]
+pub struct Directive {
+    pub kind: DirectiveKind,
+    pub tokens: Vec<PPToken>,
+}
+
+#[derive(Debug)]
+pub enum DirectiveKind {
+    Version { is_first_directive: bool },
+    Extension,
+    Pragma,
+}
+
+}
+mod types {
+use std::format;
+
+use super::{context::Context, Error, ErrorKind, Result, Span};
+use naga::{
+    proc::ResolveContext, Expression, Handle, ImageClass, ImageDimension, Scalar, ScalarKind, Type,
+    TypeInner, VectorSize,
+};
+
+pub fn parse_type(type_name: &str) -> Option<Type> {
+    match type_name {
+        "bool" => Some(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::BOOL),
+        }),
+        "float16_t" => Some(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F16),
+        }),
+        "float" => Some(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F32),
+        }),
+        "double" => Some(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::F64),
+        }),
+        "int" => Some(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::I32),
+        }),
+        "uint" => Some(Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        }),
+        "sampler" | "samplerShadow" => Some(Type {
+            name: None,
+            inner: TypeInner::Sampler {
+                comparison: type_name == "samplerShadow",
+            },
+        }),
+        word => {
+            fn kind_width_parse(ty: &str) -> Option<Scalar> {
+                Some(match ty {
+                    "" => Scalar::F32,
+                    "b" => Scalar::BOOL,
+                    "i" => Scalar::I32,
+                    "u" => Scalar::U32,
+                    "d" => Scalar::F64,
+                    "f16" => Scalar::F16,
+                    _ => return None,
+                })
+            }
+
+            fn size_parse(n: &str) -> Option<VectorSize> {
+                Some(match n {
+                    "2" => VectorSize::Bi,
+                    "3" => VectorSize::Tri,
+                    "4" => VectorSize::Quad,
+                    _ => return None,
+                })
+            }
+
+            let vec_parse = |word: &str| {
+                let mut iter = word.split("vec");
+
+                let kind = iter.next()?;
+                let size = iter.next()?;
+                let scalar = kind_width_parse(kind)?;
+                let size = size_parse(size)?;
+
+                Some(Type {
+                    name: None,
+                    inner: TypeInner::Vector { size, scalar },
+                })
+            };
+
+            let mat_parse = |word: &str| {
+                let mut iter = word.split("mat");
+
+                let kind = iter.next()?;
+                let size = iter.next()?;
+                let scalar = kind_width_parse(kind)?;
+
+                let (columns, rows) = if let Some(size) = size_parse(size) {
+                    (size, size)
+                } else {
+                    let mut iter = size.split('x');
+                    match (iter.next()?, iter.next()?, iter.next()) {
+                        (col, row, None) => (size_parse(col)?, size_parse(row)?),
+                        _ => return None,
+                    }
+                };
+
+                Some(Type {
+                    name: None,
+                    inner: TypeInner::Matrix {
+                        columns,
+                        rows,
+                        scalar,
+                    },
+                })
+            };
+
+            let texture_parse = |word: &str| {
+                let mut iter = word.split("texture");
+
+                let texture_kind = |ty| {
+                    Some(match ty {
+                        "" => ScalarKind::Float,
+                        "i" => ScalarKind::Sint,
+                        "u" => ScalarKind::Uint,
+                        _ => return None,
+                    })
+                };
+
+                let kind = iter.next()?;
+                let size = iter.next()?;
+                let kind = texture_kind(kind)?;
+
+                let sampled = |multi| ImageClass::Sampled { kind, multi };
+
+                let (dim, arrayed, class) = match size {
+                    "1D" => (ImageDimension::D1, false, sampled(false)),
+                    "1DArray" => (ImageDimension::D1, true, sampled(false)),
+                    "2D" => (ImageDimension::D2, false, sampled(false)),
+                    "2DArray" => (ImageDimension::D2, true, sampled(false)),
+                    "2DMS" => (ImageDimension::D2, false, sampled(true)),
+                    "2DMSArray" => (ImageDimension::D2, true, sampled(true)),
+                    "3D" => (ImageDimension::D3, false, sampled(false)),
+                    "Cube" => (ImageDimension::Cube, false, sampled(false)),
+                    "CubeArray" => (ImageDimension::Cube, true, sampled(false)),
+                    _ => return None,
+                };
+
+                Some(Type {
+                    name: None,
+                    inner: TypeInner::Image {
+                        dim,
+                        arrayed,
+                        class,
+                    },
+                })
+            };
+
+            let image_parse = |word: &str| {
+                let mut iter = word.split("image");
+
+                let texture_kind = |ty| {
+                    Some(match ty {
+                        "" => ScalarKind::Float,
+                        "i" => ScalarKind::Sint,
+                        "u" => ScalarKind::Uint,
+                        _ => return None,
+                    })
+                };
+
+                let kind = iter.next()?;
+                let size = iter.next()?;
+                // TODO: Check that the texture format and the kind match
+                let scalar_kind = texture_kind(kind)?;
+
+                // Iris Features: a placeholder of the image's kind, for images declared without
+                // a format (the renderer gives the real one).
+                let class = ImageClass::Storage {
+                    format: match scalar_kind {
+                        ScalarKind::Sint => naga::StorageFormat::R32Sint,
+                        ScalarKind::Uint => naga::StorageFormat::R32Uint,
+                        _ => naga::StorageFormat::Rgba32Float,
+                    },
+                    access: naga::StorageAccess::LOAD | naga::StorageAccess::STORE,
+                };
+
+                // TODO: glsl support multisampled storage images, naga doesn't
+                let (dim, arrayed) = match size {
+                    "1D" => (ImageDimension::D1, false),
+                    "1DArray" => (ImageDimension::D1, true),
+                    "2D" => (ImageDimension::D2, false),
+                    "2DArray" => (ImageDimension::D2, true),
+                    "3D" => (ImageDimension::D3, false),
+                    // Naga doesn't support cube images and it's usefulness
+                    // is questionable, so they won't be supported for now
+                    // "Cube" => (ImageDimension::Cube, false),
+                    // "CubeArray" => (ImageDimension::Cube, true),
+                    _ => return None,
+                };
+
+                Some(Type {
+                    name: None,
+                    inner: TypeInner::Image {
+                        dim,
+                        arrayed,
+                        class,
+                    },
+                })
+            };
+
+            vec_parse(word)
+                .or_else(|| mat_parse(word))
+                .or_else(|| texture_parse(word))
+                .or_else(|| image_parse(word))
+        }
+    }
+}
+
+pub const fn scalar_components(ty: &TypeInner) -> Option<Scalar> {
+    match *ty {
+        TypeInner::Scalar(scalar)
+        | TypeInner::Vector { scalar, .. }
+        | TypeInner::ValuePointer { scalar, .. }
+        | TypeInner::Matrix { scalar, .. } => Some(scalar),
+        _ => None,
+    }
+}
+
+pub const fn type_power(scalar: Scalar) -> Option<u32> {
+    Some(match scalar.kind {
+        ScalarKind::Sint => 0,
+        ScalarKind::Uint => 1,
+        ScalarKind::Float if scalar.width == 4 => 2,
+        ScalarKind::Float => 3,
+        ScalarKind::Bool | ScalarKind::AbstractInt | ScalarKind::AbstractFloat => return None,
+    })
+}
+
+impl Context<'_> {
+    /// Resolves the types of the expressions until `expr` (inclusive)
+    ///
+    /// This needs to be done before the [`typifier`] can be queried for
+    /// the types of the expressions in the range between the last grow and `expr`.
+    ///
+    /// # Note
+    ///
+    /// The `resolve_type*` methods (like [`resolve_type`]) automatically
+    /// grow the [`typifier`] so calling this method is not necessary when using
+    /// them.
+    ///
+    /// [`typifier`]: Context::typifier
+    /// [`resolve_type`]: Self::resolve_type
+    pub(crate) fn typifier_grow(&mut self, expr: Handle<Expression>, meta: Span) -> Result<()> {
+        let resolve_ctx = ResolveContext::with_locals(self.module, &self.locals, &self.arguments);
+
+        let typifier = if self.is_const {
+            &mut self.const_typifier
+        } else {
+            &mut self.typifier
+        };
+
+        let expressions = if self.is_const {
+            &self.module.global_expressions
+        } else {
+            &self.expressions
+        };
+
+        typifier
+            .grow(expr, expressions, &resolve_ctx)
+            .map_err(|error| Error {
+                kind: ErrorKind::SemanticError(format!("Can't resolve type: {error:?}").into()),
+                meta,
+            })
+    }
+
+    pub(crate) fn get_type(&self, expr: Handle<Expression>) -> &TypeInner {
+        let typifier = if self.is_const {
+            &self.const_typifier
+        } else {
+            &self.typifier
+        };
+
+        typifier.get(expr, &self.module.types)
+    }
+
+    /// Gets the type for the result of the `expr` expression
+    ///
+    /// Automatically grows the [`typifier`] to `expr` so calling
+    /// [`typifier_grow`] is not necessary
+    ///
+    /// [`typifier`]: Context::typifier
+    /// [`typifier_grow`]: Self::typifier_grow
+    pub(crate) fn resolve_type(
+        &mut self,
+        expr: Handle<Expression>,
+        meta: Span,
+    ) -> Result<&TypeInner> {
+        self.typifier_grow(expr, meta)?;
+        Ok(self.get_type(expr))
+    }
+
+    /// Gets the type handle for the result of the `expr` expression
+    ///
+    /// Automatically grows the [`typifier`] to `expr` so calling
+    /// [`typifier_grow`] is not necessary
+    ///
+    /// # Note
+    ///
+    /// Consider using [`resolve_type`] whenever possible
+    /// since it doesn't require adding each type to the [`types`] arena
+    /// and it doesn't need to mutably borrow the [`Parser`][Self]
+    ///
+    /// [`types`]: naga::Module::types
+    /// [`typifier`]: Context::typifier
+    /// [`typifier_grow`]: Self::typifier_grow
+    /// [`resolve_type`]: Self::resolve_type
+    pub(crate) fn resolve_type_handle(
+        &mut self,
+        expr: Handle<Expression>,
+        meta: Span,
+    ) -> Result<Handle<Type>> {
+        self.typifier_grow(expr, meta)?;
+
+        let typifier = if self.is_const {
+            &mut self.const_typifier
+        } else {
+            &mut self.typifier
+        };
+
+        Ok(typifier.register_type(expr, &mut self.module.types))
+    }
+
+    /// Invalidates the cached type resolution for `expr` forcing a recomputation
+    pub(crate) fn invalidate_expression(
+        &mut self,
+        expr: Handle<Expression>,
+        meta: Span,
+    ) -> Result<()> {
+        let resolve_ctx = ResolveContext::with_locals(self.module, &self.locals, &self.arguments);
+
+        let typifier = if self.is_const {
+            &mut self.const_typifier
+        } else {
+            &mut self.typifier
+        };
+
+        typifier
+            .invalidate(expr, &self.expressions, &resolve_ctx)
+            .map_err(|error| Error {
+                kind: ErrorKind::SemanticError(format!("Can't resolve type: {error:?}").into()),
+                meta,
+            })
+    }
+
+    pub(crate) fn lift_up_const_expression(
+        &mut self,
+        expr: Handle<Expression>,
+    ) -> Result<Handle<Expression>> {
+        let meta = self.expressions.get_span(expr);
+        let h = match self.expressions[expr] {
+            ref expr @ (Expression::Literal(_)
+            | Expression::Constant(_)
+            | Expression::ZeroValue(_)) => {
+                self.module.global_expressions.append(expr.clone(), meta)
+            }
+            Expression::Compose { ty, ref components } => {
+                let mut components = components.clone();
+                for component in &mut components {
+                    *component = self.lift_up_const_expression(*component)?;
+                }
+                self.module
+                    .global_expressions
+                    .append(Expression::Compose { ty, components }, meta)
+            }
+            Expression::Splat { size, value } => {
+                let value = self.lift_up_const_expression(value)?;
+                self.module
+                    .global_expressions
+                    .append(Expression::Splat { size, value }, meta)
+            }
+            _ => {
+                return Err(Error {
+                    kind: ErrorKind::SemanticError("Expression is not const-expression".into()),
+                    meta,
+                })
+            }
+        };
+        self.global_expression_kind_tracker
+            .insert(h, naga::proc::ExpressionKind::Const);
+        Ok(h)
+    }
+}
+
+}
+mod variables {
+use std::{format, string::String, vec::Vec};
+
+use super::{
+    ast::*,
+    context::{Context, ExprPos},
+    error::{Error, ErrorKind},
+    Frontend, Result, Span,
+};
+use naga::{
+    AddressSpace, Binding, BuiltIn, Constant, Expression, GlobalVariable, Handle, LocalVariable,
+    Override, ResourceBinding, Scalar, ShaderStage, SwizzleComponent, Type, TypeInner, VectorSize,
+};
+
+pub struct VarDeclaration<'a, 'key> {
+    pub qualifiers: &'a mut TypeQualifiers<'key>,
+    pub ty: Handle<Type>,
+    pub name: Option<String>,
+    pub init: Option<Handle<Expression>>,
+    pub meta: Span,
+}
+
+/// Information about a builtin used in [`add_builtin`](Frontend::add_builtin).
+struct BuiltInData {
+    /// The type of the builtin.
+    inner: TypeInner,
+    /// The associated builtin class.
+    builtin: BuiltIn,
+    /// Whether the builtin can be written to or not.
+    mutable: bool,
+    /// The storage used for the builtin.
+    storage: StorageQualifier,
+}
+
+pub enum GlobalOrConstant {
+    Global(Handle<GlobalVariable>),
+    Constant(Handle<Constant>),
+    Override(Handle<Override>),
+}
+
+impl Frontend {
+    /// Adds a builtin and returns a variable reference to it
+    fn add_builtin(
+        &mut self,
+        ctx: &mut Context,
+        name: &str,
+        data: BuiltInData,
+        meta: Span,
+    ) -> Result<Option<VariableReference>> {
+        let ty = ctx.module.types.insert(
+            Type {
+                name: None,
+                inner: data.inner,
+            },
+            meta,
+        );
+
+        let handle = ctx.module.global_variables.append(
+            GlobalVariable {
+                name: Some(name.into()),
+                space: AddressSpace::Private,
+                binding: None,
+                ty,
+                init: None,
+                memory_decorations: naga::MemoryDecorations::empty(),
+            },
+            meta,
+        );
+
+        let idx = self.entry_args.len();
+        self.entry_args.push(EntryArg {
+            name: Some(name.into()),
+            binding: Binding::BuiltIn(data.builtin),
+            handle,
+            storage: data.storage,
+        });
+
+        self.global_variables.push((
+            name.into(),
+            GlobalLookup {
+                kind: GlobalLookupKind::Variable(handle),
+                entry_arg: Some(idx),
+                mutable: data.mutable,
+            },
+        ));
+
+        let expr = ctx.add_expression(Expression::GlobalVariable(handle), meta)?;
+
+        let var = VariableReference {
+            expr,
+            load: true,
+            mutable: data.mutable,
+            constant: None,
+            entry_arg: Some(idx),
+        };
+
+        ctx.symbol_table.add_root(name.into(), var.clone());
+
+        Ok(Some(var))
+    }
+
+    pub(crate) fn lookup_variable(
+        &mut self,
+        ctx: &mut Context,
+        name: &str,
+        meta: Span,
+    ) -> Result<Option<VariableReference>> {
+        if let Some(var) = ctx.symbol_table.lookup(name).cloned() {
+            return Ok(Some(var));
+        }
+
+        let data = match name {
+            "gl_Position" => BuiltInData {
+                inner: TypeInner::Vector {
+                    size: VectorSize::Quad,
+                    scalar: Scalar::F32,
+                },
+                builtin: BuiltIn::Position { invariant: false },
+                mutable: true,
+                storage: StorageQualifier::Output,
+            },
+            "gl_FragCoord" => BuiltInData {
+                inner: TypeInner::Vector {
+                    size: VectorSize::Quad,
+                    scalar: Scalar::F32,
+                },
+                builtin: BuiltIn::Position { invariant: false },
+                mutable: false,
+                storage: StorageQualifier::Input,
+            },
+            "gl_PointCoord" => BuiltInData {
+                inner: TypeInner::Vector {
+                    size: VectorSize::Bi,
+                    scalar: Scalar::F32,
+                },
+                builtin: BuiltIn::PointCoord,
+                mutable: false,
+                storage: StorageQualifier::Input,
+            },
+            "gl_GlobalInvocationID"
+            | "gl_NumWorkGroups"
+            | "gl_WorkGroupSize"
+            | "gl_WorkGroupID"
+            | "gl_LocalInvocationID" => BuiltInData {
+                inner: TypeInner::Vector {
+                    size: VectorSize::Tri,
+                    scalar: Scalar::U32,
+                },
+                builtin: match name {
+                    "gl_GlobalInvocationID" => BuiltIn::GlobalInvocationId,
+                    "gl_NumWorkGroups" => BuiltIn::NumWorkGroups,
+                    "gl_WorkGroupSize" => BuiltIn::WorkGroupSize,
+                    "gl_WorkGroupID" => BuiltIn::WorkGroupId,
+                    "gl_LocalInvocationID" => BuiltIn::LocalInvocationId,
+                    _ => unreachable!(),
+                },
+                mutable: false,
+                storage: StorageQualifier::Input,
+            },
+            "gl_FrontFacing" => BuiltInData {
+                inner: TypeInner::Scalar(Scalar::BOOL),
+                builtin: BuiltIn::FrontFacing,
+                mutable: false,
+                storage: StorageQualifier::Input,
+            },
+            "gl_PointSize" | "gl_FragDepth" => BuiltInData {
+                inner: TypeInner::Scalar(Scalar::F32),
+                builtin: match name {
+                    "gl_PointSize" => BuiltIn::PointSize,
+                    "gl_FragDepth" => BuiltIn::FragDepth,
+                    _ => unreachable!(),
+                },
+                mutable: true,
+                storage: StorageQualifier::Output,
+            },
+            "gl_ClipDistance" | "gl_CullDistance" => {
+                let base = ctx.module.types.insert(
+                    Type {
+                        name: None,
+                        inner: TypeInner::Scalar(Scalar::F32),
+                    },
+                    meta,
+                );
+
+                BuiltInData {
+                    inner: TypeInner::Array {
+                        base,
+                        size: naga::ArraySize::Dynamic,
+                        stride: 4,
+                    },
+                    builtin: match name {
+                        "gl_ClipDistance" => BuiltIn::ClipDistances,
+                        "gl_CullDistance" => BuiltIn::CullDistance,
+                        _ => unreachable!(),
+                    },
+                    mutable: self.meta.stage == ShaderStage::Vertex,
+                    storage: StorageQualifier::Output,
+                }
+            }
+            _ => {
+                let builtin = match name {
+                    "gl_BaseVertex" => BuiltIn::BaseVertex,
+                    "gl_BaseInstance" => BuiltIn::BaseInstance,
+                    "gl_PrimitiveID" => BuiltIn::PrimitiveIndex,
+                    "gl_BaryCoordEXT" => BuiltIn::Barycentric { perspective: true },
+                    "gl_BaryCoordNoPerspEXT" => BuiltIn::Barycentric { perspective: false },
+                    "gl_InstanceIndex" => BuiltIn::InstanceIndex,
+                    "gl_VertexIndex" => BuiltIn::VertexIndex,
+                    "gl_SampleID" => BuiltIn::SampleIndex,
+                    "gl_LocalInvocationIndex" => BuiltIn::LocalInvocationIndex,
+                    "gl_DrawID" => BuiltIn::DrawIndex,
+                    _ => return Ok(None),
+                };
+
+                BuiltInData {
+                    inner: TypeInner::Scalar(Scalar::U32),
+                    builtin,
+                    mutable: false,
+                    storage: StorageQualifier::Input,
+                }
+            }
+        };
+
+        self.add_builtin(ctx, name, data, meta)
+    }
+
+    pub(crate) fn make_variable_invariant(
+        &mut self,
+        ctx: &mut Context,
+        name: &str,
+        meta: Span,
+    ) -> Result<()> {
+        if let Some(var) = self.lookup_variable(ctx, name, meta)? {
+            if let Some(index) = var.entry_arg {
+                if let Binding::BuiltIn(BuiltIn::Position { ref mut invariant }) =
+                    self.entry_args[index].binding
+                {
+                    *invariant = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn field_selection(
+        &mut self,
+        ctx: &mut Context,
+        pos: ExprPos,
+        expression: Handle<Expression>,
+        name: &str,
+        meta: Span,
+    ) -> Result<Handle<Expression>> {
+        // Iris Features: a pointer to a matrix's column (`m[1].x`) is a value pointer to a
+        // vector, swizzled as a vector behind a pointer.
+        let column;
+        let (ty, is_pointer) = match *ctx.resolve_type(expression, meta)? {
+            TypeInner::Pointer { base, .. } => (&ctx.module.types[base].inner, true),
+            TypeInner::ValuePointer { size: Some(size), scalar, .. } => {
+                column = TypeInner::Vector { size, scalar };
+                (&column, true)
+            }
+            ref ty => (ty, false),
+        };
+        match *ty {
+            TypeInner::Struct { ref members, .. } => {
+                let index = members
+                    .iter()
+                    .position(|m| m.name == Some(name.into()))
+                    .ok_or_else(|| Error {
+                        kind: ErrorKind::UnknownField(name.into()),
+                        meta,
+                    })?;
+                let pointer = ctx.add_expression(
+                    Expression::AccessIndex {
+                        base: expression,
+                        index: index as u32,
+                    },
+                    meta,
+                )?;
+
+                Ok(match pos {
+                    ExprPos::Rhs if is_pointer => {
+                        ctx.add_expression(Expression::Load { pointer }, meta)?
+                    }
+                    _ => pointer,
+                })
+            }
+            // swizzles (xyzw, rgba, stpq)
+            TypeInner::Vector { size, .. } => {
+                let check_swizzle_components = |comps: &str| {
+                    name.chars()
+                        .map(|c| {
+                            comps
+                                .find(c)
+                                .filter(|i| *i < size as usize)
+                                .map(|i| SwizzleComponent::from_index(i as u32))
+                        })
+                        .collect::<Option<Vec<SwizzleComponent>>>()
+                };
+
+                let components = check_swizzle_components("xyzw")
+                    .or_else(|| check_swizzle_components("rgba"))
+                    .or_else(|| check_swizzle_components("stpq"));
+
+                if let Some(components) = components {
+                    if let ExprPos::Lhs = pos {
+                        let not_unique = (1..components.len())
+                            .any(|i| components[i..].contains(&components[i - 1]));
+                        if not_unique {
+                            self.errors.push(Error {
+                                kind: ErrorKind::SemanticError(
+                                    format!(
+                                        concat!(
+                                            "swizzle cannot have duplicate components in ",
+                                            "left-hand-side expression for \"{:?}\""
+                                        ),
+                                        name
+                                    )
+                                    .into(),
+                                ),
+                                meta,
+                            })
+                        }
+                    }
+
+                    let mut pattern = [SwizzleComponent::X; 4];
+                    for (pat, component) in pattern.iter_mut().zip(&components) {
+                        *pat = *component;
+                    }
+
+                    // flatten nested swizzles (vec.zyx.xy.x => vec.z)
+                    let mut expression = expression;
+                    if let Expression::Swizzle {
+                        size: _,
+                        vector,
+                        pattern: ref src_pattern,
+                    } = ctx[expression]
+                    {
+                        expression = vector;
+                        for pat in &mut pattern {
+                            *pat = src_pattern[pat.index() as usize];
+                        }
+                    }
+
+                    let size = match components.len() {
+                        // Swizzles with just one component are accesses and not swizzles
+                        1 => {
+                            match pos {
+                                // If the position is in the right hand side and the base
+                                // vector is a pointer, load it, otherwise the swizzle would
+                                // produce a pointer
+                                ExprPos::Rhs if is_pointer => {
+                                    expression = ctx.add_expression(
+                                        Expression::Load {
+                                            pointer: expression,
+                                        },
+                                        meta,
+                                    )?;
+                                }
+                                _ => {}
+                            };
+                            return ctx.add_expression(
+                                Expression::AccessIndex {
+                                    base: expression,
+                                    index: pattern[0].index(),
+                                },
+                                meta,
+                            );
+                        }
+                        2 => VectorSize::Bi,
+                        3 => VectorSize::Tri,
+                        4 => VectorSize::Quad,
+                        _ => {
+                            self.errors.push(Error {
+                                kind: ErrorKind::SemanticError(
+                                    format!("Bad swizzle size for \"{name:?}\"").into(),
+                                ),
+                                meta,
+                            });
+
+                            VectorSize::Quad
+                        }
+                    };
+
+                    if is_pointer {
+                        // NOTE: for lhs expression, this extra load ends up as an unused expr, because the
+                        // assignment will extract the pointer and use it directly anyway. Unfortunately we
+                        // need it for validation to pass, as swizzles cannot operate on pointer values.
+                        expression = ctx.add_expression(
+                            Expression::Load {
+                                pointer: expression,
+                            },
+                            meta,
+                        )?;
+                    }
+
+                    Ok(ctx.add_expression(
+                        Expression::Swizzle {
+                            size,
+                            vector: expression,
+                            pattern,
+                        },
+                        meta,
+                    )?)
+                } else {
+                    Err(Error {
+                        kind: ErrorKind::SemanticError(
+                            format!("Invalid swizzle for vector \"{name}\"").into(),
+                        ),
+                        meta,
+                    })
+                }
+            }
+            // Iris Features: a scalar's swizzle (`f().x`, `t.xx`), as GLSL 4.20 and the
+            // drivers Iris runs on take it: the scalar, or a vector of it.
+            TypeInner::Scalar(_) | TypeInner::ValuePointer { size: None, .. }
+                if !name.is_empty()
+                    && name.len() <= 4
+                    && (name.bytes().all(|c| c == b'x')
+                        || name.bytes().all(|c| c == b'r')
+                        || name.bytes().all(|c| c == b's')) =>
+            {
+                let mut value = expression;
+                if is_pointer || matches!(*ty, TypeInner::ValuePointer { .. }) {
+                    if pos == ExprPos::Rhs || name.len() > 1 {
+                        value = ctx.add_expression(Expression::Load { pointer: expression }, meta)?;
+                    }
+                }
+                let size = match name.len() {
+                    1 => return Ok(value),
+                    2 => VectorSize::Bi,
+                    3 => VectorSize::Tri,
+                    _ => VectorSize::Quad,
+                };
+                ctx.add_expression(Expression::Splat { size, value }, meta)
+            }
+            _ => Err(Error {
+                kind: ErrorKind::SemanticError(
+                    format!("Can't lookup field on this type \"{name}\"").into(),
+                ),
+                meta,
+            }),
+        }
+    }
+
+    pub(crate) fn add_global_var(
+        &mut self,
+        ctx: &mut Context,
+        VarDeclaration {
+            qualifiers,
+            mut ty,
+            name,
+            init,
+            meta,
+        }: VarDeclaration,
+    ) -> Result<GlobalOrConstant> {
+        let storage = qualifiers.storage.0;
+        let (ret, lookup) = match storage {
+            StorageQualifier::Input | StorageQualifier::Output => {
+                let input = storage == StorageQualifier::Input;
+                // TODO: glslang seems to use a counter for variables without
+                // explicit location (even if that causes collisions)
+                let location = qualifiers
+                    .uint_layout_qualifier("location", &mut self.errors)
+                    .unwrap_or(0);
+
+                let interpolation = qualifiers.interpolation.take().map(|(i, _)| i);
+                let sampling = qualifiers.sampling.take().map(|(s, _)| s);
+
+                let handle = ctx.module.global_variables.append(
+                    GlobalVariable {
+                        name: name.clone(),
+                        space: AddressSpace::Private,
+                        binding: None,
+                        ty,
+                        init,
+                        memory_decorations: naga::MemoryDecorations::empty(),
+                    },
+                    meta,
+                );
+
+                let blend_src = qualifiers
+                    .layout_qualifiers
+                    .remove(&QualifierKey::Index)
+                    .and_then(|(value, _span)| match value {
+                        QualifierValue::Uint(index) => Some(index),
+                        _ => None,
+                    });
+
+                let mut binding = Binding::Location {
+                    location,
+                    interpolation,
+                    sampling,
+                    blend_src,
+                    per_primitive: false,
+                };
+
+                if let naga::Binding::Location { interpolation: ref mut interpolation @ None, ref mut sampling, .. } = binding
+                    && let Some(naga::ScalarKind::Float) = ctx.module.types[ty].inner.scalar_kind()
+                {
+                    *interpolation = Some(naga::Interpolation::Perspective);
+                    *sampling = Some(naga::Sampling::Center);
+                }
+
+                let idx = self.entry_args.len();
+                self.entry_args.push(EntryArg {
+                    name: name.clone(),
+                    binding,
+                    handle,
+                    storage,
+                });
+
+                let lookup = GlobalLookup {
+                    kind: GlobalLookupKind::Variable(handle),
+                    entry_arg: Some(idx),
+                    mutable: !input,
+                };
+
+                (GlobalOrConstant::Global(handle), lookup)
+            }
+            StorageQualifier::Const => {
+                // Check if this is a specialization constant with constant_id
+                let constant_id = qualifiers.uint_layout_qualifier("constant_id", &mut self.errors);
+
+                if let Some(id) = constant_id {
+                    // This is a specialization constant - convert to Override
+                    let id: Option<u16> = match id.try_into() {
+                        Ok(v) => Some(v),
+                        Err(_) => {
+                            self.errors.push(Error {
+                                kind: ErrorKind::SemanticError(
+                                    format!(
+                                        "constant_id value {id} is too high (maximum is {})",
+                                        u16::MAX
+                                    )
+                                    .into(),
+                                ),
+                                meta,
+                            });
+                            None
+                        }
+                    };
+
+                    let override_handle = ctx.module.overrides.append(
+                        Override {
+                            name: name.clone(),
+                            id,
+                            ty,
+                            init,
+                        },
+                        meta,
+                    );
+
+                    let lookup = GlobalLookup {
+                        kind: GlobalLookupKind::Override(override_handle, ty),
+                        entry_arg: None,
+                        mutable: false,
+                    };
+
+                    (GlobalOrConstant::Override(override_handle), lookup)
+                } else {
+                    // Regular constant
+                    let init = init.ok_or_else(|| Error {
+                        kind: ErrorKind::SemanticError(
+                            "const values must have an initializer".into(),
+                        ),
+                        meta,
+                    })?;
+
+                    let constant = Constant {
+                        name: name.clone(),
+                        ty,
+                        init,
+                    };
+                    let handle = ctx.module.constants.append(constant, meta);
+
+                    let lookup = GlobalLookup {
+                        kind: GlobalLookupKind::Constant(handle, ty),
+                        entry_arg: None,
+                        mutable: false,
+                    };
+
+                    (GlobalOrConstant::Constant(handle), lookup)
+                }
+            }
+            StorageQualifier::AddressSpace(mut space) => {
+                match space {
+                    AddressSpace::Storage { ref mut access } => {
+                        if let Some((allowed_access, _)) = qualifiers.storage_access.take() {
+                            *access = allowed_access;
+                        }
+                    }
+                    AddressSpace::Uniform => match ctx.module.types[ty].inner {
+                        TypeInner::Image {
+                            class,
+                            dim,
+                            arrayed,
+                        } => {
+                            if let naga::ImageClass::Storage {
+                                mut access,
+                                mut format,
+                            } = class
+                            {
+                                if let Some((allowed_access, _)) = qualifiers.storage_access.take()
+                                {
+                                    access = allowed_access;
+                                }
+
+                                match qualifiers.layout_qualifiers.remove(&QualifierKey::Format) {
+                                    Some((QualifierValue::Format(f), _)) => format = f,
+                                    // TODO: glsl supports images without format qualifier
+                                    // if they are `writeonly`
+                                    // Iris Features: an image without a format (`writeonly uniform
+                                    // image3D img;`) keeps the type's placeholder; the renderer
+                                    // gives it its declared image's format before it builds the
+                                    // pipeline.
+                                    None => {}
+                                    _ => unreachable!(),
+                                }
+
+                                ty = ctx.module.types.insert(
+                                    Type {
+                                        name: None,
+                                        inner: TypeInner::Image {
+                                            dim,
+                                            arrayed,
+                                            class: naga::ImageClass::Storage { format, access },
+                                        },
+                                    },
+                                    meta,
+                                );
+                            }
+
+                            space = AddressSpace::Handle
+                        }
+                        TypeInner::Sampler { .. } => space = AddressSpace::Handle,
+                        _ => {
+                            if qualifiers.none_layout_qualifier("push_constant", &mut self.errors) {
+                                space = AddressSpace::Immediate
+                            }
+                        }
+                    },
+                    AddressSpace::Function => space = AddressSpace::Private,
+                    _ => {}
+                };
+
+                let binding = match space {
+                    AddressSpace::Uniform | AddressSpace::Storage { .. } | AddressSpace::Handle => {
+                        let binding = qualifiers.uint_layout_qualifier("binding", &mut self.errors);
+                        if binding.is_none() {
+                            self.errors.push(Error {
+                                kind: ErrorKind::SemanticError(
+                                    "uniform/buffer blocks require layout(binding=X)".into(),
+                                ),
+                                meta,
+                            });
+                        }
+                        let set = qualifiers.uint_layout_qualifier("set", &mut self.errors);
+                        binding.map(|binding| ResourceBinding {
+                            group: set.unwrap_or(0),
+                            binding,
+                        })
+                    }
+                    _ => None,
+                };
+
+                let handle = ctx.module.global_variables.append(
+                    GlobalVariable {
+                        name: name.clone(),
+                        space,
+                        binding,
+                        ty,
+                        init,
+                        memory_decorations: naga::MemoryDecorations::empty(),
+                    },
+                    meta,
+                );
+
+                let lookup = GlobalLookup {
+                    kind: GlobalLookupKind::Variable(handle),
+                    entry_arg: None,
+                    mutable: true,
+                };
+
+                (GlobalOrConstant::Global(handle), lookup)
+            }
+        };
+
+        if let Some(name) = name {
+            ctx.add_global(&name, lookup)?;
+
+            self.global_variables.push((name, lookup));
+        }
+
+        qualifiers.unused_errors(&mut self.errors);
+
+        Ok(ret)
+    }
+
+    pub(crate) fn add_local_var(
+        &mut self,
+        ctx: &mut Context,
+        decl: VarDeclaration,
+    ) -> Result<Handle<Expression>> {
+        let storage = decl.qualifiers.storage;
+        let mutable = match storage.0 {
+            StorageQualifier::AddressSpace(AddressSpace::Function) => true,
+            StorageQualifier::Const => false,
+            _ => {
+                self.errors.push(Error {
+                    kind: ErrorKind::SemanticError("Locals cannot have a storage qualifier".into()),
+                    meta: storage.1,
+                });
+                true
+            }
+        };
+
+        let handle = ctx.locals.append(
+            LocalVariable {
+                name: decl.name.clone(),
+                ty: decl.ty,
+                init: decl.init,
+            },
+            decl.meta,
+        );
+        let expr = ctx.add_expression(Expression::LocalVariable(handle), decl.meta)?;
+
+        if let Some(name) = decl.name {
+            let maybe_var = ctx.add_local_var(name.clone(), expr, mutable);
+
+            if maybe_var.is_some() {
+                self.errors.push(Error {
+                    kind: ErrorKind::VariableAlreadyDeclared(name),
+                    meta: decl.meta,
+                })
+            }
+        }
+
+        decl.qualifiers.unused_errors(&mut self.errors);
+
+        Ok(expr)
+    }
+}
+
+}
+
+type Result<T> = core::result::Result<T, Error>;
+
+/// Per-shader options passed to [`parse`](Frontend::parse).
+///
+/// The [`From`] trait is implemented for [`ShaderStage`] to provide a quick way
+/// to create an `Options` instance.
+///
+/// ```rust
+/// # use naga::ShaderStage;
+/// # use naga::front::glsl::Options;
+/// Options::from(ShaderStage::Vertex);
+/// ```
+#[derive(Debug)]
+pub struct Options {
+    /// The shader stage in the pipeline.
+    pub stage: ShaderStage,
+    /// Preprocessor definitions to be used, akin to having
+    /// ```glsl
+    /// #define key value
+    /// ```
+    /// for each key value pair in the map.
+    pub defines: FastHashMap<String, String>,
+}
+
+impl From<ShaderStage> for Options {
+    fn from(stage: ShaderStage) -> Self {
+        Options {
+            stage,
+            defines: FastHashMap::default(),
+        }
+    }
+}
+
+/// Additional information about the GLSL shader.
+///
+/// Stores additional information about the GLSL shader which might not be
+/// stored in the shader [`Module`].
+#[derive(Debug)]
+pub struct ShaderMetadata {
+    /// The GLSL version specified in the shader through the use of the
+    /// `#version` preprocessor directive.
+    pub version: u16,
+    /// The GLSL profile specified in the shader through the use of the
+    /// `#version` preprocessor directive.
+    pub profile: Profile,
+    /// The shader stage in the pipeline, passed to the [`parse`](Frontend::parse)
+    /// method via the [`Options`] struct.
+    pub stage: ShaderStage,
+
+    /// The workgroup size for compute shaders, defaults to `[1; 3]` for
+    /// compute shaders and `[0; 3]` for non compute shaders.
+    pub workgroup_size: [u32; 3],
+    /// Whether or not early fragment tests where requested by the shader.
+    /// Defaults to `false`.
+    pub early_fragment_tests: bool,
+
+    /// The shader can request extensions via the
+    /// `#extension` preprocessor directive, in the directive a behavior
+    /// parameter is used to control whether the extension should be disabled,
+    /// warn on usage, enabled if possible or required.
+    ///
+    /// This field only stores extensions which were required or requested to
+    /// be enabled if possible and they are supported.
+    pub extensions: FastHashSet<String>,
+}
+
+impl ShaderMetadata {
+    fn reset(&mut self, stage: ShaderStage) {
+        self.version = 0;
+        self.profile = Profile::Core;
+        self.stage = stage;
+        self.workgroup_size = [u32::from(stage.compute_like()); 3];
+        self.early_fragment_tests = false;
+        self.extensions.clear();
+    }
+}
+
+impl Default for ShaderMetadata {
+    fn default() -> Self {
+        ShaderMetadata {
+            version: 0,
+            profile: Profile::Core,
+            stage: ShaderStage::Vertex,
+            workgroup_size: [0; 3],
+            early_fragment_tests: false,
+            extensions: FastHashSet::default(),
+        }
+    }
+}
+
+/// The `Frontend` is the central structure of the GLSL frontend.
+///
+/// To instantiate a new `Frontend` the [`Default`] trait is used, so a
+/// call to the associated function [`Frontend::default`](Frontend::default) will
+/// return a new `Frontend` instance.
+///
+/// To parse a shader simply call the [`parse`](Frontend::parse) method with a
+/// [`Options`] struct and a [`&str`](str) holding the glsl code.
+///
+/// The `Frontend` also provides the [`metadata`](Frontend::metadata) to get some
+/// further information about the previously parsed shader, like version and
+/// extensions used (see the documentation for
+/// [`ShaderMetadata`] to see all the returned information)
+///
+/// # Example usage
+/// ```rust
+/// use naga::ShaderStage;
+/// use naga::front::glsl::{Frontend, Options};
+///
+/// let glsl = r#"
+///     #version 450 core
+///
+///     void main() {}
+/// "#;
+///
+/// let mut frontend = Frontend::default();
+/// let options = Options::from(ShaderStage::Vertex);
+/// frontend.parse(&options, glsl);
+/// ```
+///
+/// # Reusability
+///
+/// If there's a need to parse more than one shader reusing the same `Frontend`
+/// instance may be beneficial since internal allocations will be reused.
+///
+/// Calling the [`parse`](Frontend::parse) method multiple times will reset the
+/// `Frontend` so no extra care is needed when reusing.
+#[derive(Debug, Default)]
+pub struct Frontend {
+    meta: ShaderMetadata,
+
+    lookup_function: FastHashMap<String, FunctionDeclaration>,
+    lookup_type: FastHashMap<String, Handle<Type>>,
+
+    global_variables: Vec<(String, GlobalLookup)>,
+
+    entry_args: Vec<EntryArg>,
+
+    layouter: Layouter,
+
+    errors: Vec<Error>,
+}
+
+impl Frontend {
+    fn reset(&mut self, stage: ShaderStage) {
+        self.meta.reset(stage);
+
+        self.lookup_function.clear();
+        self.lookup_type.clear();
+        self.global_variables.clear();
+        self.entry_args.clear();
+        self.layouter.clear();
+    }
+
+    /// Parses a shader either outputting a shader [`Module`] or a list of
+    /// [`Error`]s.
+    ///
+    /// Multiple calls using the same `Frontend` and different shaders are supported.
+    pub fn parse(
+        &mut self,
+        options: &Options,
+        source: &str,
+    ) -> core::result::Result<Module, ParseErrors> {
+        self.reset(options.stage);
+
+        let lexer = lex::Lexer::new(source, &options.defines);
+        let mut ctx = ParsingContext::new(lexer);
+
+        match ctx.parse(self) {
+            Ok(module) => {
+                if self.errors.is_empty() {
+                    Ok(module)
+                } else {
+                    Err(core::mem::take(&mut self.errors).into())
+                }
+            }
+            Err(e) => {
+                self.errors.push(e);
+                Err(core::mem::take(&mut self.errors).into())
+            }
+        }
+    }
+
+    /// Returns additional information about the parsed shader which might not
+    /// be stored in the [`Module`], see the documentation for
+    /// [`ShaderMetadata`] for more information about the returned data.
+    ///
+    /// # Notes
+    ///
+    /// Following an unsuccessful parsing the state of the returned information
+    /// is undefined, it might contain only partial information about the
+    /// current shader, the previous shader or both.
+    pub const fn metadata(&self) -> &ShaderMetadata {
+        &self.meta
+    }
+}
+
+}

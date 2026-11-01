@@ -7,9 +7,26 @@ use std::fmt::Write;
 use naga::ShaderStage;
 
 use super::scan::{
-    LATER_KEYWORDS, Stage, UNIFORM_STATE, VERTEX_INPUTS, is_ident, is_sampler_type, significant,
+    LATER_KEYWORDS, NOT_CONSTANT, Stage, UNIFORM_STATE, VERTEX_INPUTS, is_ident, is_sampler_type,
+    significant,
 };
 use super::{Sampler, split_sampler};
+
+/// `inverse` for each square matrix: the adjugate over the determinant.
+const INVERSE: &str = "mat2 hz_inverse(mat2 m) { return mat2(m[1][1], -m[0][1], -m[1][0], m[0][0]) / determinant(m); }\n\
+    mat3 hz_inverse(mat3 m) { vec3 r0 = cross(m[1], m[2]); vec3 r1 = cross(m[2], m[0]); vec3 r2 = cross(m[0], m[1]); \
+    return transpose(mat3(r0, r1, r2)) / dot(m[0], r0); }\n\
+    mat4 hz_inverse(mat4 m) {\
+    float a00 = m[0][0], a01 = m[0][1], a02 = m[0][2], a03 = m[0][3], a10 = m[1][0], a11 = m[1][1], a12 = m[1][2], a13 = m[1][3];\
+    float a20 = m[2][0], a21 = m[2][1], a22 = m[2][2], a23 = m[2][3], a30 = m[3][0], a31 = m[3][1], a32 = m[3][2], a33 = m[3][3];\
+    float b00 = a00 * a11 - a01 * a10, b01 = a00 * a12 - a02 * a10, b02 = a00 * a13 - a03 * a10, b03 = a01 * a12 - a02 * a11;\
+    float b04 = a01 * a13 - a03 * a11, b05 = a02 * a13 - a03 * a12, b06 = a20 * a31 - a21 * a30, b07 = a20 * a32 - a22 * a30;\
+    float b08 = a20 * a33 - a23 * a30, b09 = a21 * a32 - a22 * a31, b10 = a21 * a33 - a23 * a31, b11 = a22 * a33 - a23 * a32;\
+    float det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;\
+    return mat4(a11 * b11 - a12 * b10 + a13 * b09, a02 * b10 - a01 * b11 - a03 * b09, a31 * b05 - a32 * b04 + a33 * b03, a22 * b04 - a21 * b05 - a23 * b03,\
+    a12 * b08 - a10 * b11 - a13 * b07, a00 * b11 - a02 * b08 + a03 * b07, a32 * b02 - a30 * b05 - a33 * b01, a20 * b05 - a22 * b02 + a23 * b01,\
+    a10 * b10 - a11 * b08 + a13 * b06, a01 * b08 - a00 * b10 - a03 * b06, a30 * b04 - a31 * b02 + a33 * b00, a21 * b02 - a20 * b04 - a23 * b00,\
+    a11 * b07 - a10 * b09 - a12 * b06, a00 * b09 - a01 * b07 + a02 * b06, a31 * b01 - a30 * b03 - a32 * b00, a20 * b03 - a21 * b01 + a22 * b00) / det; }\n";
 
 impl Stage<'_> {
     /// Declarations of ours this stage uses (after the uniform block, samplers and varyings).
@@ -23,6 +40,9 @@ impl Stage<'_> {
              hz_FogParameters hz_Fog;\n\
              float hz_zero = 0.0;\n",
         );
+        if self.inverse {
+            p.push_str(INVERSE);
+        }
         if self.gbuffers {
             // Set by our `main` from the frame's matrices (gbuffers.rs).
             p.push_str(
@@ -37,6 +57,64 @@ impl Stage<'_> {
                  const mat4 hz_TextureMatrix[8] = mat4[8](mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0));\n",
             );
         }
+        for fun in ["Add", "Min", "Max", "And", "Or", "Xor", "Exchange"] {
+            if self.tokens.iter().any(|t| t.strip_prefix("imageAtomic") == Some(fun)) {
+                let f = fun.to_lowercase();
+                writeln!(p, "uvec4 hz_atomic_{f}(uint v) {{ return uvec4(v); }}\n\
+                    ivec4 hz_atomic_{f}(int v) {{ return ivec4(v); }}").unwrap();
+            }
+        }
+        // `textureQueryLod` (the mip level a fragment's lookup would take), from the coordinate's
+        // derivatives, and `textureGatherOffsets` (four offsets), from four fetches.
+        if self.kind == ShaderStage::Fragment && self.tokens.iter().any(|t| *t == "textureQueryLod") {
+            p.push_str("vec2 hz_textureQueryLod(texture2D t, sampler s, vec2 uv) {\n    \
+                vec2 p = uv * vec2(textureSize(sampler2D(t, s), 0));\n    \
+                float l = 0.5 * log2(max(dot(dFdx(p), dFdx(p)), dot(dFdy(p), dFdy(p))));\n    \
+                float n = float(textureQueryLevels(sampler2D(t, s)) - 1);\n    \
+                return vec2(clamp(l, 0.0, n), l);\n}\n");
+        }
+        if self.tokens.iter().any(|t| *t == "textureGatherOffsets") {
+            for (k, v) in [("", "vec4"), ("i", "ivec4"), ("u", "uvec4")] {
+                writeln!(p, "{v} hz_textureGatherOffsets({k}texture2D t, sampler s, vec2 uv, ivec2 o[4], int c) {{\n    \
+                    ivec2 n = textureSize({k}sampler2D(t, s), 0); ivec2 m = n - 1;\n    \
+                    ivec2 i = ivec2(floor(uv * vec2(n) - 0.5));\n    \
+                    return {v}(texelFetch({k}sampler2D(t, s), clamp(i + o[0], ivec2(0), m), 0)[c], texelFetch({k}sampler2D(t, s), clamp(i + o[1], ivec2(0), m), 0)[c],\n        \
+                        texelFetch({k}sampler2D(t, s), clamp(i + o[2], ivec2(0), m), 0)[c], texelFetch({k}sampler2D(t, s), clamp(i + o[3], ivec2(0), m), 0)[c]);\n}}\n\
+                    {v} hz_textureGatherOffsets({k}texture2D t, sampler s, vec2 uv, ivec2 o[4]) {{ return hz_textureGatherOffsets(t, s, uv, o, 0); }}").unwrap();
+            }
+        }
+        if self.tokens.iter().any(|t| *t == "dot") {
+            p.push_str("float hz_dot(float a, float b) { return a * b; }\n\
+                float hz_dot(vec2 a, vec2 b) { return dot(a, b); }\n\
+                float hz_dot(vec3 a, vec3 b) { return dot(a, b); }\n\
+                float hz_dot(vec4 a, vec4 b) { return dot(a, b); }\n");
+        }
+        if self.tokens.iter().any(|t| t.starts_with("textureGather")) {
+            for (k, v) in [("", "vec4"), ("i", "ivec4"), ("u", "uvec4")] {
+                for (name, off, arg) in [("hz_textureGather", "ivec2(0)", ""), ("hz_textureGatherOffset", "o", ", ivec2 o")] {
+                    writeln!(p, "{v} {name}({k}texture2D t, sampler s, vec2 uv{arg}, int c) {{\n    \
+                        ivec2 n = textureSize({k}sampler2D(t, s), 0); ivec2 m = n - 1;\n    \
+                        ivec2 i = ivec2(floor(uv * vec2(n) - 0.5)) + {off};\n    \
+                        {v} a = texelFetch({k}sampler2D(t, s), clamp(i + ivec2(0, 1), ivec2(0), m), 0);\n    \
+                        {v} b = texelFetch({k}sampler2D(t, s), clamp(i + ivec2(1, 1), ivec2(0), m), 0);\n    \
+                        {v} d = texelFetch({k}sampler2D(t, s), clamp(i + ivec2(1, 0), ivec2(0), m), 0);\n    \
+                        {v} e = texelFetch({k}sampler2D(t, s), clamp(i, ivec2(0), m), 0);\n    \
+                        return {v}(a[c], b[c], d[c], e[c]);\n}}\n\
+                        {v} {name}({k}texture2D t, sampler s, vec2 uv{arg}) {{ return {name}(t, s, uv{call}, 0); }}",
+                        call = if arg.is_empty() { "" } else { ", o" }).unwrap();
+                }
+            }
+            // Shadow lookups need derivatives: fragment stages only.
+            if self.kind == ShaderStage::Fragment {
+            p.push_str("vec4 hz_textureGather(texture2D t, samplerShadow s, vec2 uv, float r) {\n    \
+                vec2 n = vec2(textureSize(sampler2DShadow(t, s), 0));\n    \
+                vec2 i = floor(uv * n - 0.5) + 0.5;\n    \
+                return vec4(texture(sampler2DShadow(t, s), vec3((i + vec2(0.0, 1.0)) / n, r)),\n        \
+                texture(sampler2DShadow(t, s), vec3((i + vec2(1.0, 1.0)) / n, r)),\n        \
+                texture(sampler2DShadow(t, s), vec3((i + vec2(1.0, 0.0)) / n, r)),\n        \
+                texture(sampler2DShadow(t, s), vec3(i / n, r)));\n}\n");
+            }
+        }
         if self.kind == ShaderStage::Vertex {
             p.push_str(
                 "const vec2 hz_quad[6] = vec2[6](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));\n\
@@ -44,7 +122,7 @@ impl Stage<'_> {
                  vec4 hz_MultiTexCoord0; vec4 hz_MultiTexCoord1; vec4 hz_MultiTexCoord2; vec4 hz_MultiTexCoord3;\n\
                  vec4 hz_MultiTexCoord4; vec4 hz_MultiTexCoord5; vec4 hz_MultiTexCoord6; vec4 hz_MultiTexCoord7;\n",
             );
-        } else {
+        } else if self.kind == ShaderStage::Fragment {
             for n in &self.outputs {
                 if !self.frag_outs.iter().any(|(at, _)| at == n) {
                     writeln!(p, "layout(location = {n}) out vec4 hz_out{n};").unwrap();
@@ -95,8 +173,7 @@ impl Stage<'_> {
             }
             if let Some(text) = self.after.get(&i) {
                 // Written after the token, whatever it becomes.
-                let text = text.clone();
-                after_token = Some(text);
+                after_token = Some(text.clone());
             }
             if let Some(text) = self.replaced.get(&i) {
                 out.push_str(text);
@@ -189,6 +266,10 @@ impl Stage<'_> {
                 out.push_str(t);
                 continue;
             }
+            // A local `const` that calls a built-in naga cannot evaluate: an ordinary local.
+            if t == "const" && depth > 0 && self.calls_not_constant(i) {
+                continue;
+            }
             // `const in float x` parameters: naga takes no `const` there.
             if t == "const" && depth == 0 && !calls.is_empty() {
                 continue;
@@ -221,6 +302,10 @@ impl Stage<'_> {
                 out.push_str(t);
                 continue;
             }
+            if called && sampler_ty.contains_key(t) && keyword_name(t) != t && !params.contains_key(t) {
+                out.push_str(t);
+                continue;
+            }
             let sampler = params
                 .get(t)
                 .map(String::as_str)
@@ -232,10 +317,11 @@ impl Stage<'_> {
                         .is_some_and(|p| p.get(*arg) == Some(&true))
                 }) && prev(i)
                     .is_some_and(|j| matches!(self.tokens[j], "(" | ","));
-                let w = keyword_name(t);
                 if as_argument {
+                    let w = keyword_name(t);
                     write!(out, "{w}, hz_s_{w}").unwrap();
                 } else {
+                    let w = keyword_name(t);
                     write!(out, "{ty}({w}, hz_s_{w})").unwrap();
                 }
                 continue;
@@ -255,6 +341,8 @@ impl Stage<'_> {
                 }
                 // GLSL's `modf`, which naga's frontend lacks.
                 "modf" if called => Some("hz_modf".into()),
+                // Matrix inverse, which naga writes for neither Metal nor WGSL.
+                "inverse" if called && self.inverse => Some("hz_inverse".into()),
                 _ if !fragment && called && IMPLICIT_LOD.contains(&t) => Some("textureLod".into()),
                 "texture2D" | "texture1D" | "texture3D" | "textureCube" if called => {
                     Some("texture".into())
@@ -269,6 +357,17 @@ impl Stage<'_> {
                     Some("texelFetch".into())
                 }
                 "texture2DProj" if called => Some("textureProj".into()),
+                "texelFetch1D" | "texelFetch2D" | "texelFetch3D" if called => Some("texelFetch".into()),
+                "textureSize1D" | "textureSize2D" | "textureSize3D" if called => Some("textureSize".into()),
+                "textureGather" if called => Some("hz_textureGather".into()),
+                "textureGatherOffset" if called => Some("hz_textureGatherOffset".into()),
+                "textureGatherOffsets" if called => Some("hz_textureGatherOffsets".into()),
+                "textureQueryLod" if called => Some("hz_textureQueryLod".into()),
+                // naga takes `dot` of vectors only; GLSL also of two floats (Pegasus).
+                "dot" if called => Some("hz_dot".into()),
+                // Memory barriers: naga has the one `barrier()` (all memory, the workgroup in step).
+                "memoryBarrierShared" | "memoryBarrier" | "groupMemoryBarrier" | "memoryBarrierImage"
+                | "memoryBarrierBuffer" if called => Some("barrier".into()),
                 "texture2DGrad" | "texture2DGradARB" if called => Some("textureGrad".into()),
                 "shadow2D" if called => Some("vec4(texture".into()),
                 "shadow2DLod" if called => Some("vec4(textureLod".into()),
@@ -279,6 +378,8 @@ impl Stage<'_> {
                     skip_until = close.map_or(i + 1, |c| c + 1);
                     Some("(hz_ModelViewProjectionMatrix * hz_Vertex)".into())
                 }
+                "gl_VertexID" => Some("gl_VertexIndex".into()),
+                "gl_FogFragCoord" => Some("hz_FogFragCoord".into()),
                 "gl_FragColor" => Some("hz_out0".into()),
                 "gl_FragData" | "gl_TexCoord" => match self.index_after(i) {
                     Some((n, close)) => {
@@ -295,6 +396,9 @@ impl Stage<'_> {
                 "gl_FragCoord" => Some("hz_FragCoord".into()),
                 "gl_FrontColor" => Some("hz_FrontColor".into()),
                 "gl_Fog" => Some("hz_Fog".into()),
+                // Before the compatibility inputs, of which `gl_Vertex` is a prefix.
+                "gl_InstanceID" => Some("gl_InstanceIndex".into()),
+                "gl_VertexIndex" | "gl_InstanceIndex" => None,
                 _ if UNIFORM_STATE.iter().any(|b| t.starts_with(b)) => {
                     Some(format!("hz_{}", &t[3..]))
                 }
@@ -302,8 +406,6 @@ impl Stage<'_> {
                     Some(format!("hz_{}", &t[3..]))
                 }
                 "sampler" | "image" => Some(keyword_name(t).into()),
-                "gl_VertexID" => Some("gl_VertexIndex".into()),
-                "gl_InstanceID" => Some("gl_InstanceIndex".into()),
                 _ if old && LATER_KEYWORDS.contains(&t) => Some(format!("hz_kw_{t}")),
                 _ => None,
             };
@@ -316,19 +418,22 @@ impl Stage<'_> {
     }
 }
 
-/// A name that is a keyword in Vulkan GLSL (naga's), written as one of ours.
-fn keyword_name(name: &str) -> &str {
-    match name {
-        "sampler" => "hz_kw_sampler",
-        "image" => "hz_kw_image",
-        n => n,
-    }
-}
-
-/// Sampling functions with an implicit level of detail (a fragment shader's derivatives).
-const IMPLICIT_LOD: [&str; 5] = ["texture", "texture2D", "texture1D", "texture3D", "textureCube"];
-
 impl Stage<'_> {
+    /// Whether the declaration after token `i` calls a built-in in `NOT_CONSTANT` before its `;`.
+    pub(super) fn calls_not_constant(&self, i: usize) -> bool {
+        for (j, &t) in self.tokens.iter().enumerate().skip(i + 1) {
+            if matches!(t, ";" | "{" | "}") {
+                return false;
+            }
+            if NOT_CONSTANT.contains(&t)
+                && self.tokens[j + 1..].iter().find(|t| significant(t)) == Some(&"(")
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The element count of an unsized array whose `[]` ends at `close`: the arguments of the
     /// constructor that follows (`[] = T[](...)` or `[](...)`).
     pub(super) fn array_length(&self, close: usize) -> Option<usize> {
@@ -374,3 +479,17 @@ pub(super) fn attribute_value(name: &str, ty: &str) -> String {
         _ => format!("{ty}(0)"),
     }
 }
+
+/// A name that is a keyword in Vulkan GLSL (naga's), written as one of ours.
+pub(super) fn keyword_name(name: &str) -> &str {
+    match name {
+        "texture" => "hz_kw_texture",
+        "texture2D" => "hz_kw_texture2D",
+        "sampler" => "hz_kw_sampler",
+        "image" => "hz_kw_image",
+        n => n,
+    }
+}
+
+/// Sampling functions with an implicit level of detail (a fragment shader's derivatives).
+const IMPLICIT_LOD: [&str; 5] = ["texture", "texture2D", "texture1D", "texture3D", "textureCube"];

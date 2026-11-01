@@ -20,6 +20,18 @@ pub(super) struct Var {
     pub(super) structure: bool,
 }
 
+/// `layout(rgba16f) uniform writeonly image2D colorimg4;`
+#[derive(Clone)]
+pub(super) struct ImageDecl {
+    pub(super) name: String,
+    pub(super) ty: String,
+    pub(super) format: String,
+    /// `readonly`, `writeonly` or empty (both).
+    pub(super) access: String,
+    /// Declared `coherent` or `volatile`: invocations of a dispatch share it as it changes.
+    pub(super) coherent: bool,
+}
+
 pub(super) struct Stage<'p> {
     pub(super) kind: ShaderStage,
     pub(super) pp: &'p Preprocessed,
@@ -29,6 +41,9 @@ pub(super) struct Stage<'p> {
     /// Name, type with its array suffix, token of the type.
     pub(super) uniforms: Vec<(String, String, usize)>,
     pub(super) samplers: Vec<(String, String)>,
+    pub(super) images: Vec<ImageDecl>,
+    /// The bindings of the SSBOs (`buffer` blocks), in set 4.
+    pub(super) buffers: BTreeSet<u32>,
     pub(super) ins: Vec<Var>,
     pub(super) outs: Vec<Var>,
     /// Vertex inputs, now private globals, and the value our `main` gives each.
@@ -38,6 +53,13 @@ pub(super) struct Stage<'p> {
     pub(super) gbuffers: bool,
     /// The pack's fragment outputs, declared again with their locations.
     pub(super) frag_outs: Vec<(u32, String)>,
+    /// Iris Features: our wider outputs' assignments, after the pack's `main`.
+    pub(super) widened: Vec<String>,
+    /// Iris Features: struct varyings' member copies.
+    /// Narrow outputs copied into their vec4 after the pack's `main`.
+    pub(super) out_copies: Vec<String>,
+    /// The stage calls `inverse`, which ours replaces, and doesn't define its own.
+    pub(super) inverse: bool,
     /// The pack's functions that take samplers: which parameters are samplers.
     pub(super) sampler_functions: HashMap<String, Vec<bool>>,
     /// The pack's structs: each member's type and name with its array suffix.
@@ -49,14 +71,11 @@ pub(super) struct Stage<'p> {
     /// Globals whose initializer runs in our `main` (`g = hz_init_g();`), in order.
     pub(super) inits: Vec<String>,
     pub(super) errors: Vec<Error>,
-    /// Images (Iris Features): name, type (`uimage3D`), format qualifier (`r32ui`), access
-    /// (`readonly `, `writeonly ` or empty).
-    pub(super) images: Vec<(String, String, String, String)>,
-    /// Storage-buffer blocks (Iris Features): the pack's binding of each.
-    pub(super) buffers: Vec<u32>,
-    /// `bool` members of storage-buffer blocks, stored as `uint` (a bool is not host-shareable).
+    /// Interface block instance names (`data_out` of `out DATA { .. } data_out;`).
+    pub(super) instances: Vec<String>,
+    /// `bool` members of storage buffers, stored as `uint`.
     pub(super) bool_members: Vec<String>,
-    /// Token ranges of storage-buffer blocks (their declarations are not accesses).
+    /// Storage buffer blocks' member token ranges.
     pub(super) block_ranges: Vec<std::ops::Range<usize>>,
     /// Text written before / after a token, which is otherwise rewritten as usual.
     pub(super) before: HashMap<usize, String>,
@@ -66,10 +85,6 @@ pub(super) struct Stage<'p> {
     /// `(` of sampling calls on a shadow sampler whose result is swizzled (`texture(s, p).x`):
     /// the call is wrapped in `vec4(...)`, as naga takes no swizzle of a scalar.
     pub(super) shadow_swizzles: std::collections::HashSet<usize>,
-    /// Interface block instance names (`} data_out;`): `data_out.` goes.
-    pub(super) instances: Vec<String>,
-    /// Globals whose constant initializer calls a function naga can't evaluate.
-    pub(super) runtime_consts: Vec<String>,
 }
 
 /// Types a value converts to by constructor (scalars, vectors, matrices).
@@ -79,14 +94,48 @@ pub(super) const CONVERTIBLE: [&str; 25] = [
     "mat4x4", "mat2x3", "mat3x4", "mat4x3",
 ];
 
-/// Built-ins naga can't evaluate in a constant expression.
-pub(super) const NOT_CONSTANT: [&str; 12] = [
-    "mix", "smoothstep", "step", "pow", "exp", "exp2", "log", "log2", "sqrt", "inversesqrt",
-    "normalize", "length",
+/// The format qualifiers of images (GLSL 4.60, 4.4.6.2).
+const IMAGE_FORMATS: [&str; 39] = [
+    "rgba32f",
+    "rgba16f",
+    "rg32f",
+    "rg16f",
+    "r11f_g11f_b10f",
+    "r32f",
+    "r16f",
+    "rgba16",
+    "rgb10_a2",
+    "rgba8",
+    "rg16",
+    "rg8",
+    "r16",
+    "r8",
+    "rgba16_snorm",
+    "rgba8_snorm",
+    "rg16_snorm",
+    "rg8_snorm",
+    "r16_snorm",
+    "r8_snorm",
+    "rgba32i",
+    "rgba16i",
+    "rgba8i",
+    "rg32i",
+    "rg16i",
+    "rg8i",
+    "r32i",
+    "r16i",
+    "r8i",
+    "rgba32ui",
+    "rgba16ui",
+    "rgb10_a2ui",
+    "rgba8ui",
+    "rg32ui",
+    "rg16ui",
+    "rg8ui",
+    "r32ui",
+    "r16ui",
+    "r8ui",
 ];
-
-/// Memory qualifiers of images and buffers: kept as access, or dropped (`restrict`...).
-pub(super) const MEMORY: [&str; 5] = ["readonly", "writeonly", "restrict", "coherent", "volatile"];
 
 pub(super) const STORAGE: [&str; 5] = ["uniform", "in", "out", "attribute", "varying"];
 pub(super) const QUALIFIERS: [&str; 11] = [
@@ -118,6 +167,35 @@ pub(super) const VERTEX_INPUTS: [&str; 6] = [
     "gl_Normal",
     "gl_FogCoord",
     "gl_MultiTexCoord",
+];
+/// Built-in functions naga's constant evaluator lacks: a `const` that calls one is evaluated
+/// where the program runs instead (GL drivers fold them; naga fails the program).
+pub(super) const NOT_CONSTANT: [&str; 25] = [
+    "mix",
+    "smoothstep",
+    "reflect",
+    "refract",
+    "faceforward",
+    "transpose",
+    "determinant",
+    "inverse",
+    "outerProduct",
+    "matrixCompMult",
+    "modf",
+    "frexp",
+    "ldexp",
+    "packUnorm2x16",
+    "packSnorm2x16",
+    "packUnorm4x8",
+    "packSnorm4x8",
+    "packHalf2x16",
+    "unpackUnorm2x16",
+    "unpackSnorm2x16",
+    "unpackUnorm4x8",
+    "unpackSnorm4x8",
+    "unpackHalf2x16",
+    "bitfieldExtract",
+    "bitfieldInsert",
 ];
 /// Words that became keywords after GLSL 1.x and that old packs use as names.
 pub(super) const LATER_KEYWORDS: [&str; 17] = [
@@ -157,6 +235,23 @@ pub(super) fn significant(t: &str) -> bool {
     !t.trim().is_empty()
 }
 
+/// A fragment output narrower than four components: the vec4 of its kind, and the components
+/// that fill it (alpha 1).
+fn widened(ty: &str) -> Option<(&'static str, &'static str)> {
+    Some(match ty {
+        "float" => ("vec4", ", 0.0, 0.0, 1.0"),
+        "vec2" => ("vec4", ", 0.0, 1.0"),
+        "vec3" => ("vec4", ", 1.0"),
+        "int" => ("ivec4", ", 0, 0, 1"),
+        "ivec2" => ("ivec4", ", 0, 1"),
+        "ivec3" => ("ivec4", ", 1"),
+        "uint" => ("uvec4", ", 0u, 0u, 1u"),
+        "uvec2" => ("uvec4", ", 0u, 1u"),
+        "uvec3" => ("uvec4", ", 1u"),
+        _ => return None,
+    })
+}
+
 /// `sampler2D`, `isampler3D`, `usampler2D`, `sampler2DShadow`...
 pub(super) fn is_sampler_type(t: &str) -> bool {
     t.trim_start_matches(['i', 'u']).starts_with("sampler")
@@ -175,11 +270,20 @@ impl<'p> Stage<'p> {
             removed: Vec::new(),
             uniforms: Vec::new(),
             samplers: Vec::new(),
+            images: Vec::new(),
+            buffers: BTreeSet::new(),
             ins: Vec::new(),
             outs: Vec::new(),
             attributes: Vec::new(),
             frag_outs: Vec::new(),
-            sampler_functions: HashMap::new(),
+            widened: Vec::new(),
+            out_copies: Vec::new(),
+            inverse: false,
+            // Iris Features: `textureGather` takes its sampler apart, as our helpers do.
+            sampler_functions: [("textureGather", vec![true, false, false, false]), ("textureGatherOffset", vec![true, false, false, false]), ("textureGatherOffsets", vec![true, false, false, false]), ("textureQueryLod", vec![true, false])]
+                .into_iter()
+                .map(|(n, p)| (n.to_owned(), p))
+                .collect(),
             structs: HashMap::new(),
             outputs: BTreeSet::new(),
             frag_coord: false,
@@ -187,19 +291,60 @@ impl<'p> Stage<'p> {
             replaced: HashMap::new(),
             inits: Vec::new(),
             errors: Vec::new(),
-            images: Vec::new(),
-            buffers: Vec::new(),
+            instances: Vec::new(),
             bool_members: Vec::new(),
             block_ranges: Vec::new(),
             before: HashMap::new(),
             after: HashMap::new(),
             bodies: Vec::new(),
             shadow_swizzles: std::collections::HashSet::new(),
-            instances: Vec::new(),
-            runtime_consts: Vec::new(),
         };
         s.rename_vulkan_types();
+        {
+            let sig: Vec<usize> = (0..s.tokens.len()).filter(|&i| significant(s.tokens[i])).collect();
+            for k in 0..sig.len() {
+                let fun = match s.tokens[sig[k]] {
+                    "imageAtomicAdd" => "add",
+                    "imageAtomicMin" => "min",
+                    "imageAtomicMax" => "max",
+                    "imageAtomicAnd" => "and",
+                    "imageAtomicOr" => "or",
+                    "imageAtomicXor" => "xor",
+                    "imageAtomicExchange" => "exchange",
+                    _ => continue,
+                };
+                if sig.get(k + 1).map(|&i| s.tokens[i]) != Some("(") {
+                    continue;
+                }
+                let (mut depth, mut commas, mut second, mut close) = (0i32, 0, None, None);
+                for j in k + 1..sig.len() {
+                    match s.tokens[sig[j]] {
+                        "(" | "[" | "{" => depth += 1,
+                        ")" | "]" | "}" => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(j);
+                                break;
+                            }
+                        }
+                        "," if depth == 1 => {
+                            commas += 1;
+                            if commas == 2 {
+                                second = Some(j);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let (Some(c2), Some(cl), 2) = (second, close, commas) {
+                    s.replaced.insert(sig[k], "imageStore".into());
+                    s.replaced.insert(sig[c2], format!(", hz_atomic_{fun}("));
+                    s.replaced.insert(sig[cl], "))".into());
+                }
+            }
+        }
         let (mut start, mut depth, mut parens) = (0, 0usize, 0usize);
+        let mut own_inverse = false;
         for i in 0..s.tokens.len() {
             match s.tokens[i] {
                 "(" => parens += 1,
@@ -234,18 +379,34 @@ impl<'p> Stage<'p> {
                     }
                 }
                 "gl_FragCoord" => s.frag_coord = true,
+                "inverse" => {
+                    s.inverse = true;
+                    // `mat4 inverse(mat4 m)`: a pack for GLSL 1.20, which has none, wrote its own.
+                    own_inverse |= depth == 0
+                        && s.tokens[..i]
+                            .iter()
+                            .rfind(|t| significant(t))
+                            .is_some_and(|t| is_ident(t));
+                }
                 "gl_TexCoord" => {
                     if let Some((n, _)) = s.index_after(i) {
                         s.builtin_varying(format!("hz_TexCoord{n}"));
                     }
                 }
                 "gl_FrontColor" => s.builtin_varying("hz_FrontColor".into()),
+                "gl_FogFragCoord" => {
+                    let list = if kind == ShaderStage::Vertex { &mut s.outs } else { &mut s.ins };
+                    if !list.iter().any(|v| v.name == "hz_FogFragCoord") {
+                        list.push(Var { name: "hz_FogFragCoord".into(), decl: "float @;".into(), structure: false });
+                    }
+                }
                 "gl_Color" if kind == ShaderStage::Fragment => {
                     s.builtin_varying("hz_FrontColor".into())
                 }
                 _ => {}
             }
         }
+        s.inverse &= !own_inverse;
         s.bool_member_accesses();
         s.instance_prefixes();
         s.returns();
@@ -319,7 +480,6 @@ impl<'p> Stage<'p> {
         }
     }
 
-    /// A statement at global scope, tokens `from..to` (without its `;`, or before a `{`).
     pub(super) fn global(&mut self, from: usize, to: usize, body: bool) {
         let words: Vec<usize> = (from..to)
             .filter(|&i| significant(self.tokens[i]))
@@ -331,7 +491,8 @@ impl<'p> Stage<'p> {
         let prototype = paren.is_some_and(|p| self.tokens[words[p]] == "(")
             && !words.iter().any(|&i| STORAGE.contains(&self.tokens[i]));
         if body && words.iter().any(|&i| self.tokens[i] == "buffer") {
-            return self.buffer_block(&words, to);
+            self.buffer_bools(to);
+            return self.buffer_block(&words);
         }
         if body
             && words
@@ -350,42 +511,37 @@ impl<'p> Stage<'p> {
         let mut k = 0;
         let mut storage = None;
         let mut location = None;
+        let mut format = None;
+        let mut access = "";
+        let mut coherent = false;
         let mut interpolation = String::new();
-        let mut format = String::new();
-        let mut access = String::new();
         while let Some(&i) = words.get(k) {
             let w = self.tokens[i];
             if w == "layout" {
-                // layout(location = n, ...), or an image's format: layout(rgba16f)
+                // layout(location = n, ...), an image's layout(rgba16f)
                 let mut j = k + 1;
                 while let Some(&t) = words.get(j) {
                     j += 1;
-                    let word = self.tokens[t];
-                    if word == "location" {
-                        location = words
-                            .get(j + 1)
-                            .and_then(|&n| self.tokens[n].parse::<u32>().ok());
-                    }
-                    let assigned = words.get(j).is_some_and(|&n| self.tokens[n] == "=");
-                    let after_eq = j >= 2 && words.get(j - 2).is_some_and(|&n| self.tokens[n] == "=");
-                    if is_ident(word) && !assigned && !after_eq && word != "layout" {
-                        format = word.to_owned();
-                    }
-                    if word == ")" {
-                        break;
+                    match self.tokens[t] {
+                        "location" => {
+                            location = words
+                                .get(j + 1)
+                                .and_then(|&n| self.tokens[n].parse::<u32>().ok());
+                        }
+                        f if IMAGE_FORMATS.contains(&f) => format = Some(f),
+                        ")" => break,
+                        _ => {}
                     }
                 }
                 k = j;
                 continue;
             }
-            if MEMORY.contains(&w) {
-                if matches!(w, "readonly" | "writeonly") {
-                    access = format!("{w} ");
-                }
-                self.removed.push(i..i + 1);
-            } else if STORAGE.contains(&w) {
+            if STORAGE.contains(&w) {
                 storage = Some(w);
-            } else if QUALIFIERS.contains(&w) {
+            } else if matches!(w, "readonly" | "writeonly") {
+                access = w;
+            } else if QUALIFIERS.contains(&w) || matches!(w, "coherent" | "volatile" | "restrict") {
+                coherent |= matches!(w, "coherent" | "volatile");
                 if matches!(
                     w,
                     "flat" | "smooth" | "noperspective" | "centroid" | "sample"
@@ -408,6 +564,16 @@ impl<'p> Stage<'p> {
         // Declarators: name [array] [= init], separated by commas.
         let mut declarators: Vec<(String, String)> = Vec::new();
         let mut j = k + 1;
+        let mut type_array = String::new();
+        while words.get(j).is_some_and(|&t| self.tokens[t] == "[") {
+            while let Some(&t) = words.get(j) {
+                type_array.push_str(self.tokens[t]);
+                j += 1;
+                if self.tokens[t] == "]" {
+                    break;
+                }
+            }
+        }
         while let Some(&n) = words.get(j) {
             let name = self.tokens[n].to_owned();
             let mut array = String::new();
@@ -431,27 +597,39 @@ impl<'p> Stage<'p> {
                 j += 1;
             }
             j += 1;
-            declarators.push((name, array));
+            declarators.push((name, format!("{type_array}{array}")));
         }
         let fragment = self.kind == ShaderStage::Fragment;
         let input = matches!(storage, "in" | "attribute") || (storage == "varying" && fragment);
+        if storage != "uniform"
+            && matches!(ty.trim_end_matches(char::is_numeric), "int" | "uint" | "ivec" | "uvec")
+            && !interpolation.contains("flat")
+        {
+            interpolation.insert_str(0, "flat ");
+        }
         self.removed.push(from..to + 1);
         for (name, array) in declarators {
-            let decl = format!("{interpolation}{ty} @{array};");
+            let integer = ty.starts_with("int") || ty.starts_with("uint") || ty.starts_with("ivec")
+                || ty.starts_with("uvec") || ty == "bool" || ty.starts_with("bvec");
+            let decl = if integer && !interpolation.contains("flat") {
+                format!("flat {ty} @{array};")
+            } else {
+                format!("{interpolation}{ty} @{array};")
+            };
             match storage {
                 "uniform" if is_sampler_type(&ty) => self.samplers.push((name, ty.clone())),
-                "uniform" if ty.contains("image") => {
-                    if format.is_empty() && !access.starts_with("writeonly") {
-                        self.errors.push(self.error(
-                            ty_at,
-                            &format!("`{name}`: an image without a format qualifier"),
-                        ));
-                    }
-                    if !self.images.iter().any(|i| i.0 == name) {
-                        self.images
-                            .push((name, ty.clone(), format.clone(), access.clone()));
-                    }
-                }
+                "uniform" if ty.contains("image") => match format {
+                    Some(format) => self.images.push(ImageDecl {
+                        name,
+                        ty: ty.clone(),
+                        format: format.to_owned(),
+                        access: access.to_owned(),
+                        coherent,
+                    }),
+                    None => self
+                        .errors
+                        .push(self.error(ty_at, &format!("`{name}`: an image needs a format"))),
+                },
                 "uniform" => self.uniforms.push((name, format!("{ty}{array}"), ty_at)),
                 _ if input && !fragment => {
                     let value = attribute_value(&name, &ty);
@@ -486,8 +664,23 @@ impl<'p> Stage<'p> {
                 _ if fragment => {
                     let n = location.unwrap_or(self.outputs.len() as u32);
                     self.outputs.insert(n);
-                    self.frag_outs
-                        .push((n, format!("layout(location = {n}) out {ty} {name}{array};")));
+                    // wgpu wants every component of the target's format written; GL fills
+                    // what a narrower output leaves out. Ours is a vec4, theirs a private global.
+                    match widened(&ty).filter(|_| array.is_empty()) {
+                        Some((wide, fill)) => {
+                            self.frag_outs.push((
+                                n,
+                                format!(
+                                    "layout(location = {n}) out {wide} hz_out{n}; {ty} {name};"
+                                ),
+                            ));
+                            self.out_copies
+                                .push(format!("hz_out{n} = {wide}({name}{fill});"));
+                        }
+                        None => self
+                            .frag_outs
+                            .push((n, format!("layout(location = {n}) out {ty} {name}{array};"))),
+                    }
                 }
                 _ => self.outs.push(Var {
                     name,
@@ -526,16 +719,16 @@ impl<'p> Stage<'p> {
         }
         declarators.push((begin, assign, words.len()));
         let constant = words[..eq].iter().any(|&i| text(i) == "const");
-        let conditional =
-            |d: &(usize, Option<usize>, usize)| words[d.0..d.2].iter().any(|&i| text(i) == "?");
-        // naga's constant evaluator lacks some built-ins (`mix`...): such a constant, and one
-        // that reads such a constant, is initialized at run time instead.
-        let runtime = words[eq + 1..].iter().enumerate().any(|(n, &i)| {
-            let t = text(i);
-            let called = words.get(eq + 2 + n).is_some_and(|&j| text(j) == "(");
-            (called && NOT_CONSTANT.contains(&t)) || self.runtime_consts.iter().any(|c| c == t)
-        });
-        if constant && !declarators.iter().any(conditional) && !runtime {
+        // What naga cannot evaluate at global scope: a conditional, or a call to a built-in its
+        // constant evaluator lacks.
+        let runtime = |d: &(usize, Option<usize>, usize)| {
+            (d.0..d.2).any(|n| {
+                text(words[n]) == "?"
+                    || (NOT_CONSTANT.contains(&text(words[n]))
+                        && words.get(n + 1).is_some_and(|&j| text(j) == "("))
+            })
+        };
+        if constant && !declarators.iter().any(runtime) {
             return;
         }
         // The first declarator's name ends the type.
@@ -552,7 +745,10 @@ impl<'p> Stage<'p> {
                     Some(n) => write!(ty, "{n}]").unwrap(),
                     None => return,
                 },
-                t if ty.is_empty() || t == "[" => ty.push_str(t),
+                // `T[6]`: the size and its `]` belong to the type.
+                t if ty.is_empty() || t == "[" || ty.contains('[') && !ty.ends_with(']') => {
+                    ty.push_str(t)
+                }
                 // Qualifiers before the type (`highp`...): the type is the last word.
                 t => ty = t.to_owned(),
             }
@@ -613,128 +809,35 @@ impl<'p> Stage<'p> {
             }
         }
         self.replaced.extend(replaced);
-        if constant {
-            self.runtime_consts.extend(names.iter().cloned());
-        }
         self.inits.extend(names);
     }
 
-    /// `struct Name {` at token `open`, whose words start at `from`: its members, to `}`.
-    fn structure(&mut self, from: usize, open: usize) {
-        let words: Vec<&str> = self.tokens[from..open]
-            .iter()
-            .copied()
-            .filter(|t| significant(t))
-            .collect();
-        let [.., "struct", name] = words[..] else {
-            return;
-        };
-        let mut members = Vec::new();
-        let mut decl: Vec<&str> = Vec::new();
-        for &t in &self.tokens[open + 1..] {
-            match t {
-                "}" => break,
-                ";" => {
-                    // `T a, b[2]`, after any precision or other qualifier.
-                    let words: Vec<&str> =
-                        decl.drain(..).filter(|w| !QUALIFIERS.contains(w)).collect();
-                    let Some((ty, rest)) = words.split_first() else {
-                        continue;
-                    };
-                    for d in rest.split(|w| *w == ",") {
-                        if let Some((n, array)) = d.split_first() {
-                            members.push((ty.to_string(), format!("{n}{}", array.concat())));
-                        }
-                    }
-                }
-                t if significant(t) => decl.push(t),
-                _ => {}
-            }
-        }
-        self.structs.insert(name.to_owned(), members);
-    }
-
-    /// `layout(std430, binding = N) [readonly] buffer Name { members } [instance];` (Iris
-    /// Features): bound at set 0, binding 1000 + N; `bool` members stored as `uint`.
-    pub(super) fn buffer_block(&mut self, words: &[usize], open: usize) {
-        let text = |i: usize| self.tokens[i];
+    /// `layout(std430, binding = n) buffer Name {`: an SSBO, in set 4 at its binding. Its
+    /// access qualifiers go, so that every stage binds it alike (read and write).
+    fn buffer_block(&mut self, words: &[usize]) {
         let mut binding = None;
-        let mut layout_at = None;
-        let mut k = 0;
-        while let Some(&i) = words.get(k) {
-            match text(i) {
-                "layout" => {
-                    layout_at = Some(i);
-                    let mut j = k + 1;
-                    while let Some(&t) = words.get(j) {
-                        if text(t) == "binding" {
-                            binding = words
-                                .get(j + 2)
-                                .and_then(|&n| text(n).parse::<u32>().ok());
-                        }
-                        j += 1;
-                        if text(t) == ")" {
-                            // Everything after `layout` up to `)` goes; `layout` is rewritten.
-                            self.removed.push(i + 1..t + 1);
-                            break;
-                        }
-                    }
-                    k = j;
-                    continue;
+        for (k, &i) in words.iter().enumerate() {
+            match self.tokens[i] {
+                "binding" => {
+                    binding = words
+                        .get(k + 2)
+                        .and_then(|&n| self.tokens[n].parse::<u32>().ok());
+                    self.replaced.insert(i, "set = 4, binding".into());
                 }
-                w if MEMORY.contains(&w) && !matches!(w, "readonly" | "writeonly") => {
-                    self.removed.push(i..i + 1);
+                "readonly" | "writeonly" | "restrict" | "coherent" | "volatile" => {
+                    self.removed.push(i..i + 1)
                 }
                 _ => {}
             }
-            k += 1;
         }
-        let Some(binding) = binding else {
-            let at = words.first().copied().unwrap_or(open);
-            self.errors
-                .push(self.error(at, "a storage buffer without `layout(binding = n)`"));
-            return;
-        };
-        let decl = format!("layout(std430, set = 0, binding = {})", 1000 + binding);
-        match layout_at {
-            Some(at) => _ = self.replaced.insert(at, decl),
+        match binding {
+            Some(b) => _ = self.buffers.insert(b),
             None => {
-                let first = words[0];
-                let t = text(first).to_owned();
-                self.replaced.insert(first, format!("{decl} {t}"));
+                let at = words.first().copied().unwrap_or(0);
+                self.errors
+                    .push(self.error(at, "a buffer block needs a binding"));
             }
         }
-        if !self.buffers.contains(&binding) {
-            self.buffers.push(binding);
-        }
-        // The members, to the matching `}`.
-        let mut depth = 0;
-        let mut close = open;
-        let mut statement_start = true;
-        for i in open..self.tokens.len() {
-            match text(i) {
-                "{" => depth += 1,
-                "}" => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = i;
-                        break;
-                    }
-                }
-                ";" => statement_start = true,
-                t if significant(t) && depth == 1 => {
-                    if statement_start && t == "bool" {
-                        self.replaced.insert(i, "uint".into());
-                        if let Some(n) = (i + 1..self.tokens.len()).find(|&j| significant(text(j))) {
-                            self.bool_members.push(text(n).to_owned());
-                        }
-                    }
-                    statement_start = false;
-                }
-                _ => {}
-            }
-        }
-        self.block_ranges.push(open..close + 1);
     }
 
     /// Reads of a `bool` member stored as `uint` compare it with zero; writes convert.
@@ -883,6 +986,39 @@ impl<'p> Stage<'p> {
                 self.removed.push(i..dot + 1);
             }
         }
+    }
+
+    /// A storage buffer's members from `open`, to the matching `}`: `bool` members are stored
+    /// as `uint` (GLSL's bool isn't host-shareable).
+    fn buffer_bools(&mut self, open: usize) {
+        let text = |i: usize| self.tokens[i];
+        let mut depth = 0;
+        let mut close = open;
+        let mut statement_start = true;
+        for i in open..self.tokens.len() {
+            match text(i) {
+                "{" => depth += 1,
+                "}" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = i;
+                        break;
+                    }
+                }
+                ";" => statement_start = true,
+                t if significant(t) && depth == 1 => {
+                    if statement_start && t == "bool" {
+                        self.replaced.insert(i, "uint".into());
+                        if let Some(n) = (i + 1..self.tokens.len()).find(|&j| significant(text(j))) {
+                            self.bool_members.push(text(n).to_owned());
+                        }
+                    }
+                    statement_start = false;
+                }
+                _ => {}
+            }
+        }
+        self.block_ranges.push(open..close + 1);
     }
 
     /// A function definition: remember its body and return type.
@@ -1172,6 +1308,41 @@ impl<'p> Stage<'p> {
         for (i, t) in after {
             self.after.entry(i).or_default().push_str(&t);
         }
+    }
+
+    /// `struct Name {` at token `open`, whose words start at `from`: its members, to `}`.
+    fn structure(&mut self, from: usize, open: usize) {
+        let words: Vec<&str> = self.tokens[from..open]
+            .iter()
+            .copied()
+            .filter(|t| significant(t))
+            .collect();
+        let [.., "struct", name] = words[..] else {
+            return;
+        };
+        let mut members = Vec::new();
+        let mut decl: Vec<&str> = Vec::new();
+        for &t in &self.tokens[open + 1..] {
+            match t {
+                "}" => break,
+                ";" => {
+                    // `T a, b[2]`, after any precision or other qualifier.
+                    let words: Vec<&str> =
+                        decl.drain(..).filter(|w| !QUALIFIERS.contains(w)).collect();
+                    let Some((ty, rest)) = words.split_first() else {
+                        continue;
+                    };
+                    for d in rest.split(|w| *w == ",") {
+                        if let Some((n, array)) = d.split_first() {
+                            members.push((ty.to_string(), format!("{n}{}", array.concat())));
+                        }
+                    }
+                }
+                t if significant(t) => decl.push(t),
+                _ => {}
+            }
+        }
+        self.structs.insert(name.to_owned(), members);
     }
 
     /// A function definition or prototype: remember which parameters are samplers.
