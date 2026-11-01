@@ -2751,6 +2751,76 @@ index 000000000..dccc41f44
 +    }
 +    pp.entities = Some(entities);
 +}
+diff --git a/crates/horizon-client-render/src/gfx/pack_sky.rs b/crates/horizon-client-render/src/gfx/pack_sky.rs
+index fa0a85a0a..a67a5bc22 100644
+--- a/crates/horizon-client-render/src/gfx/pack_sky.rs
++++ b/crates/horizon-client-render/src/gfx/pack_sky.rs
+@@ -134,6 +134,10 @@ pub(super) struct Part {
+ 
+ /// A disc fan at height `y`, radius 512, as triangles (SkyRenderer's sky and void discs).
+ fn disc(y: f32, kind: u32, out: &mut Vec<Vertex>) {
++    // Iris Features: the sky disc comes with Iris's horizon.
++    if y > 0.0 && kind == SKY {
++        iris_sky::horizon(out);
++    }
+     let sign = y.signum();
+     let rim = |i: i32| {
+         let a = (i as f32).to_radians();
+@@ -151,6 +155,54 @@ fn disc(y: f32, kind: u32, out: &mut Vec<Vertex>) {
+     }
+ }
+ 
++mod iris_sky {
++    //! Iris's horizon (`HorizonRenderer`): an octagonal prism around the camera from 16 below
++    //! to 16 above it, and a plane 16 below, drawn with the sky disc. Vanilla's disc ends 1.8
++    //! degrees above the horizon; without the horizon the space below kept colortex0's clear
++    //! colour (the fog colour), where packs that colour their sky by direction expect their
++    //! sky (a band between distant terrain and the sky with Complementary and its kin).
++    use super::*;
++
++    const TOP: f32 = 16.0;
++    const BOTTOM: f32 = -16.0;
++    /// Iris's radius is the render distance; 256 blocks keeps the prism's top (3.6 degrees)
++    /// over the disc's rim whatever the distance.
++    const RADIUS: f32 = 256.0;
++
++    fn quad(out: &mut Vec<Vertex>, [x1, z1]: [f32; 2], [x2, z2]: [f32; 2], y: [f32; 2]) {
++        let v = |x: f32, y: f32, z: f32| Vertex {
++            pos: [x, y, z],
++            kind: SKY,
++        };
++        let [a, b, c, d] = [v(x1, y[0], z1), v(x1, y[1], z1), v(x2, y[1], z2), v(x2, y[0], z2)];
++        out.extend([a, b, c, a, c, d]);
++    }
++
++    pub(super) fn horizon(out: &mut Vec<Vertex>) {
++        // The prism's eight sides.
++        let corner = |i: i32| {
++            let a = (22.5 + 45.0 * i as f32).to_radians();
++            [RADIUS * a.cos(), RADIUS * a.sin()]
++        };
++        for i in 0..8 {
++            quad(out, corner(i), corner(i + 1), [BOTTOM, TOP]);
++        }
++        // The plane below, in tiles of 64 out to 384 (as Iris's).
++        for x in (-384..384).step_by(64) {
++            for z in (-384..384).step_by(64) {
++                let (x, z) = (x as f32, z as f32);
++                let y = [BOTTOM, BOTTOM];
++                let v = |x: f32, z: f32| Vertex {
++                    pos: [x, y[0], z],
++                    kind: SKY,
++                };
++                let [a, b, c, d] = [v(x, z), v(x + 64.0, z), v(x + 64.0, z + 64.0), v(x, z + 64.0)];
++                out.extend([a, b, c, a, c, d]);
++            }
++        }
++    }
++}
++
+ pub(super) struct PackSky {
+     vertices: wgpu::Buffer,
+     celestial: wgpu::Buffer,
 diff --git a/crates/horizon-client-render/src/gfx/pack_uniforms.rs b/crates/horizon-client-render/src/gfx/pack_uniforms.rs
 index 59f8bb578..e435a4721 100644
 --- a/crates/horizon-client-render/src/gfx/pack_uniforms.rs

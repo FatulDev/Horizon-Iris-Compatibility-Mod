@@ -145,3 +145,16 @@ fn iris_buffer_blend() -> ::core::ops::ControlFlow<wgpu::BlendState> {
     }
 }
 ''', [])
+
+# Iris's horizon (`HorizonRenderer`) with the sky disc: the band between distant terrain and
+# the sky, where the clear colour showed instead of the pack's sky.
+_sky = dev(RE + 'gfx/pack_sky.rs')
+_inner = _sky[_sky.index('mod iris_sky {\n') + len('mod iris_sky {\n'):_sky.index('\n}\n\npub(super) struct PackSky')]
+module('render-iris-sky', RE + 'gfx/pack_sky.rs', 'iris_sky', re.sub(r'^(\s*)//!', r'\1//', deindent(_inner), flags=re.M))
+hook('sky-horizon', 'horizon_client_render::gfx::pack_sky::disc', '''\
+fn iris_sky_horizon(y: f32, kind: u32, out: &mut Vec<Vertex>) {
+    if y > 0.0 && kind == SKY {
+        iris_sky::horizon(out);
+    }
+}
+''', [binding('y', 'f32', 'y'), binding('kind', 'u32', 'kind'), binding('out', '&mut Vec<Vertex>', '&mut *out')], cancellable=False)

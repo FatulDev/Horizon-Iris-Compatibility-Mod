@@ -68,6 +68,7 @@ The packs in brackets are examples of packs that needed each change.
 | Block ids for floodfill | Flat terrain knows a face's sprite, not its block. Ids are now picked by sprite **and** by how the face glows, so an unlit furnace isn't the lit one and a pumpkin isn't a jack o'lantern. A face whose sprite blocks of other ids share is left out of voxels when the block's other faces place it (one block's faces carried two ids, and lights flickered with draw order). Redstone dust takes its power's id from its tint |
 | Shader profiles | A profile's values are set even when written differently from the option's list (`0.5` for `0.50`) or not in it at all, as in Iris (the profile button worked once, then kept starting over) |
 | Per-buffer blending | `blend.<program>.<buffer>` (Iris): one buffer's own blend, or `off`, apart from the program's. Packs keep their data buffers unblended under translucent geometry (Eclipse's colortex11, Pegasus's colortex1, Complementary's colortex4 and 8); Horizon blended every buffer alike |
+| Iris's horizon | The sky program also draws Iris's horizon (`HorizonRenderer`): an octagonal prism around the camera from 16 blocks below it to 16 above, and a plane 16 below. Vanilla's sky disc ends 1.8 degrees above the horizon, and the space under it kept colortex0's clear colour (the fog colour) where packs that colour their sky by direction expect their sky: the band between distant terrain and the sky (Complementary, Rethinking Voxels, BSL) |
 | `cloudHeight` | The clouds' altitude (it read 0: Complementary drew its clouds at the bottom of the world, and none in the sky) |
 | Options in sizes | `image.*`, `bufferObject.*` and `size.buffer.*` read the pack's options as their values, as Iris preprocesses the whole file (Complementary's voxel images, sized by its colored lighting option) |
 | Storage blocks in older GLSL | `buffer Name {` in a `#version 130` program with `GL_ARB_shader_storage_buffer_object` stays a storage block (Complementary's `composite` was dropped with colored lighting or voxel reflections on) |
@@ -85,8 +86,6 @@ Reported in the game:
 - Block outline: not showing with Photon, Bliss, Eclipse, Mellow and BSL in the game, though it
   draws in the test setup. The log now says what it draws into (`block outline drawn ... into
   colortexN`), or why it doesn't.
-- Complementary, Rethinking Voxels: a band between distant terrain and the horizon. It shows in
-  the test setup too, where it is the sky below the horizon beyond the terrain.
 - Complementary: placed stained glass solid (per-buffer blending may fix it).
 - Sildur's: water reflections white.
 - RedHat: the water warps the view, with a flat ring that follows the camera.
