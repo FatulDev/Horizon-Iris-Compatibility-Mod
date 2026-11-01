@@ -20,4 +20,10 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Files under ref/ and reference.patch are from Horizon (horizon-rust/horizon), MIT.
+Files under ref/ and reference.patch are from Horizon (horizon-rust/horizon), under the MIT
+License above:
+
+Copyright (c) 2026 Ludovic Marie and the Horizon contributors
+
+vendor/naga-glsl is naga's GLSL frontend (gfx-rs/wgpu), under MIT or Apache-2.0; both licences
+are in that folder.
