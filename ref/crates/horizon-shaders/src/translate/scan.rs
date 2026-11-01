@@ -316,7 +316,7 @@ impl<'p> Stage<'p> {
                 if sig.get(k + 1).map(|&i| s.tokens[i]) != Some("(") {
                     continue;
                 }
-                let (mut depth, mut commas, mut second, mut close) = (0i32, 0, None, None);
+                let (mut depth, mut commas, mut first, mut second, mut close) = (0i32, 0, None, None, None);
                 for j in k + 1..sig.len() {
                     match s.tokens[sig[j]] {
                         "(" | "[" | "{" => depth += 1,
@@ -329,6 +329,9 @@ impl<'p> Stage<'p> {
                         }
                         "," if depth == 1 => {
                             commas += 1;
+                            if commas == 1 {
+                                first = Some(j);
+                            }
                             if commas == 2 {
                                 second = Some(j);
                             }
@@ -336,7 +339,50 @@ impl<'p> Stage<'p> {
                         _ => {}
                     }
                 }
-                if let (Some(c2), Some(cl), 2) = (second, close, commas) {
+                // Iris Features: an atomic whose old value is used (Rethinking Voxels' shadow
+                // pass tests the bit it set): `imageStore` has none, so the old value is read
+                // into a variable before the statement, the store goes there too, and the call
+                // reads the variable.
+                let prev = k.checked_sub(1).map(|p| s.tokens[sig[p]]);
+                let used = !matches!(prev, None | Some(";" | "{" | "}" | ")" | "else" | ":"));
+                let text = |a: usize, b: usize| s.tokens[sig[a]..sig[b]].concat();
+                let start = used.then(|| {
+                    let mut d = 0i32;
+                    let mut p = k;
+                    while p > 0 {
+                        p -= 1;
+                        match s.tokens[sig[p]] {
+                            ")" | "]" => d += 1,
+                            "(" | "[" if d > 0 => d -= 1,
+                            ";" | "{" | "}" if d == 0 => return Some(p + 1),
+                            _ => {}
+                        }
+                    }
+                    Some(0)
+                });
+                let start = start.flatten().filter(|&st| s.tokens[sig[st]] != "else");
+                if let (Some(c1), Some(c2), Some(cl), 2, Some(st)) = (first, second, close, commas, start) {
+                    let image = text(k + 2, c1);
+                    let name = image.trim();
+                    let ty = sig
+                        .windows(2)
+                        .find(|w| s.tokens[w[1]] == name && s.tokens[w[0]].contains("image"))
+                        .map_or("float", |w| match s.tokens[w[0]].chars().next() {
+                            Some('i') => "int",
+                            Some('u') => "uint",
+                            _ => "float",
+                        });
+                    let old = format!("hz_atomic_old_{}", sig[k]);
+                    let coords = text(c1 + 1, c2);
+                    let value = text(c2 + 1, cl);
+                    let hoisted = format!(
+                        "{ty} {old} = imageLoad({image}, {coords}).x; \
+                         imageStore({image}, {coords}, hz_atomic_{fun}({value})); "
+                    );
+                    s.before.entry(sig[st]).or_default().push_str(&hoisted);
+                    s.replaced.insert(sig[k], old);
+                    s.removed.push(sig[k] + 1..sig[cl] + 1);
+                } else if let (Some(c2), Some(cl), 2, false) = (second, close, commas, used) {
                     s.replaced.insert(sig[k], "imageStore".into());
                     s.replaced.insert(sig[c2], format!(", hz_atomic_{fun}("));
                     s.replaced.insert(sig[cl], "))".into());

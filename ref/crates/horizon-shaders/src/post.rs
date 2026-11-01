@@ -737,14 +737,16 @@ pub fn load_post(
             p
         });
     // Iris Features: what Horizon has no place for. Held translucent items draw with
-    // `gbuffers_hand_water` when the pack has it (no fallback: without it they stay with
-    // `gbuffers_hand`), and the weather program again, to draw without depth unless
-    // `rain.depth=true` (Iris writes rain's depth only then).
+    // `gbuffers_hand_water`, or `gbuffers_hand` as Iris falls back, blended as translucent
+    // items are unless `blend.gbuffers_hand_water` says otherwise (through `gbuffers_hand`
+    // alone held stained glass was a solid colour), and the weather program again, to draw
+    // without depth unless `rain.depth=true` (Iris writes rain's depth only then).
     let mut extra = Vec::new();
     if let Some(i) = inputs.hand.as_ref()
-        && let Some(mut p) = gbuffers(&["gbuffers_hand_water"], Group::Translucent, i)
+        && let Some(mut p) =
+            gbuffers(&["gbuffers_hand_water", "gbuffers_hand"], Group::Translucent, i)
     {
-        p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
+        p.blend = blend(properties, "gbuffers_hand_water").unwrap_or(Some(TRANSLUCENT_BLEND));
         extra.push(("hand_water".to_owned(), p));
     }
     // Block-breaking cracks with `gbuffers_damagedblock` (Iris's chain: terrain's after it),

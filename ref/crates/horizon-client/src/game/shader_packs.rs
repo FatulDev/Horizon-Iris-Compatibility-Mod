@@ -43,13 +43,28 @@ pub(super) fn read_shader_options(
     let text = pack.read_text("shaders.properties").unwrap_or_default();
     let properties = Properties::parse(&text, &horizon_shaders::with_options(&pack, macros));
     let screens = horizon_shaders::Screens::parse(&properties, &options);
-    Some(ShaderOptions::new(
+    let mut shader_options = ShaderOptions::new(
         name.to_owned(),
         options,
         screens,
         lang,
-        chosen,
-    ))
+        chosen.clone(),
+    );
+    // Iris Features: a chosen value the option's list lacks stays chosen, as Iris keeps it
+    // (a profile sets them: Eclipse's VERY_HIGH writes `shadowMapResolution:3172`). Dropped,
+    // the profile no longer matched once the page opened again, and the next click started
+    // over from the first profile.
+    for (option, value) in chosen {
+        if shader_options
+            .options
+            .get(&option)
+            .is_some_and(|o| o.default != value)
+            && !shader_options.chosen.contains_key(&option)
+        {
+            shader_options.chosen.insert(option, value);
+        }
+    }
+    Some(shader_options)
 }
 
 /// Saves the values chosen on the Shader Options page; none chosen removes the file.

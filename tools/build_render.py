@@ -158,3 +158,8 @@ fn iris_sky_horizon(y: f32, kind: u32, out: &mut Vec<Vertex>) {
     }
 }
 ''', [binding('y', 'f32', 'y'), binding('kind', 'u32', 'kind'), binding('out', '&mut Vec<Vertex>', '&mut *out')], cancellable=False)
+
+# Shader profiles: a profile matches with its values as numbers too, and chosen values the
+# option's list lacks stay chosen (Eclipse's profiles stopped cycling after one click).
+replace('current-profile', RE + 'shader_options.rs', r'^    pub fn current_profile\(', 'horizon_client_render::shader_options::ShaderOptions::current_profile', owner='ShaderOptions')
+replace('read-shader-options', GA + 'game/shader_packs.rs', r'^pub\(super\) fn read_shader_options\(', 'horizon_client::game::shader_packs::read_shader_options')

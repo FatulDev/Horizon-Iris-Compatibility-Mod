@@ -167,8 +167,22 @@ impl ShaderOptions {
     }
 
     pub fn current_profile(&self) -> Option<&str> {
+        // Iris Features: a value matches when it is the profile's as a number too (`0.50` for
+        // the profile's `0.5`): `next_profile` sets the list's spelling, and an exact match
+        // never found the profile it had just set, so the next click started over.
+        let same = |a: &str, b: &str| {
+            a.trim() == b.trim()
+                || matches!((a.trim().parse::<f64>(), b.trim().parse::<f64>()), (Ok(x), Ok(y)) if x == y)
+        };
         self.screens
-            .current_profile(|n| self.value(n).map(str::to_owned))
+            .profiles
+            .iter()
+            .find(|(_, values)| {
+                values
+                    .iter()
+                    .all(|(n, v)| self.value(n).is_some_and(|have| same(have, v)))
+            })
+            .map(|(name, _)| name.as_str())
     }
 
     pub fn reset(&mut self) {
@@ -295,6 +309,45 @@ impl ShaderOptions {
 mod tests {
     use super::*;
     use horizon_shaders::{Macros, Properties};
+
+    /// `IRIS_TEST_PACK=<dir>`: steps a real pack's profiles, as the button does.
+    #[test]
+    #[ignore]
+    fn steps_a_real_packs_profiles() {
+        let Ok(dir) = std::env::var("IRIS_TEST_PACK") else { return };
+        let pack = horizon_shaders::Pack::open(std::path::Path::new(&dir)).unwrap();
+        let options = horizon_shaders::options(&pack);
+        let lang = Lang::load(&pack, "en_us");
+        let mut chosen = BTreeMap::new();
+        for step in 0..12 {
+            let p = horizon_shaders::Pack::open(std::path::Path::new(&dir)).unwrap().with_chosen(chosen.clone());
+            let text = p.read_text("shaders.properties").unwrap_or_default();
+            let properties = Properties::parse(&text, &horizon_shaders::with_options(&p, &Macros::standard()));
+            let screens = Screens::parse(&properties, &options);
+            let mut o = ShaderOptions::new("t".into(), options.clone(), screens, lang.clone(), chosen.clone());
+            for (n, v) in &chosen {
+                if o.options.get(n).is_some_and(|x| &x.default != v) && !o.chosen.contains_key(n) {
+                    o.chosen.insert(n.clone(), v.clone());
+                }
+            }
+            println!("step {step}: current {:?}", o.current_profile());
+            if o.current_profile().is_none() {
+                for (name, values) in o.screens.profiles.iter().filter(|p| p.0 == "VERY_HIGH") {
+                    let bad: Vec<_> = values.iter().filter(|(n, v)| o.value(n) != Some(v.as_str())).map(|(n, v)| format!("{n}={v} have {:?} chosen {:?}", o.value(n), chosen.get(n))).take(6).collect();
+                    println!("      {name}: {bad:?}");
+                }
+            }
+            o.next_profile();
+            println!("   -> after next: {:?}", o.current_profile());
+            if o.current_profile().is_none() {
+                for (name, values) in &o.screens.profiles {
+                    let bad: Vec<_> = values.iter().filter(|(n, v)| o.value(n) != Some(v.as_str())).map(|(n, v)| format!("{n}={v} have {:?}", o.value(n))).take(4).collect();
+                    println!("      {name}: {bad:?}");
+                }
+            }
+            chosen = o.chosen.clone();
+        }
+    }
 
     fn options() -> ShaderOptions {
         let switch = |name: &str, default: &str| PackOption {

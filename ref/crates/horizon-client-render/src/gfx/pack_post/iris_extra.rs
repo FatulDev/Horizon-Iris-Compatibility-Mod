@@ -22,6 +22,7 @@ struct Lines {
 
 static LINES: std::sync::Mutex<Option<Lines>> = std::sync::Mutex::new(None);
 static OUTLINE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static OUTLINE_PLACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const SHADER: &str = "
 struct U { m: mat4x4<f32> };
@@ -90,6 +91,16 @@ pub fn draw_outline(pp: &PackPost, device: &wgpu::Device, encoder: &mut wgpu::Co
         1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
     ]);
     let m = depth * projection * model_view;
+    // Once per pack: where the first edge lands (x, y -1..1 on screen, depth 0..1), for reports.
+    if !OUTLINE_PLACED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let e = edges[0];
+        let at = m * glam::Vec4::new(e[0], e[1], e[2], 1.0);
+        log::info!(
+            "shader pack: block outline's first corner at {:?} from the camera lands at {:?}",
+            [e[0], e[1], e[2]],
+            (at.truncate() / at.w).to_array()
+        );
+    }
     let mut lines = LINES.lock().unwrap_or_else(|e| e.into_inner());
     if lines.as_ref().is_none_or(|l| l.format != format || l.depth != depth_format) {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -201,6 +212,7 @@ static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// A pack was built: its extra passes are built again.
 pub fn new_pack() {
     OUTLINE_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
+    OUTLINE_PLACED.store(false, std::sync::atomic::Ordering::Relaxed);
     // A new pack may come with a new device: the outline's pipeline is made again.
     *LINES.lock().unwrap_or_else(|e| e.into_inner()) = None;
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

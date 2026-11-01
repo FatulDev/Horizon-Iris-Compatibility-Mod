@@ -4311,7 +4311,8 @@ pub(crate) mod iris_tests {
                 }
                 match std::env::var("IRIS_TEST_GLOW").as_deref() {
                     Ok("tier") => set(1, [-1, -1, 196, -1, -1, -1, -1, -1, -1], false, 1 << 2),
-                    Ok(_) => set(1, [196; GLOW_CODES], false, all),
+                    // `IRIS_TEST_GLOW=<id>`: the pillars as that block (the pack's glowstone).
+                    Ok(v) => set(1, [v.parse().unwrap_or(196); GLOW_CODES], false, all),
                     Err(_) => {}
                 }
                 let world = World {

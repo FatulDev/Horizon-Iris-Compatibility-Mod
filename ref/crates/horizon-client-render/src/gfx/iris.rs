@@ -88,7 +88,8 @@ pub fn set_crumbling(rect: [f32; 4]) {
 /// UV that repeats over the block and their stage sprite's origin in the light bytes
 /// (`breaking::stage_light`), which entity.wgsl wraps per pixel. A pack samples the atlas at
 /// the UV as given, so each quad's UVs become atlas UVs inside its stage's sprite here (they
-/// read the whole atlas), and the light full: the pass is unlit.
+/// read the whole atlas), the light full (the pass is unlit), and the quads pulled toward the
+/// camera.
 pub fn crack_uvs(quads: &mut [crate::gfx::Vertex]) {
     let [_, _, w, h] = *CRUMBLING.lock().unwrap_or_else(|e| e.into_inner());
     for quad in quads.chunks_exact_mut(4) {
@@ -107,6 +108,11 @@ pub fn crack_uvs(quads: &mut [crate::gfx::Vertex]) {
                 origin[1] + (v.uv[1] - base[1]).clamp(0.0, 1.0) * h,
             ];
             v.light = 240 | 240 << 8;
+            // Pulled toward the camera as vanilla's crumbling layer is
+            // (`VIEW_OFFSET_Z_LAYERING`, positions being camera-relative), so the cracks don't
+            // fight the block's own depth (they flickered); a little more than vanilla's, as
+            // packs jitter terrain for their TAA.
+            v.pos = v.pos.map(|c| c * 0.999);
         }
     }
 }

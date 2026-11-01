@@ -61,12 +61,12 @@ The packs in brackets are examples of packs that needed each change.
 | `mc_midTexCoord` | The middle of the quad's own texture coordinates, not of its sprite (stretched grass sides) |
 | Distant terrain | While a pack runs, distant faces are meshed a block each (grass sides stretched across far hills) |
 | Block outline | Drawn by the mod after translucent terrain, into the buffer it writes, with the pack's own camera, black at 40% as vanilla's; Horizon's own outline (drawn into its world pass, where it floated at an angle or didn't show) is skipped while a pack runs |
-| Held translucent items | Stained glass and other translucent items in hand draw with `gbuffers_hand_water` when the pack has it, blended over the scene, back faces culled as vanilla draws items, as in Iris (they were grainy through `gbuffers_hand`; Eclipse) |
-| Block-breaking cracks | Drawn with `gbuffers_damagedblock` (or Iris's fallbacks: terrain, textured_lit, textured, basic), multiplied into the block under them as vanilla's are unless the pack sets its own blend. Each crack samples its own destroy stage's sprite (0.1.28 drew the whole atlas over the block) |
+| Held translucent items | Stained glass and other translucent items in hand draw with `gbuffers_hand_water`, or `gbuffers_hand` as Iris falls back (they were a solid colour in packs without `gbuffers_hand_water`), blended over the scene, back faces culled as vanilla draws items, as in Iris (they were grainy through `gbuffers_hand`; Eclipse) |
+| Block-breaking cracks | Drawn with `gbuffers_damagedblock` (or Iris's fallbacks: terrain, textured_lit, textured, basic), multiplied into the block under them as vanilla's are unless the pack sets its own blend. Each crack samples its own destroy stage's sprite (0.1.28 drew the whole atlas over the block), pulled toward the camera as vanilla's crumbling layer is (they flickered against the block) |
 | Translucent particles | `gbuffers_particles_translucent` when the pack has it, after the translucent terrain |
 | Rain depth | Rain and snow write depth only with `rain.depth=true`, as in Iris. A frame without weather keeps the pack's weather passes (they were lost after the first clear frame, and Horizon drew its own rain into the pack's buffers) |
 | Block ids for floodfill | Flat terrain knows a face's sprite, not its block. Ids are now picked by sprite **and** by how the face glows, so an unlit furnace isn't the lit one and a pumpkin isn't a jack o'lantern. A face whose sprite blocks of other ids share is left out of voxels when the block's other faces place it (one block's faces carried two ids, and lights flickered with draw order). Redstone dust takes its power's id from its tint |
-| Shader profiles | A profile's values are set even when written differently from the option's list (`0.5` for `0.50`) or not in it at all, as in Iris (the profile button worked once, then kept starting over) |
+| Shader profiles | A profile's values are set, and the profile recognised again, even when written differently from the option's list (`0.5` for `0.50`) or not in it at all (Eclipse's `shadowMapResolution:3172`), as in Iris; such values stay chosen when the page opens again (the profile button worked once, then kept starting over) |
 | Per-buffer blending | `blend.<program>.<buffer>` (Iris): one buffer's own blend, or `off`, apart from the program's. Packs keep their data buffers unblended under translucent geometry (Eclipse's colortex11, Pegasus's colortex1, Complementary's colortex4 and 8); Horizon blended every buffer alike |
 | Iris's horizon | The sky program also draws Iris's horizon (`HorizonRenderer`): an octagonal prism around the camera from 16 blocks below it to 16 above, and a plane 16 below. Vanilla's sky disc ends 1.8 degrees above the horizon, and the space under it kept colortex0's clear colour (the fog colour) where packs that colour their sky by direction expect their sky: the band between distant terrain and the sky (Complementary, Rethinking Voxels, BSL) |
 | `cloudHeight` | The clouds' altitude (it read 0: Complementary drew its clouds at the bottom of the world, and none in the sky) |
@@ -75,29 +75,29 @@ The packs in brackets are examples of packs that needed each change.
 | A variable named as its struct | `faceData faceData = ...;` (Complementary's voxel reflections) |
 | `fogColor`, `skyColor` undeclared | Declared as Iris's uniforms when a program uses them without a declaration (Luster) |
 | Narrowed outputs | The alpha test reads a narrowed location-0 output (`vec3 shadowcolor0_out`) by its name (Photon's shadow programs were dropped) |
+| Atomics whose old value is used | `if ((imageAtomicOr(img, c, bit) >> 16 & 1) == 0)`: the old value is read before the statement and the atomic done there (Rethinking Voxels' shadow pass, which voxelises the world for its block lights, failed to build) |
 | GPU errors | Logged once each instead of ending the game |
 
 ## Known issues
 
 Reported in the game:
 
-- Eclipse, Pegasus, Photon: held glass, stained glass and ice look wrong. 0.1.29 adds per-buffer
-  blending and culls their back faces; not confirmed in the game yet.
-- Block outline: not showing with Photon, Bliss, Eclipse, Mellow and BSL in the game, though it
-  draws in the test setup. The log now says what it draws into (`block outline drawn ... into
-  colortexN`), or why it doesn't.
-- Complementary: placed stained glass solid (per-buffer blending may fix it).
+- Block outline: not showing in the game, though it draws in the test setup. The log says what
+  it draws into, and since 0.1.31 where its first corner lands on the screen (`block outline's
+  first corner ... lands at`).
+- Eclipse: smoke and maybe other particles reflect light.
+- Pegasus: the water simulation looks frame-rate limited, with a repeating grid.
+- Reverie: static noise, flat untextured water, a flat sky, no light from blocks, jittery leaves.
+- Solas: light flickers on blocks beside a light source; the night sky turns white.
 - Sildur's: water reflections white.
 - RedHat: the water warps the view, with a flat ring that follows the camera.
-- Reverie: static noise, flat untextured water, a flat sky, no light from blocks.
-- Rethinking Voxels: torches and campfires light themselves, not the blocks around them.
-- Solas: light flickers on blocks beside a light source; the night sky turns white.
 - Alpha Piscium: transparent terrain and flat water. It needs subgroup operations
   (`subgroupElect`, `subgroupMin`...) that the GLSL frontend doesn't have yet, plus
   `SEPARATE_HARDWARE_SAMPLERS` and `HIGHER_SHADOWCOLOR`.
-- Nostalgia 5.1: renders, then the game crashes (the GPU device is lost).
-- Luster: a fixed cloud image and no terrain. It uses buffers past colortex15, which Horizon
-  doesn't have.
+- Nostalgia 5.1: renders, then the screen goes black and the game crashes (the GPU driver
+  resets).
+- Luster: a black world. It renders its lighting into colortex16 to colortex21, and Horizon has
+  16 colour buffers (colortex0 to colortex15); that limit is Horizon's and not one a mod can lift.
 - Just Colored Lighting: caves see-through, no shader effects.
 
 ## Pack status

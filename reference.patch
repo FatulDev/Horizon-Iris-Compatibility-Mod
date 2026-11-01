@@ -39,10 +39,10 @@ index e9990b6da..951dd9fb3 100644
          self.pack_atlas = None;
 diff --git a/crates/horizon-client-render/src/gfx/iris.rs b/crates/horizon-client-render/src/gfx/iris.rs
 new file mode 100644
-index 000000000..34df519ea
+index 000000000..76f550101
 --- /dev/null
 +++ b/crates/horizon-client-render/src/gfx/iris.rs
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,433 @@
 +//! Iris Features: render state the mod's copies of Horizon's functions share: Iris's own
 +//! uniforms (the player), and which buffers the passes built so far write.
 +use super::pack_uniforms::Value;
@@ -133,7 +133,8 @@ index 000000000..34df519ea
 +/// UV that repeats over the block and their stage sprite's origin in the light bytes
 +/// (`breaking::stage_light`), which entity.wgsl wraps per pixel. A pack samples the atlas at
 +/// the UV as given, so each quad's UVs become atlas UVs inside its stage's sprite here (they
-+/// read the whole atlas), and the light full: the pass is unlit.
++/// read the whole atlas), the light full (the pass is unlit), and the quads pulled toward the
++/// camera.
 +pub fn crack_uvs(quads: &mut [crate::gfx::Vertex]) {
 +    let [_, _, w, h] = *CRUMBLING.lock().unwrap_or_else(|e| e.into_inner());
 +    for quad in quads.chunks_exact_mut(4) {
@@ -152,6 +153,11 @@ index 000000000..34df519ea
 +                origin[1] + (v.uv[1] - base[1]).clamp(0.0, 1.0) * h,
 +            ];
 +            v.light = 240 | 240 << 8;
++            // Pulled toward the camera as vanilla's crumbling layer is
++            // (`VIEW_OFFSET_Z_LAYERING`, positions being camera-relative), so the cracks don't
++            // fight the block's own depth (they flickered); a little more than vanilla's, as
++            // packs jitter terrain for their TAA.
++            v.pos = v.pos.map(|c| c * 0.999);
 +        }
 +    }
 +}
@@ -632,7 +638,7 @@ index 25fb917db..b01ca8a47 100644
                          wgpu::TextureDimension::D2
                      },
 diff --git a/crates/horizon-client-render/src/gfx/pack_post.rs b/crates/horizon-client-render/src/gfx/pack_post.rs
-index c6a037b22..459cc0034 100644
+index c6a037b22..5dd5dd71d 100644
 --- a/crates/horizon-client-render/src/gfx/pack_post.rs
 +++ b/crates/horizon-client-render/src/gfx/pack_post.rs
 @@ -797,6 +797,10 @@ fn texture_entry_of(
@@ -762,7 +768,7 @@ index c6a037b22..459cc0034 100644
          self.resize(device, size);
          if let Some((layout, ids)) = &self.block_ids {
              // A page that grew has a new buffer.
-@@ -3831,3 +3863,1411 @@ mod tests {
+@@ -3831,3 +3863,1412 @@ mod tests {
          assert!(source("shadowtex1HW", false, true, false) == Source::ShadowDepth(1, true));
      }
  }
@@ -1214,7 +1220,8 @@ index c6a037b22..459cc0034 100644
 +                }
 +                match std::env::var("IRIS_TEST_GLOW").as_deref() {
 +                    Ok("tier") => set(1, [-1, -1, 196, -1, -1, -1, -1, -1, -1], false, 1 << 2),
-+                    Ok(_) => set(1, [196; GLOW_CODES], false, all),
++                    // `IRIS_TEST_GLOW=<id>`: the pillars as that block (the pack's glowstone).
++                    Ok(v) => set(1, [v.parse().unwrap_or(196); GLOW_CODES], false, all),
 +                    Err(_) => {}
 +                }
 +                let world = World {
@@ -2176,10 +2183,10 @@ index c6a037b22..459cc0034 100644
 +}
 diff --git a/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs b/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs
 new file mode 100644
-index 000000000..dccc41f44
+index 000000000..121cca31f
 --- /dev/null
 +++ b/crates/horizon-client-render/src/gfx/pack_post/iris_extra.rs
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,583 @@
 +// Iris Features: the block outline while a pack runs. Iris draws it after the pack's deferred
 +// programs, into what translucent terrain writes, so the pack neither lights nor reflects it and
 +// it follows the pack's own camera; Horizon's own outline goes into its world pass instead.
@@ -2204,6 +2211,7 @@ index 000000000..dccc41f44
 +
 +static LINES: std::sync::Mutex<Option<Lines>> = std::sync::Mutex::new(None);
 +static OUTLINE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++static OUTLINE_PLACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 +
 +const SHADER: &str = "
 +struct U { m: mat4x4<f32> };
@@ -2272,6 +2280,16 @@ index 000000000..dccc41f44
 +        1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
 +    ]);
 +    let m = depth * projection * model_view;
++    // Once per pack: where the first edge lands (x, y -1..1 on screen, depth 0..1), for reports.
++    if !OUTLINE_PLACED.swap(true, std::sync::atomic::Ordering::Relaxed) {
++        let e = edges[0];
++        let at = m * glam::Vec4::new(e[0], e[1], e[2], 1.0);
++        log::info!(
++            "shader pack: block outline's first corner at {:?} from the camera lands at {:?}",
++            [e[0], e[1], e[2]],
++            (at.truncate() / at.w).to_array()
++        );
++    }
 +    let mut lines = LINES.lock().unwrap_or_else(|e| e.into_inner());
 +    if lines.as_ref().is_none_or(|l| l.format != format || l.depth != depth_format) {
 +        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2383,6 +2401,7 @@ index 000000000..dccc41f44
 +/// A pack was built: its extra passes are built again.
 +pub fn new_pack() {
 +    OUTLINE_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
++    OUTLINE_PLACED.store(false, std::sync::atomic::Ordering::Relaxed);
 +    // A new pack may come with a new device: the outline's pipeline is made again.
 +    *LINES.lock().unwrap_or_else(|e| e.into_inner()) = None;
 +    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2894,10 +2913,10 @@ index b4dee5bf6..e6355261f 100644
      if pieces > MAX_PIECES {
          let extent = (rect.u1 - rect.u0).max(rect.v1 - rect.v0);
 diff --git a/crates/horizon-client-render/src/shader_options.rs b/crates/horizon-client-render/src/shader_options.rs
-index 04a7705fd..255f061ca 100644
+index 04a7705fd..d81c7ed2a 100644
 --- a/crates/horizon-client-render/src/shader_options.rs
 +++ b/crates/horizon-client-render/src/shader_options.rs
-@@ -139,8 +139,30 @@ impl ShaderOptions {
+@@ -139,14 +139,50 @@ impl ShaderOptions {
              .iter()
              .position(|(n, _)| Some(n) == current.as_ref());
          let (_, values) = profiles[at.map_or(0, |i| (i + 1) % profiles.len())].clone();
@@ -2929,11 +2948,110 @@ index 04a7705fd..255f061ca 100644
          }
      }
  
+     pub fn current_profile(&self) -> Option<&str> {
++        // Iris Features: a value matches when it is the profile's as a number too (`0.50` for
++        // the profile's `0.5`): `next_profile` sets the list's spelling, and an exact match
++        // never found the profile it had just set, so the next click started over.
++        let same = |a: &str, b: &str| {
++            a.trim() == b.trim()
++                || matches!((a.trim().parse::<f64>(), b.trim().parse::<f64>()), (Ok(x), Ok(y)) if x == y)
++        };
+         self.screens
+-            .current_profile(|n| self.value(n).map(str::to_owned))
++            .profiles
++            .iter()
++            .find(|(_, values)| {
++                values
++                    .iter()
++                    .all(|(n, v)| self.value(n).is_some_and(|have| same(have, v)))
++            })
++            .map(|(name, _)| name.as_str())
+     }
+ 
+     pub fn reset(&mut self) {
+@@ -274,6 +310,45 @@ mod tests {
+     use super::*;
+     use horizon_shaders::{Macros, Properties};
+ 
++    /// `IRIS_TEST_PACK=<dir>`: steps a real pack's profiles, as the button does.
++    #[test]
++    #[ignore]
++    fn steps_a_real_packs_profiles() {
++        let Ok(dir) = std::env::var("IRIS_TEST_PACK") else { return };
++        let pack = horizon_shaders::Pack::open(std::path::Path::new(&dir)).unwrap();
++        let options = horizon_shaders::options(&pack);
++        let lang = Lang::load(&pack, "en_us");
++        let mut chosen = BTreeMap::new();
++        for step in 0..12 {
++            let p = horizon_shaders::Pack::open(std::path::Path::new(&dir)).unwrap().with_chosen(chosen.clone());
++            let text = p.read_text("shaders.properties").unwrap_or_default();
++            let properties = Properties::parse(&text, &horizon_shaders::with_options(&p, &Macros::standard()));
++            let screens = Screens::parse(&properties, &options);
++            let mut o = ShaderOptions::new("t".into(), options.clone(), screens, lang.clone(), chosen.clone());
++            for (n, v) in &chosen {
++                if o.options.get(n).is_some_and(|x| &x.default != v) && !o.chosen.contains_key(n) {
++                    o.chosen.insert(n.clone(), v.clone());
++                }
++            }
++            println!("step {step}: current {:?}", o.current_profile());
++            if o.current_profile().is_none() {
++                for (name, values) in o.screens.profiles.iter().filter(|p| p.0 == "VERY_HIGH") {
++                    let bad: Vec<_> = values.iter().filter(|(n, v)| o.value(n) != Some(v.as_str())).map(|(n, v)| format!("{n}={v} have {:?} chosen {:?}", o.value(n), chosen.get(n))).take(6).collect();
++                    println!("      {name}: {bad:?}");
++                }
++            }
++            o.next_profile();
++            println!("   -> after next: {:?}", o.current_profile());
++            if o.current_profile().is_none() {
++                for (name, values) in &o.screens.profiles {
++                    let bad: Vec<_> = values.iter().filter(|(n, v)| o.value(n) != Some(v.as_str())).map(|(n, v)| format!("{n}={v} have {:?}", o.value(n))).take(4).collect();
++                    println!("      {name}: {bad:?}");
++                }
++            }
++            chosen = o.chosen.clone();
++        }
++    }
++
+     fn options() -> ShaderOptions {
+         let switch = |name: &str, default: &str| PackOption {
+             name: name.into(),
 diff --git a/crates/horizon-client/src/game/shader_packs.rs b/crates/horizon-client/src/game/shader_packs.rs
-index d0fe7a991..8c6c1c4b7 100644
+index d0fe7a991..c58d8c3a1 100644
 --- a/crates/horizon-client/src/game/shader_packs.rs
 +++ b/crates/horizon-client/src/game/shader_packs.rs
-@@ -210,8 +210,8 @@ impl Game<'_> {
+@@ -43,13 +43,28 @@ pub(super) fn read_shader_options(
+     let text = pack.read_text("shaders.properties").unwrap_or_default();
+     let properties = Properties::parse(&text, &horizon_shaders::with_options(&pack, macros));
+     let screens = horizon_shaders::Screens::parse(&properties, &options);
+-    Some(ShaderOptions::new(
++    let mut shader_options = ShaderOptions::new(
+         name.to_owned(),
+         options,
+         screens,
+         lang,
+-        chosen,
+-    ))
++        chosen.clone(),
++    );
++    // Iris Features: a chosen value the option's list lacks stays chosen, as Iris keeps it
++    // (a profile sets them: Eclipse's VERY_HIGH writes `shadowMapResolution:3172`). Dropped,
++    // the profile no longer matched once the page opened again, and the next click started
++    // over from the first profile.
++    for (option, value) in chosen {
++        if shader_options
++            .options
++            .get(&option)
++            .is_some_and(|o| o.default != value)
++            && !shader_options.chosen.contains_key(&option)
++        {
++            shader_options.chosen.insert(option, value);
++        }
++    }
++    Some(shader_options)
+ }
+ 
+ /// Saves the values chosen on the Shader Options page; none chosen removes the file.
+@@ -210,8 +225,8 @@ impl Game<'_> {
                          let table = block_id_table(&self.pack, &ids);
                          log::info!(
                              "shader pack {name}: mc_Entity for {} of {} block sprites in {} ms",
@@ -2944,7 +3062,7 @@ index d0fe7a991..8c6c1c4b7 100644
                              started_ids.elapsed().as_millis()
                          );
                          if let Some((programs, notes)) =
-@@ -544,6 +544,51 @@ fn block_id_table(pack: &super::PackResources, ids: &BlockIds) -> Vec<i32> {
+@@ -544,6 +559,51 @@ fn block_id_table(pack: &super::PackResources, ids: &BlockIds) -> Vec<i32> {
              *slot = 1;
          }
      }
@@ -3129,7 +3247,7 @@ index 2c0f69d8b..7f890f2ba 100644
      }
  
 diff --git a/crates/horizon-shaders/src/post.rs b/crates/horizon-shaders/src/post.rs
-index cef9e4654..7058ef58e 100644
+index cef9e4654..9d39bfe5b 100644
 --- a/crates/horizon-shaders/src/post.rs
 +++ b/crates/horizon-shaders/src/post.rs
 @@ -319,9 +319,12 @@ impl CustomImage {
@@ -3258,19 +3376,21 @@ index cef9e4654..7058ef58e 100644
      let mut gbuffers = |names: &[&str], group, inputs: &GbuffersInputs| {
          names.iter().find_map(|name| {
              // `alphaTest.<program>` replaces the geometry's default test (OQ-23).
-@@ -655,6 +736,53 @@ pub fn load_post(
+@@ -655,6 +736,55 @@ pub fn load_post(
              p.blend = blend(properties, &p.name).flatten();
              p
          });
 +    // Iris Features: what Horizon has no place for. Held translucent items draw with
-+    // `gbuffers_hand_water` when the pack has it (no fallback: without it they stay with
-+    // `gbuffers_hand`), and the weather program again, to draw without depth unless
-+    // `rain.depth=true` (Iris writes rain's depth only then).
++    // `gbuffers_hand_water`, or `gbuffers_hand` as Iris falls back, blended as translucent
++    // items are unless `blend.gbuffers_hand_water` says otherwise (through `gbuffers_hand`
++    // alone held stained glass was a solid colour), and the weather program again, to draw
++    // without depth unless `rain.depth=true` (Iris writes rain's depth only then).
 +    let mut extra = Vec::new();
 +    if let Some(i) = inputs.hand.as_ref()
-+        && let Some(mut p) = gbuffers(&["gbuffers_hand_water"], Group::Translucent, i)
++        && let Some(mut p) =
++            gbuffers(&["gbuffers_hand_water", "gbuffers_hand"], Group::Translucent, i)
 +    {
-+        p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
++        p.blend = blend(properties, "gbuffers_hand_water").unwrap_or(Some(TRANSLUCENT_BLEND));
 +        extra.push(("hand_water".to_owned(), p));
 +    }
 +    // Block-breaking cracks with `gbuffers_damagedblock` (Iris's chain: terrain's after it),
@@ -3312,7 +3432,7 @@ index cef9e4654..7058ef58e 100644
      if let Some(inputs) = &inputs.terrain {
          // Solid and cutout terrain draw together: the cutout test, unless `alphaTest.*` says
          // otherwise (3.2).
-@@ -879,7 +1007,18 @@ impl Loader<'_> {
+@@ -879,7 +1009,18 @@ impl Loader<'_> {
          ) {
              return None;
          }
@@ -3332,7 +3452,7 @@ index cef9e4654..7058ef58e 100644
              let Some(inputs) = self.geometry.clone() else {
                  self.post.notes.push(format!(
                      "{name}: uses a geometry stage (supported for terrain's shadow only); skipped"
-@@ -1120,6 +1259,44 @@ fn located(pp: &Preprocessed, list: &[crate::preprocess::Diagnostic]) -> Vec<Str
+@@ -1120,6 +1261,44 @@ fn located(pp: &Preprocessed, list: &[crate::preprocess::Diagnostic]) -> Vec<Str
          .collect()
  }
  
@@ -16294,7 +16414,7 @@ index 62f670815..4bdeb5b0f 100644
 +/// Sampling functions with an implicit level of detail (a fragment shader's derivatives).
 +const IMPLICIT_LOD: [&str; 5] = ["texture", "texture2D", "texture1D", "texture3D", "textureCube"];
 diff --git a/crates/horizon-shaders/src/translate/scan.rs b/crates/horizon-shaders/src/translate/scan.rs
-index 716c58f43..176103c2e 100644
+index 716c58f43..41cd1ecea 100644
 --- a/crates/horizon-shaders/src/translate/scan.rs
 +++ b/crates/horizon-shaders/src/translate/scan.rs
 @@ -53,6 +53,9 @@ pub(super) struct Stage<'p> {
@@ -16353,7 +16473,7 @@ index 716c58f43..176103c2e 100644
              structs: HashMap::new(),
              outputs: BTreeSet::new(),
              frag_coord: false,
-@@ -262,8 +291,58 @@ impl<'p> Stage<'p> {
+@@ -262,8 +291,104 @@ impl<'p> Stage<'p> {
              replaced: HashMap::new(),
              inits: Vec::new(),
              errors: Vec::new(),
@@ -16382,7 +16502,7 @@ index 716c58f43..176103c2e 100644
 +                if sig.get(k + 1).map(|&i| s.tokens[i]) != Some("(") {
 +                    continue;
 +                }
-+                let (mut depth, mut commas, mut second, mut close) = (0i32, 0, None, None);
++                let (mut depth, mut commas, mut first, mut second, mut close) = (0i32, 0, None, None, None);
 +                for j in k + 1..sig.len() {
 +                    match s.tokens[sig[j]] {
 +                        "(" | "[" | "{" => depth += 1,
@@ -16395,6 +16515,9 @@ index 716c58f43..176103c2e 100644
 +                        }
 +                        "," if depth == 1 => {
 +                            commas += 1;
++                            if commas == 1 {
++                                first = Some(j);
++                            }
 +                            if commas == 2 {
 +                                second = Some(j);
 +                            }
@@ -16402,7 +16525,50 @@ index 716c58f43..176103c2e 100644
 +                        _ => {}
 +                    }
 +                }
-+                if let (Some(c2), Some(cl), 2) = (second, close, commas) {
++                // Iris Features: an atomic whose old value is used (Rethinking Voxels' shadow
++                // pass tests the bit it set): `imageStore` has none, so the old value is read
++                // into a variable before the statement, the store goes there too, and the call
++                // reads the variable.
++                let prev = k.checked_sub(1).map(|p| s.tokens[sig[p]]);
++                let used = !matches!(prev, None | Some(";" | "{" | "}" | ")" | "else" | ":"));
++                let text = |a: usize, b: usize| s.tokens[sig[a]..sig[b]].concat();
++                let start = used.then(|| {
++                    let mut d = 0i32;
++                    let mut p = k;
++                    while p > 0 {
++                        p -= 1;
++                        match s.tokens[sig[p]] {
++                            ")" | "]" => d += 1,
++                            "(" | "[" if d > 0 => d -= 1,
++                            ";" | "{" | "}" if d == 0 => return Some(p + 1),
++                            _ => {}
++                        }
++                    }
++                    Some(0)
++                });
++                let start = start.flatten().filter(|&st| s.tokens[sig[st]] != "else");
++                if let (Some(c1), Some(c2), Some(cl), 2, Some(st)) = (first, second, close, commas, start) {
++                    let image = text(k + 2, c1);
++                    let name = image.trim();
++                    let ty = sig
++                        .windows(2)
++                        .find(|w| s.tokens[w[1]] == name && s.tokens[w[0]].contains("image"))
++                        .map_or("float", |w| match s.tokens[w[0]].chars().next() {
++                            Some('i') => "int",
++                            Some('u') => "uint",
++                            _ => "float",
++                        });
++                    let old = format!("hz_atomic_old_{}", sig[k]);
++                    let coords = text(c1 + 1, c2);
++                    let value = text(c2 + 1, cl);
++                    let hoisted = format!(
++                        "{ty} {old} = imageLoad({image}, {coords}).x; \
++                         imageStore({image}, {coords}, hz_atomic_{fun}({value})); "
++                    );
++                    s.before.entry(sig[st]).or_default().push_str(&hoisted);
++                    s.replaced.insert(sig[k], old);
++                    s.removed.push(sig[k] + 1..sig[cl] + 1);
++                } else if let (Some(c2), Some(cl), 2, false) = (second, close, commas, used) {
 +                    s.replaced.insert(sig[k], "imageStore".into());
 +                    s.replaced.insert(sig[c2], format!(", hz_atomic_{fun}("));
 +                    s.replaced.insert(sig[cl], "))".into());
@@ -16412,7 +16578,7 @@ index 716c58f43..176103c2e 100644
          let (mut start, mut depth, mut parens) = (0, 0usize, 0usize);
          let mut own_inverse = false;
          for i in 0..s.tokens.len() {
-@@ -315,6 +394,12 @@ impl<'p> Stage<'p> {
+@@ -315,6 +440,12 @@ impl<'p> Stage<'p> {
                      }
                  }
                  "gl_FrontColor" => s.builtin_varying("hz_FrontColor".into()),
@@ -16425,7 +16591,7 @@ index 716c58f43..176103c2e 100644
                  "gl_Color" if kind == ShaderStage::Fragment => {
                      s.builtin_varying("hz_FrontColor".into())
                  }
-@@ -322,9 +407,52 @@ impl<'p> Stage<'p> {
+@@ -322,9 +453,52 @@ impl<'p> Stage<'p> {
              }
          }
          s.inverse &= !own_inverse;
@@ -16478,7 +16644,7 @@ index 716c58f43..176103c2e 100644
      /// Names that desktop GLSL leaves free but Vulkan GLSL takes for its separate texture and
      /// sampler types (`sampler2D sampler`): renamed, unless called (`texture2D(...)`).
      fn rename_vulkan_types(&mut self) {
-@@ -387,7 +515,6 @@ impl<'p> Stage<'p> {
+@@ -387,7 +561,6 @@ impl<'p> Stage<'p> {
          }
      }
  
@@ -16486,7 +16652,7 @@ index 716c58f43..176103c2e 100644
      pub(super) fn global(&mut self, from: usize, to: usize, body: bool) {
          let words: Vec<usize> = (from..to)
              .filter(|&i| significant(self.tokens[i]))
-@@ -399,8 +526,20 @@ impl<'p> Stage<'p> {
+@@ -399,8 +572,20 @@ impl<'p> Stage<'p> {
          let prototype = paren.is_some_and(|p| self.tokens[words[p]] == "(")
              && !words.iter().any(|&i| STORAGE.contains(&self.tokens[i]));
          if body && words.iter().any(|&i| self.tokens[i] == "buffer") {
@@ -16507,7 +16673,7 @@ index 716c58f43..176103c2e 100644
          if body || prototype {
              return self.function(&words);
          }
-@@ -460,6 +599,16 @@ impl<'p> Stage<'p> {
+@@ -460,6 +645,16 @@ impl<'p> Stage<'p> {
          // Declarators: name [array] [= init], separated by commas.
          let mut declarators: Vec<(String, String)> = Vec::new();
          let mut j = k + 1;
@@ -16524,7 +16690,7 @@ index 716c58f43..176103c2e 100644
          while let Some(&n) = words.get(j) {
              let name = self.tokens[n].to_owned();
              let mut array = String::new();
-@@ -483,13 +632,25 @@ impl<'p> Stage<'p> {
+@@ -483,13 +678,25 @@ impl<'p> Stage<'p> {
                  j += 1;
              }
              j += 1;
@@ -16552,7 +16718,7 @@ index 716c58f43..176103c2e 100644
              match storage {
                  "uniform" if is_sampler_type(&ty) => self.samplers.push((name, ty.clone())),
                  "uniform" if ty.contains("image") => match format {
-@@ -714,6 +875,476 @@ impl<'p> Stage<'p> {
+@@ -714,6 +921,476 @@ impl<'p> Stage<'p> {
          }
      }
  
