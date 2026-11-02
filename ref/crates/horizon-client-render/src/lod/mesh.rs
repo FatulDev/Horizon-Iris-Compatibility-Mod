@@ -1057,9 +1057,12 @@ const MAX_STEPS: i32 = 32;
 /// atlas lookups can't (grass sides stretched across far hills).
 fn emit(mesh: &mut SectionMesh, key: FaceKey, rect: Rect) {
     // A face of a coarse tile (thousands of blocks wide) stays one quad: a quad a block would
-    // be millions of them.
+    // be millions of them. Tops and bottoms are split only when small: distant terrain is
+    // mostly tops, and splitting them all filled video memory on 8 GB cards; sides, where
+    // the stretching showed, are split up to 4096 blocks.
+    let limit = if matches!(key.direction, Direction::Up | Direction::Down) { 64.0 } else { 4096.0 };
     if horizon_shaders::iris::pack_terrain()
-        && (rect.u1 - rect.u0) * (rect.v1 - rect.v0) <= 4096.0
+        && (rect.u1 - rect.u0) * (rect.v1 - rect.v0) <= limit
     {
         let mut u0 = rect.u0;
         while u0 < rect.u1 {

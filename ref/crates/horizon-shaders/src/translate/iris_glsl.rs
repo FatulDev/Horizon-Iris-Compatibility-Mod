@@ -5341,9 +5341,12 @@ impl Frontend {
                     // Glsl requires the formats to strictly match unless you are builtin
                     // function overload and have not been replaced, in which case we only
                     // check that the format scalar kind matches
+                    // Iris Features: a function of the pack's takes the image it is passed,
+                    // whatever its format (the parameter's type is set from the calls after
+                    // parsing: `iris_passes::image_arguments`).
                     let good_format = overload_format == call_format
-                        || (overload.internal
-                            && Scalar::from(overload_format) == Scalar::from(call_format));
+                        || !overload.internal
+                        || Scalar::from(overload_format) == Scalar::from(call_format);
                     if !(good_size && good_format) {
                         continue 'outer;
                     }
@@ -5351,7 +5354,7 @@ impl Frontend {
                     // While storage access mismatch is an error it isn't one that causes
                     // the overload matching to fail so we defer the error and consider
                     // that the images match exactly
-                    if !call_access.contains(overload_access) {
+                    if overload.internal && !call_access.contains(overload_access) {
                         self.errors.push(Error {
                             kind: ErrorKind::SemanticError(
                                 format!(
@@ -8659,8 +8662,27 @@ impl ParsingContext<'_> {
         }
 
         loop {
+            // Iris Features: memory and precision qualifiers on a parameter (`writeonly
+            // image3D img`, Photon's floodfill) say nothing naga needs: the image's own type
+            // comes from what the calls pass (`iris_passes::image_arguments`).
+            while self.peek(frontend).is_some_and(|t| {
+                matches!(
+                    t.value,
+                    TokenValue::MemoryQualifier(_) | TokenValue::Restrict | TokenValue::PrecisionQualifier(_)
+                )
+            }) {
+                self.bump(frontend)?;
+            }
             if self.peek_type_name(frontend) || self.peek_parameter_qualifier(frontend) {
                 let qualifier = self.parse_parameter_qualifier(frontend);
+                while self.peek(frontend).is_some_and(|t| {
+                    matches!(
+                        t.value,
+                        TokenValue::MemoryQualifier(_) | TokenValue::Restrict | TokenValue::PrecisionQualifier(_)
+                    )
+                }) {
+                    self.bump(frontend)?;
+                }
                 let mut ty = self.parse_type_non_void(frontend, ctx)?.0;
 
                 match self.expect_peek(frontend)?.value {

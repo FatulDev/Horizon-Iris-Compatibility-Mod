@@ -15,7 +15,7 @@ PRISTINE = os.path.expanduser('~/hz-pristine')
 OUT = os.path.join(ROOT, 'out', 'iris_features')
 
 MOD_ID = 'iris_features'
-VERSION = '0.1.31'
+VERSION = '0.1.32'
 HORIZON = '10b16c4b94d6ebdf3234545f53243c6466dfa32c'
 MIXINS = '4342a0bfbe71d4d14185528d64e496d6022f16a1'
 

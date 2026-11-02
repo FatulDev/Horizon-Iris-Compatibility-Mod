@@ -619,7 +619,32 @@ pub(super) fn text_fixes(module: &naga::Module, text: &str) -> Vec<(usize, usize
         if typifier.grow(last, &f.expressions, &ctx).is_err() {
             return;
         }
-        for (_, e) in f.expressions.iter() {
+        for (h, e) in f.expressions.iter() {
+            // An index the frontend made a float (`light_color[clamp(i, 0u, 47u)]` with an
+            // `int i`: GLSL takes the `uint` overload, naga's frontend the float one; Photon's
+            // colored lights) is written as an `int` of it.
+            if let Expression::Access { index, .. } = *e
+                && matches!(typifier.get(index, &module.types), TypeInner::Scalar(s) if s.kind == ScalarKind::Float)
+            {
+                // The index's own span, else what the brackets of the access hold.
+                let own = f.expressions.get_span(index).to_range();
+                let range = own.or_else(|| {
+                    let r = f.expressions.get_span(h).to_range()?;
+                    let t = text.get(r.clone())?;
+                    let open = t.find('[')?;
+                    let close = t.rfind(']')?;
+                    (open < close).then(|| r.start + open + 1..r.start + close)
+                });
+                if let Some(range) = range
+                    && range.end <= text.len()
+                    && range.start < range.end
+                    && text.is_char_boundary(range.start)
+                    && text.is_char_boundary(range.end)
+                {
+                    fixes.push((range.start, range.end, format!("int({})", &text[range.clone()])));
+                }
+                continue;
+            }
             let Expression::Binary { op: BinaryOperator::Modulo, left, right } = *e else { continue };
             let (scalar, size, kind) = match (typifier.get(left, &module.types), typifier.get(right, &module.types)) {
                 (TypeInner::Vector { size, scalar }, TypeInner::Scalar(_)) => (right, *size, scalar.kind),
@@ -974,4 +999,174 @@ pub(super) fn component_arguments(module: &mut naga::Module, info: &naga::valid:
 
 pub(super) fn image_atomics_on() -> bool {
     crate::iris::image_atomics()
+}
+
+/// Iris Features: functions that take storage images (Photon's `update_lpv(writeonly image3D
+/// light_img, ...)`). GLSL leaves an image parameter's format to the image passed; naga stores
+/// only to a global image. Each function is copied for each set of global images its calls
+/// pass, the copy reading those globals where it read the parameters (with their types), and
+/// the calls go to the copies; repeated so images passed on through parameters follow. The
+/// originals, called no more, are emptied.
+pub(super) fn image_arguments(module: &mut naga::Module) {
+    use naga::{Expression, Handle, Statement, TypeInner};
+    use std::collections::HashMap;
+    let storage = |module: &naga::Module, ty: Handle<naga::Type>| {
+        matches!(module.types[ty].inner, TypeInner::Image { class: naga::ImageClass::Storage { .. }, .. })
+    };
+    // The storage image parameters of each function.
+    let params = |module: &naga::Module, f: Handle<naga::Function>| -> Vec<usize> {
+        let func = &module.functions[f];
+        (0..func.arguments.len()).filter(|&i| storage(module, func.arguments[i].ty)).collect()
+    };
+    type Key = (Handle<naga::Function>, Vec<Handle<naga::GlobalVariable>>);
+    let mut copies: HashMap<Key, Handle<naga::Function>> = HashMap::new();
+    let mut emptied = Vec::new();
+    fn calls_mut(block: &mut naga::Block, f: &mut dyn FnMut(&mut Handle<naga::Function>, &mut Vec<Handle<Expression>>)) {
+        for s in block.iter_mut() {
+            match s {
+                Statement::Call { function, arguments, .. } => f(function, arguments),
+                Statement::Block(b) => calls_mut(b, f),
+                Statement::If { accept, reject, .. } => {
+                    calls_mut(accept, f);
+                    calls_mut(reject, f);
+                }
+                Statement::Switch { cases, .. } => cases.iter_mut().for_each(|c| calls_mut(&mut c.body, f)),
+                Statement::Loop { body, continuing, .. } => {
+                    calls_mut(body, f);
+                    calls_mut(continuing, f);
+                }
+                _ => {}
+            }
+        }
+    }
+    for _ in 0..8 {
+        // The copies the calls need: (callee, the globals passed).
+        let mut wanted: Vec<Key> = Vec::new();
+        let callers: Vec<Option<Handle<naga::Function>>> = module
+            .functions
+            .iter()
+            .map(|(h, _)| Some(h))
+            .chain((0..module.entry_points.len()).map(|_| None))
+            .collect();
+        let mut ep = 0;
+        for caller in callers {
+            let func = match caller {
+                Some(h) => &mut module.functions[h],
+                None => {
+                    ep += 1;
+                    &mut module.entry_points[ep - 1].function
+                }
+            };
+            let expressions = func.expressions.clone();
+            let mut body = std::mem::take(&mut func.body);
+            let mut found = Vec::new();
+            calls_mut(&mut body, &mut |callee, args| found.push((*callee, args.clone())));
+            let func = match caller {
+                Some(h) => &mut module.functions[h],
+                None => &mut module.entry_points[ep - 1].function,
+            };
+            func.body = body;
+            for (callee, args) in found {
+                let ps = params(module, callee);
+                if ps.is_empty() || copies.values().any(|c| *c == callee) {
+                    continue;
+                }
+                let globals: Option<Vec<_>> = ps
+                    .iter()
+                    .map(|&i| match args.get(i).map(|a| &expressions[*a]) {
+                        Some(Expression::GlobalVariable(g)) => Some(*g),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(globals) = globals {
+                    let key = (callee, globals);
+                    if !copies.contains_key(&key) && !wanted.contains(&key) {
+                        wanted.push(key);
+                    }
+                }
+            }
+        }
+        if wanted.is_empty() {
+            break;
+        }
+        for (callee, globals) in wanted {
+            let ps = params(module, callee);
+            let mut copy = module.functions[callee].clone();
+            // The image parameters go (passing a write-only image counts as reading it), the
+            // others move up.
+            for (_, e) in copy.expressions.iter_mut() {
+                if let Expression::FunctionArgument(j) = *e {
+                    match ps.iter().position(|&i| i == j as usize) {
+                        Some(k) => *e = Expression::GlobalVariable(globals[k]),
+                        None => {
+                            let before = ps.iter().filter(|&&i| i < j as usize).count() as u32;
+                            *e = Expression::FunctionArgument(j - before);
+                        }
+                    }
+                }
+            }
+            for &i in ps.iter().rev() {
+                copy.arguments.remove(i);
+            }
+            copy.name = copy.name.map(|n| format!("{n}_hz{}", copies.len()));
+            let h = module.functions.append(copy, naga::Span::UNDEFINED);
+            copies.insert((callee, globals), h);
+            if !emptied.contains(&callee) {
+                emptied.push(callee);
+            }
+        }
+        // The calls go to their copies.
+        let callers: Vec<Option<Handle<naga::Function>>> = module
+            .functions
+            .iter()
+            .map(|(h, _)| Some(h))
+            .chain((0..module.entry_points.len()).map(|_| None))
+            .collect();
+        let mut ep = 0;
+        for caller in callers {
+            let func = match caller {
+                Some(h) => &mut module.functions[h],
+                None => {
+                    ep += 1;
+                    &mut module.entry_points[ep - 1].function
+                }
+            };
+            let expressions = func.expressions.clone();
+            let mut body = std::mem::take(&mut func.body);
+            calls_mut(&mut body, &mut |callee, args| {
+                let ps = params(module, *callee);
+                if ps.is_empty() {
+                    return;
+                }
+                let globals: Option<Vec<_>> = ps
+                    .iter()
+                    .map(|&i| match args.get(i).map(|a| &expressions[*a]) {
+                        Some(Expression::GlobalVariable(g)) => Some(*g),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(c) = globals.and_then(|g| copies.get(&(*callee, g))) {
+                    *callee = *c;
+                    for &i in ps.iter().rev() {
+                        if i < args.len() {
+                            args.remove(i);
+                        }
+                    }
+                }
+            });
+            let func = match caller {
+                Some(h) => &mut module.functions[h],
+                None => &mut module.entry_points[ep - 1].function,
+            };
+            func.body = body;
+        }
+    }
+    for h in emptied {
+        let f = &mut module.functions[h];
+        f.body = naga::Block::new();
+        f.expressions = naga::Arena::new();
+        f.local_variables = naga::Arena::new();
+        f.named_expressions.clear();
+        f.result = None;
+    }
 }

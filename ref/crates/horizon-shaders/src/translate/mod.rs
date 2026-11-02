@@ -1093,6 +1093,7 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
         REWRITES.with(|r| r.set(r.get() - 1));
         return again;
     }
+    image_arguments(&mut module);
     workgroup_barriers(&mut module);
     vector_modulo(&mut module);
     private_struct_strides(&mut module);
@@ -1776,6 +1777,33 @@ mod tests {
                    sums += ivec4(1);\n    lights[gl_LocalInvocationIndex] += uvec2(1u);\n    \
                    uvec2 l = lights[gl_LocalInvocationIndex];\n    barrier();\n    \
                    imageStore(colorimg5, ivec2(0), ivec4(sums.y + int(lights[1].x + l.y)));\n}\n";
+        let pack = Pack::from_zip_bytes("P.zip", zip(&[("shaders/deferred_a.csh", csh)])).unwrap();
+        translate_compute(&preprocess(&pack, "deferred_a.csh", &Macros::standard()))
+            .unwrap_or_else(|e| panic!("{e:?}"));
+    }
+
+    /// Stray `;` at the top level, after a function or another `;`; a struct's stays.
+    #[test]
+    fn stray_semicolons_at_the_top_level_go() {
+        let csh = "#version 430\nlayout(local_size_x = 1) in;\nstruct S { float a; };\n;\n\
+                   float f(float x) { return x; };\nlayout(r32f) uniform image2D colorimg4;\n\
+                   void main() { S s = S(1.0); imageStore(colorimg4, ivec2(0), vec4(f(s.a))); }\n";
+        let pack = Pack::from_zip_bytes("P.zip", zip(&[("shaders/deferred_a.csh", csh)])).unwrap();
+        translate_compute(&preprocess(&pack, "deferred_a.csh", &Macros::standard()))
+            .unwrap_or_else(|e| panic!("{e:?}"));
+    }
+
+    /// Photon's colored lights: a constant array indexed by `clamp(int, uint, uint)`, and an
+    /// image passed to a function with a memory qualifier on the parameter.
+    #[test]
+    fn constant_tables_take_mixed_clamp_indices_and_images_go_to_functions() {
+        let csh = "#version 430\nlayout(local_size_x = 4) in;\n\
+                   const vec3 light_color[2] = vec3[2](vec3(1.0), vec3(0.5));\n\
+                   layout(rgba16f) writeonly uniform image2D light_data_img;\n\
+                   void put(writeonly image2D img, int i) { imageStore(img, ivec2(i, 0), vec4(light_color[clamp(i, 0u, 1u)], 0.0)); }\n\
+                   void main() {\n    int index = int(gl_LocalInvocationID.x);\n    \
+                   imageStore(light_data_img, ivec2(index, 0), vec4(light_color[clamp(index, 0u, 1u)], 0.0));\n    \
+                   put(light_data_img, index);\n}\n";
         let pack = Pack::from_zip_bytes("P.zip", zip(&[("shaders/deferred_a.csh", csh)])).unwrap();
         translate_compute(&preprocess(&pack, "deferred_a.csh", &Macros::standard()))
             .unwrap_or_else(|e| panic!("{e:?}"));

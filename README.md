@@ -59,7 +59,7 @@ The packs in brackets are examples of packs that needed each change.
 | `texture.<stage>.colortexN` | Stands in for buffer N only until a program has written it, as in Iris (a noise texture in a buffer the pack later renders into; Eclipse's bloom) |
 | Terrain alpha test | Cutout faces (leaves, plants, campfires) shed texels below alpha 0.1, as Iris tests its cutout layers, also with declared outputs; solid faces aren't tested |
 | `mc_midTexCoord` | The middle of the quad's own texture coordinates, not of its sprite (stretched grass sides) |
-| Distant terrain | While a pack runs, distant faces are meshed a block each (grass sides stretched across far hills) |
+| Distant terrain | While a pack runs, distant sides are meshed a block each (grass sides stretched across far hills); tops only when small (meshing every distant top a block each filled video memory on 8 GB cards) |
 | Block outline | Drawn by the mod after translucent terrain, into the buffer it writes, with the pack's own camera, black at 40% as vanilla's; Horizon's own outline (drawn into its world pass, where it floated at an angle or didn't show) is skipped while a pack runs |
 | Held translucent items | Stained glass and other translucent items in hand draw with `gbuffers_hand_water`, or `gbuffers_hand` as Iris falls back (they were a solid colour in packs without `gbuffers_hand_water`), blended over the scene, back faces culled as vanilla draws items, as in Iris (they were grainy through `gbuffers_hand`; Eclipse) |
 | Block-breaking cracks | Drawn with `gbuffers_damagedblock` (or Iris's fallbacks: terrain, textured_lit, textured, basic), multiplied into the block under them as vanilla's are unless the pack sets its own blend. Each crack samples its own destroy stage's sprite (0.1.28 drew the whole atlas over the block), pulled toward the camera as vanilla's crumbling layer is (they flickered against the block) |
@@ -76,6 +76,9 @@ The packs in brackets are examples of packs that needed each change.
 | `fogColor`, `skyColor` undeclared | Declared as Iris's uniforms when a program uses them without a declaration (Luster) |
 | Narrowed outputs | The alpha test reads a narrowed location-0 output (`vec3 shadowcolor0_out`) by its name (Photon's shadow programs were dropped) |
 | Atomics whose old value is used | `if ((imageAtomicOr(img, c, bit) >> 16 & 1) == 0)`: the old value is read before the statement and the atomic done there (Rethinking Voxels' shadow pass, which voxelises the world for its block lights, failed to build) |
+| Images passed to functions | `void update_lpv(writeonly image3D img, ...)`: the parameter's memory qualifier is read, and each function is copied for the images its calls pass, as naga stores only to a global image (Photon's colored lights: `setup` and `shadowcomp` were dropped) |
+| Float array indices | `table[clamp(i, 0u, 47u)]` with an `int i`: GLSL takes the `uint` overload, naga's frontend the float one; the index is made an `int` again (Photon's colored lights) |
+| Stray `;` at the top level | After a function's body or another `;`, as GL drivers take it |
 | GPU errors | Logged once each instead of ending the game |
 
 ## Known issues
@@ -99,6 +102,18 @@ Reported in the game:
 - Luster: a black world. It renders its lighting into colortex16 to colortex21, and Horizon has
   16 colour buffers (colortex0 to colortex15); that limit is Horizon's and not one a mod can lift.
 - Just Colored Lighting: caves see-through, no shader effects.
+
+## Not the mod's
+
+Reported along with it, and not caused by it:
+
+- `horizon-launcher: unknown option` on start: the game was started with the launcher's
+  arguments. Start it from the launcher.
+- Out of memory while the game starts, before any shader pack loads (a 2 GB GPU with 32x
+  textures and Fresh Animations): the resource packs' textures don't fit. Fewer or smaller
+  resource packs fix it.
+- `no shaders folder at the root of the pack`: the zip holds a folder that holds `shaders/`.
+  Zip the pack so that `shaders/` is at the top, or put the unzipped folder in `shaderpacks/`.
 
 ## Pack status
 

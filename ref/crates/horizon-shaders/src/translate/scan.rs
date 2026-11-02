@@ -391,11 +391,16 @@ impl<'p> Stage<'p> {
         }
         let (mut start, mut depth, mut parens) = (0, 0usize, 0usize);
         let mut own_inverse = false;
+        // Iris Features: whether the last top-level braces were a function's body, for the
+        // stray `;` after one (`void f() { ... };`) or after another `;`, which GL drivers
+        // take and naga's parser doesn't (Eclipse's composite5).
+        let (mut function_body, mut closed_function) = (false, false);
         for i in 0..s.tokens.len() {
             match s.tokens[i] {
                 "(" => parens += 1,
                 ")" => parens = parens.saturating_sub(1),
                 "{" if depth == 0 && parens == 0 => {
+                    function_body = s.tokens[..i].iter().rev().find(|t| significant(t)) == Some(&")");
                     s.global(start, i, true);
                     s.structure(start, i);
                     depth = 1;
@@ -405,9 +410,20 @@ impl<'p> Stage<'p> {
                     depth -= 1;
                     if depth == 0 {
                         start = i + 1;
+                        closed_function = function_body;
                     }
                 }
+                ";" if depth == 0
+                    && parens == 0
+                    && !s.tokens[start..i].iter().any(|t| significant(t))
+                    && (closed_function
+                        || s.tokens[..i].iter().rev().find(|t| significant(t)) == Some(&";")) =>
+                {
+                    s.removed.push(i..i + 1);
+                    start = i + 1;
+                }
                 ";" if depth == 0 && parens == 0 => {
+                    closed_function = false;
                     s.global(start, i, false);
                     start = i + 1;
                 }
